@@ -1,0 +1,11 @@
+node_modules/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+data/backups/
+
+# 本地密钥与秘密配置（模板 .env.example 保留可提交）
+.env
+.env.local
+.env.*.local
