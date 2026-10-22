@@ -31,6 +31,11 @@ export function migrate(db) {
     }
     db.prepare('UPDATE cards SET issued_on = ? WHERE issued_on IS NULL').run(DEMO_ISSUED_ON)
 
+    // 银行卡：状态版本（乐观锁，冻结/解冻确认时校验建单后卡片是否被改动；旧库回填为 1）
+    if (!hasColumn(db, 'cards', 'version')) {
+      db.exec('ALTER TABLE cards ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+    }
+
     // 模拟转账：交易流水与转账单的关联字段（可空；非转账流水为 NULL）
     if (!hasColumn(db, 'transactions', 'transfer_ref')) {
       db.exec('ALTER TABLE transactions ADD COLUMN transfer_ref TEXT')

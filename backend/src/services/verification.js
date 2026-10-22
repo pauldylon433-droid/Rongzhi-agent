@@ -5,6 +5,7 @@
 import { hashPassword, verifyPassword, encryptSecret, decryptSecret } from '../lib/crypto-util.js'
 import { base32Decode, verifyTotp } from '../lib/totp.js'
 import { finalizeTransfer, getTransferRow, viewTransfer } from './transfers.js'
+import { finalizeCardOperation, getCardOpRow, viewCardOperation } from './card-operations.js'
 
 export const MAX_VERIFY_FAILURES = 5
 export const VERIFY_LOCK_MS = 15 * 60 * 1000 // 连续失败锁定 15 分钟
@@ -75,6 +76,39 @@ function resetFailures(db, userId) {
   db.prepare('UPDATE verification_failures SET fail_count = 0, locked_until = NULL WHERE user_id = ?').run(userId)
 }
 
+// —— 阶段一：绑定 / 锁定 / 凭据校验（失败计数独立提交，不随业务事务回滚丢失）。
+// 转账强验证与银行卡解冻强验证复用同一套密码哈希、TOTP、失败锁定与用户级锁定状态；
+// 校验成功返回命中的 TOTP 时间步 { matchedStep }；失败抛 VerificationError。
+export function verifyCredentials(db, userId, { password, totp }, { encryptionKey, now = new Date() } = {}) {
+  const binding = getBinding(db, userId)
+  if (!binding || binding.enabled !== 1) {
+    throw new VerificationError('尚未绑定验证器，无法执行强验证', 'not_bound')
+  }
+  const fail = getFailure(db, userId)
+  const nowIso = now.toISOString()
+  if (fail && fail.locked_until && nowIso < fail.locked_until) {
+    const mins = Math.ceil((new Date(fail.locked_until).getTime() - now.getTime()) / 60000)
+    throw new VerificationError(`强验证已锁定，请 ${mins} 分钟后重试`, 'locked', { locked_until: fail.locked_until })
+  }
+  if (!encryptionKey) {
+    throw new VerificationError('验证器配置缺失（缺少加密密钥），操作保持阻断', 'no_key')
+  }
+  let secret
+  try {
+    secret = decryptSecret(JSON.parse(binding.totp_secret_enc), encryptionKey)
+  } catch {
+    throw new VerificationError('验证器配置错误（无法解密密钥），操作保持阻断', 'decrypt_failed')
+  }
+  const pwdOk = verifyPassword(password, binding.password_salt, binding.password_hash)
+  const matchedStep = pwdOk ? verifyTotp(secret, totp, { ms: now.getTime() }) : null
+  if (!pwdOk || matchedStep === null) {
+    const rec = recordFailure(db, userId, now)
+    if (rec.locked) throw new VerificationError('交易密码或验证码连续错误次数过多，强验证已锁定 15 分钟', 'locked')
+    throw new VerificationError(`交易密码或验证码错误（还可尝试 ${rec.remaining} 次）`, 'bad_credentials')
+  }
+  return { matchedStep }
+}
+
 // 一次性绑定（仅本地 CLI 绑定流程调用）。已绑定拒绝覆盖。
 // matchedStep：绑定环节已验证并命中的 TOTP 时间步（消费后防止立即复用）。
 export function bindVerification(db, userId, { password, totpSecretBase32, encryptionKey, matchedStep, now = new Date() }) {
@@ -109,32 +143,8 @@ export function bindVerification(db, userId, { password, totpSecretBase32, encry
 // 校验类失败抛 VerificationError（not_bound / no_key / decrypt_failed / locked / bad_credentials / code_reused）。
 export function verifyAndConfirmTransfer(db, userId, refNo, { password, totp }, { encryptionKey, now = new Date() } = {}) {
   // —— 阶段一：绑定 / 锁定 / 凭据校验（失败计数独立提交，不随扣款回滚丢失）——
-  const binding = getBinding(db, userId)
-  if (!binding || binding.enabled !== 1) {
-    throw new VerificationError('尚未绑定验证器，无法执行强验证转账', 'not_bound')
-  }
-  const fail = getFailure(db, userId)
+  const { matchedStep } = verifyCredentials(db, userId, { password, totp }, { encryptionKey, now })
   const nowIso = now.toISOString()
-  if (fail && fail.locked_until && nowIso < fail.locked_until) {
-    const mins = Math.ceil((new Date(fail.locked_until).getTime() - now.getTime()) / 60000)
-    throw new VerificationError(`强验证已锁定，请 ${mins} 分钟后重试`, 'locked', { locked_until: fail.locked_until })
-  }
-  if (!encryptionKey) {
-    throw new VerificationError('验证器配置缺失（缺少加密密钥），红色转账保持阻断', 'no_key')
-  }
-  let secret
-  try {
-    secret = decryptSecret(JSON.parse(binding.totp_secret_enc), encryptionKey)
-  } catch {
-    throw new VerificationError('验证器配置错误（无法解密密钥），红色转账保持阻断', 'decrypt_failed')
-  }
-  const pwdOk = verifyPassword(password, binding.password_salt, binding.password_hash)
-  const matchedStep = pwdOk ? verifyTotp(secret, totp, { ms: now.getTime() }) : null
-  if (!pwdOk || matchedStep === null) {
-    const rec = recordFailure(db, userId, now)
-    if (rec.locked) throw new VerificationError('交易密码或验证码连续错误次数过多，强验证已锁定 15 分钟', 'locked')
-    throw new VerificationError(`交易密码或验证码错误（还可尝试 ${rec.remaining} 次）`, 'bad_credentials')
-  }
 
   // —— 阶段二：原子消费验证码 + 扣款 + 流水 + 状态更新（同一事务）——
   const run = db.transaction(() => {
@@ -166,6 +176,60 @@ export function verifyAndConfirmTransfer(db, userId, refNo, { password, totp }, 
         `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
          VALUES (?, 'verification', ?, 'verify_success', 'success', ?)`,
       ).run(userId, refNo, JSON.stringify({ step: matchedStep, transaction_id: res.transaction_id }))
+      resetFailures(db, userId)
+    }
+    return res
+  })
+  const r = run()
+  if (r.outcome === 'code_reused') {
+    throw new VerificationError('该动态验证码已在当前时间窗口内使用过，请等待下一个验证码', 'code_reused')
+  }
+  return r
+}
+
+// 强验证确认解冻：密码 + TOTP 均正确 → 消费时间步 + 更新卡片状态（同一事务）。
+// 与转账强验证复用同一套密码哈希、TOTP、失败锁定与用户级锁定状态；
+// 同一用户「已用于转账的时间步」不可再用于解冻，反之亦然（totp_used_steps 的 UNIQUE(user_id, step)）。
+// 跨业务累计失败同样触发用户级锁定（verification_failures 以 user_id 为键）。
+// 返回 outcome：'completed'（含幂等）、'not_found'、'expired'、'cancelled'、'failed'、'stale'、'already'；
+// 校验类失败抛 VerificationError（not_bound / no_key / decrypt_failed / locked / bad_credentials / code_reused）。
+export function verifyAndConfirmCardUnfreeze(db, userId, refNo, { password, totp }, { encryptionKey, now = new Date() } = {}) {
+  // —— 阶段一：绑定 / 锁定 / 凭据校验（复用转账同一套用户级失败锁定）——
+  const { matchedStep } = verifyCredentials(db, userId, { password, totp }, { encryptionKey, now })
+  const nowIso = now.toISOString()
+
+  // —— 阶段二：原子消费验证码 + 更新卡片状态 + 审计（同一事务）——
+  const run = db.transaction(() => {
+    const row = getCardOpRow(db, refNo)
+    if (!row || row.user_id !== userId) return { outcome: 'not_found' }
+
+    if (row.status === 'needs_verification' && nowIso > row.expires_at) {
+      db.prepare("UPDATE card_operations SET status = 'expired' WHERE id = ? AND status = 'needs_verification'").run(row.id)
+      return { outcome: 'expired', op: viewCardOperation(db, { ...row, status: 'expired' }) }
+    }
+    if (row.status !== 'needs_verification') {
+      // 已完成 / 已取消 / 已过期 / 已失效 / 待确认（冻结）的单不可通过验证（重新）执行
+      return { outcome: row.status, op: viewCardOperation(db, row) }
+    }
+    // 强验证接口仅执行解冻（unfreeze）；冻结（pending）单不可走该接口
+    if (row.action !== 'unfreeze') return { outcome: row.status, op: viewCardOperation(db, row) }
+
+    // 消费该时间步（防重放：跨单、跨业务、并发、重启后均不可复用同一时间步）
+    try {
+      db.prepare('INSERT INTO totp_used_steps (user_id, step, purpose, consumed_at) VALUES (?, ?, ?, ?)')
+        .run(userId, matchedStep, 'unfreeze', nowIso)
+    } catch (e) {
+      if (/UNIQUE/i.test(String(e && e.message))) return { outcome: 'code_reused' }
+      throw e
+    }
+
+    const res = finalizeCardOperation(db, userId, row, now, 'needs_verification')
+
+    if (res.outcome === 'completed') {
+      db.prepare(
+        `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
+         VALUES (?, 'verification', ?, 'verify_success', 'success', ?)`,
+      ).run(userId, refNo, JSON.stringify({ step: matchedStep, card_id: row.card_id, action: 'unfreeze' }))
       resetFailures(db, userId)
     }
     return res

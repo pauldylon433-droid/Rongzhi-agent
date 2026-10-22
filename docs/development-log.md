@@ -694,3 +694,260 @@ Microsoft Authenticator）扫码，验证器名「融智 Agent」、账户为演
 - 尚未实现正式登录认证与多用户隔离；TOTP 时间步窗口为 ±1（约 90 秒）；仅本地绑定命令，无 Web 绑定 / 重置。
 - 强验证交互的自动化覆盖为输入状态机单元测试（非真实 TTY 端到端）；真实 PowerShell 交互由用户人工验收。
 
+---
+
+## 第十五阶段：银行卡查询、临时冻结 / 解冻，并接入自然语言助手
+
+日期：2026-10-22
+
+本轮实现银行卡查询、临时冻结（黄色，需点击确认）与解冻（红色，需交易密码 + TOTP 强验证），
+并接入自然语言助手。正式挂失 / 销卡 / 补卡 / 调额本阶段**不实现**，遇到时明确说明不支持并询问是否改用临时冻结。
+冻结 / 解冻仅改变卡片状态 `active ↔ frozen`，不改变余额、交易流水、订阅与日限额。
+
+### 一、新增 / 修改
+
+#### 后端（backend/）
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `src/services/card-operations.js` | 新建：银行卡操作服务（创建 / 查看 / 确认 / 取消，乐观锁版本 CAS，风险判定，状态机校验，审计） |
+| `src/routes/card-operations.js` | 新建：银行卡操作路由（创建 / 查看 / 确认 / 取消 / 强验证；字段白名单 + 限流 + 状态码映射） |
+| `src/routes/index.js` | 修改：注册 `/card-operations` 路由 |
+| `src/services/verification.js` | 修改：新增 `verifyAndConfirmCardUnfreeze`，复用转账强验证（凭据 / TOTP / 防重放 / 失败锁定） |
+| `src/services/assistant.js` | 修改：工具白名单新增 `get_cards` / `prepare_card_operation` / `get_card_operation_status`；`buildCardOpNotice`；会话 `pendingCardOpRef` + 单消息去重 |
+| `src/db/schema.js` | 修改：`cards.version` 列 + `card_operations` 表 + 索引 |
+| `src/db/migrate.js` | 修改：`cards.version` 回填 1 + 新建 `card_operations` 表（幂等） |
+| `scripts/verify-card-operations.js` | 新建：独立临时库 78 项断言验证 |
+| `scripts/verify-migrate.js` | 修改：新增 `version` 回填断言；修复既有 fixture 缺 `transfer_recipients`（此前遗留，非本轮引入） |
+
+#### 前端（frontend/）
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `src/components/CardOperationConfirmCard.vue` | 新建：共享银行卡操作确认卡（冻结确认 / 解冻强验证 / 取消 / 回执，挂载回读最新状态） |
+| `src/components/CardList.vue` | 修改：银行卡分区新增冻结 / 解冻辅助入口（与聊天入口共用同一确认卡） |
+| `src/components/AssistantPanel.vue` | 修改：渲染 `get_cards` / `prepare_card_operation` / `get_card_operation_status` 结果卡 + 改单信号 |
+| `src/composables/useCardOpSignal.js` | 新建：银行卡操作状态变更信号（改单后旧卡自动回读） |
+| `src/api/index.js` | 修改：新增银行卡操作接口请求封装 |
+| `src/App.vue` | 修改：场景状态更新为「查询/冻结/解冻已实现」+ 说明文案 |
+
+#### 文档
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `docs/api.md` | 新增银行卡操作接口文档 + AI 工具白名单扩为 8 个 |
+| `docs/database-design.md` | 新增 `card_operations` 表、`cards.version`、索引与迁移说明 |
+| `docs/security-design.md` | 新增银行卡状态机 / 版本 CAS / 跨业务强验证复用 / 无客户端 verified 布尔 |
+| `docs/development-log.md` | 本日志 |
+
+### 二、实现要点
+
+- **查询**：复用现有 `listCards` 服务与真实数据，仅返回掩码卡号、卡类型、状态、日限额。
+- **冻结（黄色）**：创建操作单不改变卡片状态，`active → frozen`，用户在确认卡点击「确认冻结」执行；
+  确认接口只接受 `{ confirm: true }`。
+- **解冻（红色）**：`frozen → active`，需交易密码 + TOTP 强验证，复用转账强验证同一套
+  （`totp_used_steps` 跨业务防重放、`verification_failures` 跨业务失败锁定），不另起第二套规则。
+- **版本 CAS**：卡片状态更新 `WHERE id=? AND status=? AND version=?`；建单后卡片被改动（含「正常→冻结→正常」）
+  的旧单不可覆盖新状态；重复确认幂等。
+- **操作单与转账区分**：编号前缀 `card-op-`、独立 `pendingCardOpRef`、取消 / 过期逻辑互不影响。
+- **AI 边界**：只开放 `get_cards` / `prepare_card_operation` / `get_card_operation_status`，不开放任何执行 /
+  强验证工具；聊天「确认 / 我同意」不改卡片状态；多卡时列出掩码选项不擅自选第一张；「挂失」等明确说明不支持。
+- **前端共用**：聊天入口与卡片列表辅助入口共用同一确认卡与后端确认规则。
+
+### 三、自动测试（命令行，与人工验收区分）
+
+| 项目 | 结果 |
+| ---- | ---- |
+| `node scripts/verify-card-operations.js` | ✅ 78/78（创建不改状态、归属/状态流转、版本 CAS 含「正常→冻结→正常」、冻结确认/解冻强验证/取消/过期/重复幂等、跨业务防重放与失败锁定） |
+| `node scripts/verify-strong-verification.js` | ✅ 73/73（无回归） |
+| `node scripts/verify-transfers.js` | ✅ 61/61（无回归） |
+| `node scripts/verify-assistant-transfer.js` | ✅ 通过（NL 转账 / 改单无回归） |
+| `node scripts/verify-assistant.js` | ✅ 通过（无回归） |
+| `node scripts/verify-db.js` | ✅ 通过（无回归） |
+| `node scripts/verify-migrate.js` | ✅ 9/9（含 version 回填断言） |
+| `npm run build`（前端） | ✅ 通过（39 模块，dist/index.html 0.46 kB / css 20.87 kB / js 109.37 kB） |
+| 收费模型 | ✅ 未调用（仅本地模拟 + mock 模型） |
+| 开发库业务数据 | ✅ 未修改；未在开发库自动冻结 / 解冻 |
+
+### 四、一致性备份
+
+- 结构变更前备份：`backend/data/backups/rongzhi.pre-transfer-20261022051915653.db`（复用 `backup-db.js`，SQLite `db.backup()` 正确处理 WAL）。
+
+### 五、已知限制
+
+- 正式挂失 / 销卡 / 补卡 / 调额未实现（仅临时冻结 / 解冻，仅改卡片状态）。
+- 无银行卡交易授权或真实扣款引擎（本阶段为模拟边界）。
+- 正式登录认证与多用户隔离仍未实现（单用户演示模式）。
+
+### 六、重启与验收步骤
+
+后端以 `npm run dev`（nodemon）运行会随源码改动自动重启并执行增量迁移；若以 `npm start` 运行则需重启以加载
+新增路由与 `cards.version` 迁移。前端 `npm run dev` 热更新。
+
+验收：
+1. 打开前端 → 「银行卡」分区查看掩码卡号与状态；卡片行提供「冻结」辅助入口。
+2. 「AI 助手」输入「我有哪些银行卡？」→ 列出掩码卡号选项。
+3. 输入「冻结尾号 1234 的卡」→ 生成冻结操作单（待确认，卡片状态不变）→ 确认卡点「确认冻结」→ 状态变「冻结」，卡片列表同步刷新。
+4. 输入「把刚才冻结的卡解冻」→ 生成解冻单（需强验证）→ 输入交易密码 + TOTP 动态码 → 「验证并确认解冻」→ 状态变「正常」。
+5. 反向核对：聊天文字「确认」不改状态；「挂失」明确提示不支持并询问是否改用临时冻结；同一验证码不可复用。
+
+---
+
+## 第十六阶段：修复 AI 助手回答中的 Markdown 表格显示
+
+日期：2026-10-22
+
+本轮仅修复助手回答的**展示层**：此前回答中的 Markdown 表格以原始 `| 卡号 | 类型 | …` 纯文本显示，
+现在渲染为按列对齐的真实表格。不改变银行卡、转账或强验证业务逻辑；不修改数据库、不调用收费模型。
+
+### 一、新增 / 修改
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `frontend/src/utils/markdown.js` | 新建：markdown-it 解析（html:false 转义原始 HTML）→ DOMPurify 严格白名单净化；表格对齐 class 化 + 金额列右对齐 + 横向滚动容器 |
+| `frontend/src/components/MarkdownContent.vue` | 新建：可复用助手回答展示组件（段落 / 换行 / 列表 / 加粗 / 代码块 / 表格），v-html 只接收净化结果 |
+| `frontend/src/components/AssistantPanel.vue` | 修改：助手文本改用 `MarkdownContent`；用户消息仍按纯文本展示；工具结果卡 / 确认按钮 / 服务端状态说明职责不变 |
+| `frontend/scripts/verify-markdown.mjs` | 新建：本地固定文本 + 安全净化验证（32 项断言，jsdom + dompurify） |
+| `frontend/package.json` | 修改：新增依赖 `markdown-it@^15.0.3`、`dompurify@^3.4.17`；devDependency `jsdom@^30.1.3`（仅验证脚本用，不进构建产物） |
+| `docs/development-log.md` | 本日志 |
+
+### 二、实现要点
+
+- **解析与净化分离**：markdown-it 关闭 `html`（原始 HTML 一律转义）、关闭 `linkify`、开启 `breaks`；
+  DOMPurify 提供严格 `ALLOWED_TAGS` / `ALLOWED_ATTR` 白名单，仅保留文本、列表、代码、表格与链接标签，
+  禁止脚本 / 事件属性 / 表单 / 按钮 / iframe / 图片 / 可执行链接（`javascript:` / `data:` / `vbscript:` 由
+  DOMPurify 默认 URI 校验阻断）。
+- **表格**：表头 `:---`/`:---:` 对齐转为受控 class（不保留内联 style）；整列数据格均为金额/数值时右对齐
+  （可靠识别），否则统一左对齐，不改动模型数值；外层 `div.md-table-scroll` 横向滚动，手机宽度不撑宽整页。
+- **复用**：无现成 Markdown 依赖，选用 `markdown-it + dompurify`，不引大型 UI 库、不用正则自研解析器。
+- **职责隔离**：仅助手文本走 `MarkdownContent`；用户消息纯文本，工具结果卡 / 确认按钮 / 状态说明不经
+  模型生成的 HTML 创建业务入口。
+
+### 三、验证结果（真实执行）
+
+| 验证项 | 结果 |
+| ---- | ---- |
+| `node scripts/verify-markdown.mjs` | ✅ 32/32（银行卡表格、多行表格、金额列右对齐、显式对齐、普通文本/换行/列表/加粗/代码块、不完整表格回退、恶意 HTML/事件属性/图片/javascript·data·链接阻断、安全 http 链接保留并带 rel） |
+| `npm run build`（前端） | ✅ 通过（62 模块；dist js 239.81 kB，因打包 markdown-it + dompurify 增大） |
+| 浏览器可视验收（电脑/手机宽度） | ⚠️ 未做（命令行环境，无浏览器；仅验证构建与 Node 渲染/净化） |
+| 收费模型 / 数据库 / 业务逻辑 | ✅ 未调用、未修改、未改动 |
+
+### 四、已知限制
+
+- 表格金额列右对齐为「整列数据格均为数值/金额」的可靠启发式；混有非数值格的列统一左对齐。
+- 浏览器端实际渲染（Vite 打包后 `createDOMPurify(window)` 路径）已随构建与 Node 同一模块路径验证，
+  但未做真实浏览器可视验收。
+
+## 第十七阶段：修复连续输入与焦点 + 服务端持久化当前对话
+
+日期：2026-10-22
+
+本轮只修两件事：**发送消息后不能直接继续输入**、**刷新页面后聊天记录丢失**。不改变账户 / 银行卡状态区分，
+不改变转账或强验证业务规则，不修改开发库业务数据，不调用收费模型。
+
+### 一、新增 / 修改
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `backend/src/db/schema.js` | 修改：新增 `chat_sessions`（模型上下文 + 会话元数据）、`chat_messages`（用户可见消息）、`chat_state`（当前对话指针）三张表及索引 |
+| `backend/src/services/assistant.js` | 修改：会话持久化（单事务写会话 + 消息 + 指针，200 条上限、7 天保留、损坏 JSON 容错）；`getCurrent` 只读恢复、`newConversation` 切换对话、`purgeExpiredSessions` |
+| `backend/src/routes/assistant.js` | 修改：新增 `GET /api/assistant/current`（只读恢复）、`POST /api/assistant/new`（新建对话，均不校验密钥、不调模型） |
+| `frontend/src/api/index.js` | 修改：新增 `fetchCurrentChat` / `newConversation` |
+| `frontend/src/components/AssistantPanel.vue` | 修改：单行输入改为 `textarea`；中文输入法 composition 守卫（IME 回车不发送）+ Shift+Enter 换行；发送后 `nextTick` 聚焦、等待中仍可起草、回复/失败不清空等待期草稿；挂载时 `loadCurrent` 恢复 + 加载 / 失败重试 / 过期 / 欢迎态 |
+| `backend/scripts/verify-assistant.js` | 修改：6.2 过期会话沿用同一 `sessionId`（可见历史保留，上下文重新开始） |
+| `backend/scripts/verify-chat-persistence.js` | 新建：mock 模型 + 临时库验证持久化（35 项断言） |
+| `docs/api.md` / `docs/database-design.md` / `docs/development-log.md` | 文档同步 |
+
+### 二、实现要点
+
+- **连续输入与焦点**：Enter 发送、Shift+Enter 换行；`compositionstart/end` + `isComposing`/`keyCode 229` 守卫，
+  中文输入法选词回车不发送；发送后清空输入并用 `ref + nextTick` 恢复焦点；等待回复期间不禁用输入（可起草但不可并行提交）；
+  回复/失败只清空已发送内容，不覆盖等待期新起草的草稿；回复返回不抢其他输入框 / 验证表单焦点。
+- **服务端持久化**：区分 part A（`chat_messages` 用户可见消息、工具记录、时间、`ref_no` 引用）与
+  part B（`chat_sessions.messages_json` 模型上下文 + 会话元数据）。刷新经只读 `GET /current` 恢复，不调收费模型、不重发；
+  后端重启后仍能恢复（读库而非内存）。
+- **安全与归属**：演示用户服务端确定（不接受客户端 `userId` / 伪造历史）；system 提示每次按当前上海时间由服务端生成、不持久化；
+  不持久化交易密码 / 验证码 / TOTP 密钥 / 模型密钥 / 敏感请求体；不使用 localStorage 存聊天。
+- **一致性**：操作卡以 `ref_no` 回读业务库**最新状态**，不沿用历史快照；刷新不重建会话、不伪造历史；
+  旧迟到响应不污染新会话（`setCurrentSession` 前校验当前会话）；过期会话历史仍可查看并提示上下文重新开始。
+
+### 三、验证结果（真实执行）
+
+| 验证项 | 结果 |
+| ---- | ---- |
+| `node backend/scripts/verify-chat-persistence.js` | ✅ 35/35（两轮恢复、重启上下文、过期、tool 配对+归属、新建隔离、只读不伪造、操作卡回读、无凭据、上限+保留+损坏 JSON） |
+| `node backend/scripts/verify-assistant.js` | ✅ 通过（含 6.2 过期沿用同一 sessionId） |
+| `node backend/scripts/verify-card-operations.js` | ✅ 78/78 |
+| `node backend/scripts/verify-transfers.js` | ✅ 61/61 |
+| `node backend/scripts/verify-strong-verification.js` | ✅ 73/73 |
+| `node backend/scripts/verify-migrate.js` / `verify-db.js` | ✅ 通过 |
+| `node frontend/scripts/verify-markdown.mjs` | ✅ 32/32 |
+| `npm run build`（前端） | ✅ 通过（62 模块；dist js 240.97 kB） |
+| 后端运行状态 | ✅ `GET /api/health` 正常；`GET /api/assistant/current` 返回空会话（新表 / 端点已随 nodemon 自动重启生效） |
+| 收费模型 / 开发库业务数据 | ✅ 未调用、未修改 |
+| 浏览器可视验收（连续输入 / 刷新恢复） | ⚠️ 未做（命令行环境无浏览器；已通过 Node 级验证 + 构建，人工验收步骤见交付报告） |
+
+### 四、已知限制
+
+- 焦点与中文输入法行为已按规范实现并通过代码级校验，但真实浏览器交互（IME 组合、刷新恢复）需人工验收确认。
+- 历史消息为查询时快照，操作卡状态以业务库最新值为准（设计如此，非缺陷）。
+
+## 第十八阶段：交易流水入账状态筛选 + 翻页位置稳定
+
+日期：2026-10-22
+
+本轮只做两件事：交易流水增加「全部 / 已入账 / 待入账」入账状态筛选；修复翻页时整页向上跳动。
+
+### 一、根因
+
+- 翻页跳动：`TransactionList` 加载时用 `v-if="loading"` 整体替换「列表 + 分页区」为一行「加载中…」，导致该段高度骤降约整页，整页阅读模式下视口被钳制后上跳（落到月度分析附近）。
+  按钮为原生 `<button>`（无 href / 表单提交），组件内无 `scrollIntoView` / `scrollTo` / `focus` / 自动滚动 watch；助手的 `focusInput` / `scrollToBottom` 只作用于其自身流程，不被流水请求间接触发。
+
+### 二、修改文件
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `backend/src/services/transactions.js` | `listTransactions` 增加 `status` 条件（与 COUNT 同 `WHERE`，参数化） |
+| `backend/src/routes/transactions.js` | `GET /api/transactions` 增加可选 `status`：仅 `posted` / `pending`；非法值 / 重复参数（数组）/ `status[]=` 均 400 |
+| `frontend/src/api/index.js` | `fetchTransactions` 增加 `status` 参数 |
+| `frontend/src/components/TransactionList.vue` | 增加「全部 / 已入账 / 待入账」下拉；任一筛选变化回第 1 页；`meta.total` 来自后端；竞态防护保留；翻页稳定：外层 `min-height` 预留完整页高度 + 分页区常驻 + 加载中禁用翻页按钮 |
+| `backend/scripts/verify-api.js` | 扩展状态筛选断言（含 posted/pending 正确 total、月份组合、跨页完整筛出、非法参数 400、他用户隔离） |
+| `docs/api.md` | 补充 `GET /api/transactions` 的 `status` 参数说明 |
+
+### 三、验证结果（真实执行）
+
+| 验证项 | 结果 |
+| ---- | ---- |
+| `node backend/scripts/verify-api.js` | ✅ 34/34（含状态筛选 13 项 + 原有回归） |
+| `npm run build`（前端） | ✅ 通过（62 模块） |
+| 浏览器可视验收（翻页位置 / 桌面与手机宽度） | ⚠️ 未做（命令行环境无浏览器） |
+
+## 第十九阶段：三区域筛选展示（流水文案 / 银行卡卡种 / 订阅状态）
+
+日期：2026-10-22
+
+本轮仅做前端展示层筛选，不引入新依赖、不改后端 / 数据库 / 业务数据；银行卡与订阅接口本就返回完整列表（无分页），故用 Vue `computed` 在完整数据上过滤。
+
+### 一、字段与状态映射
+
+- 交易流水：状态筛选文案「未入账」→「待入账」（`pending` 参数与筛选逻辑不变）。
+- 银行卡：`card_type` 字段，映射 `借记卡` / `信用卡`（固定选项）；其它出现的卡种按实际字段补充为选项；
+  未知 / 空卡种在「全部」中展示并兜底「其他卡种」，不归为借记卡 / 信用卡。状态仍按 `active/frozen/cancelled` 展示（`statusText` 不变）。
+- 订阅：`status` 字段枚举 `active`（生效）/ `paused`（暂停）/ `cancelled`（已取消），映射固定选项；
+  未知状态仅在「全部」中展示并兜底「未知状态」，不按商户名 / 扣费日期 / 金额猜测。
+
+### 二、修改文件
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `frontend/src/components/TransactionList.vue` | 状态筛选选项「未入账」→「待入账」 |
+| `frontend/src/components/CardList.vue` | 新增「全部 / 借记卡 / 信用卡」卡种筛选（`computed` 前端过滤），空结果提示「该卡种暂无银行卡」，冻结 / 解冻后保留选择并回读最新状态 |
+| `frontend/src/components/SubscriptionList.vue` | 新增「全部 / 生效 / 暂停 / 已取消」状态筛选（`computed` 前端过滤），空结果提示「该状态下暂无订阅」，已取消仍显示「已取消，不再扣费」 |
+
+### 三、验证结果（真实执行）
+
+| 验证项 | 结果 |
+| ---- | ---- |
+| `npm run build`（前端） | ✅ 通过（62 模块） |
+| 浏览器可视验收（三区域切换 / 空结果 / 手机宽度） | ⚠️ 未做（命令行环境无浏览器，见交付报告） |
+

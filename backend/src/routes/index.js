@@ -7,6 +7,7 @@ import { createAnalyticsRouter } from './analytics.js'
 import { createAssistantRouter } from './assistant.js'
 import { createTransfersRouter } from './transfers.js'
 import { createVerificationRouter } from './verification.js'
+import { createCardOperationsRouter } from './card-operations.js'
 
 export function createApiRouter(db, demoUserId) {
   const router = Router()
@@ -18,5 +19,6 @@ export function createApiRouter(db, demoUserId) {
   router.use('/assistant', createAssistantRouter(db, demoUserId))
   router.use('/transfers', createTransfersRouter(db, demoUserId))
   router.use('/verification', createVerificationRouter(db, demoUserId))
+  router.use('/card-operations', createCardOperationsRouter(db, demoUserId))
   return router
 }

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { fetchTransactions } from '../api/index.js'
 import { useMonthRange } from '../composables/useMonthRange.js'
 import { useDataRefresh } from '../composables/useDataRefresh.js'
@@ -20,6 +20,7 @@ const {
 
 const year = ref(String(currentYear)) // 选中的年份（字符串）；'' 表示「全部月份」
 const monthNum = ref(currentMonth)    // 选中的月份（1-12）
+const statusFilter = ref('')          // 入账状态：'' 全部 / 'posted' 已入账 / 'pending' 待入账
 const page = ref(1)
 
 const isAll = computed(() => year.value === '')
@@ -36,6 +37,24 @@ const error = ref('')
 // 竞态防护：每次加载自增序号，仅最新一次请求允许写回结果，旧请求一律丢弃。
 let requestId = 0
 
+// 分页稳定性：翻页加载时保留上一页列表高度，避免整段塌陷导致视口上跳。
+// 外层 .tx-body-reserve 用 min-height 预留「完整页」高度，内层 .tx-body 测量自然高度（只增不减）。
+const bodyEl = ref(null)
+const reserveHeight = ref(0)
+const reserveStyle = computed(() =>
+  reserveHeight.value > 0 ? { minHeight: reserveHeight.value + 'px' } : {},
+)
+
+function measureBody() {
+  if (!bodyEl.value) return
+  const h = bodyEl.value.offsetHeight
+  if (h > reserveHeight.value) reserveHeight.value = h
+}
+
+function resetReserve() {
+  reserveHeight.value = 0
+}
+
 async function load() {
   const id = ++requestId
   loading.value = true
@@ -47,17 +66,20 @@ async function load() {
       : `${year.value}-${String(monthNum.value).padStart(2, '0')}`
     const res = await fetchTransactions({
       month: monthValue,
+      status: statusFilter.value === '' ? undefined : statusFilter.value,
       limit: PAGE_SIZE,
       offset,
     })
     if (id !== requestId) return // 过期请求，丢弃
     rows.value = res.rows
     total.value = res.total
+    loading.value = false
+    await nextTick()
+    if (id === requestId) measureBody()
   } catch (e) {
     if (id !== requestId) return
     error.value = e && e.message ? e.message : '加载失败'
-  } finally {
-    if (id === requestId) loading.value = false
+    loading.value = false
   }
 }
 
@@ -75,7 +97,8 @@ function onYearChange() {
 }
 
 function changeFilter() {
-  page.value = 1 // 切换月份回到第一页
+  resetReserve() // 换筛选条件后重新测量，避免沿用上一筛选的预留高度
+  page.value = 1 // 任一筛选变化回到第一页
   load()
 }
 
@@ -126,45 +149,53 @@ watch(version, load)
         </template>
         <span v-else-if="accountsLoading" class="filter-note">正在获取开户日期…</span>
         <span v-else class="filter-warn">{{ filterMessage }}</span>
+        <label class="filter-label">状态</label>
+        <select v-model="statusFilter" class="select" aria-label="入账状态" @change="changeFilter">
+          <option value="">全部</option>
+          <option value="posted">已入账</option>
+          <option value="pending">待入账</option>
+        </select>
       </div>
     </div>
 
-    <p v-if="loading" class="state-loading">加载中…</p>
-    <div v-else-if="error" class="state-error">
-      <p class="state-error-text">{{ error }}</p>
-      <button class="btn-ghost" @click="load">重试</button>
-    </div>
-    <template v-else>
-      <p v-if="rows.length === 0" class="state-empty">该月份暂无交易</p>
-      <ul v-else class="tx-list">
-        <li v-for="t in rows" :key="t.id" class="tx-item">
-          <div class="tx-main">
-            <span class="tx-merchant">{{ t.merchant || '—' }}</span>
-            <span class="tx-sub">
-              {{ t.category }}<template v-if="t.description"> · {{ t.description }}</template>
-            </span>
-          </div>
-          <div class="tx-side">
-            <span class="tx-amount" :class="t.direction === 'income' ? 'is-income' : 'is-expense'">
-              {{ amountPrefix(t.direction) }}{{ formatCentsToYuan(t.amount_cents) }}
-            </span>
-            <span class="status-badge" :class="statusTone(t.status)">
-              {{ statusText[t.status] || '未知状态' }}
-            </span>
-            <span class="tx-time">{{ formatShanghaiDateTime(t.transaction_at) }}</span>
-          </div>
-        </li>
-      </ul>
-
-      <div class="pager">
-        <span class="pager-total">共 {{ total }} 条</span>
-        <div class="pager-controls">
-          <button class="btn" :disabled="!hasPrev" @click="prevPage">上一页</button>
-          <span class="pager-info">第 {{ page }} / {{ totalPages }} 页</span>
-          <button class="btn" :disabled="!hasNext" @click="nextPage">下一页</button>
+    <div class="tx-body-reserve" :style="reserveStyle">
+      <div ref="bodyEl" class="tx-body">
+        <p v-if="loading" class="state-loading">加载中…</p>
+        <div v-else-if="error" class="state-error">
+          <p class="state-error-text">{{ error }}</p>
+          <button class="btn-ghost" @click="load">重试</button>
         </div>
+        <p v-else-if="rows.length === 0" class="state-empty">当前筛选条件下暂无交易记录</p>
+        <ul v-else class="tx-list">
+          <li v-for="t in rows" :key="t.id" class="tx-item">
+            <div class="tx-main">
+              <span class="tx-merchant">{{ t.merchant || '—' }}</span>
+              <span class="tx-sub">
+                {{ t.category }}<template v-if="t.description"> · {{ t.description }}</template>
+              </span>
+            </div>
+            <div class="tx-side">
+              <span class="tx-amount" :class="t.direction === 'income' ? 'is-income' : 'is-expense'">
+                {{ amountPrefix(t.direction) }}{{ formatCentsToYuan(t.amount_cents) }}
+              </span>
+              <span class="status-badge" :class="statusTone(t.status)">
+                {{ statusText[t.status] || '未知状态' }}
+              </span>
+              <span class="tx-time">{{ formatShanghaiDateTime(t.transaction_at) }}</span>
+            </div>
+          </li>
+        </ul>
       </div>
-    </template>
+    </div>
+
+    <div v-if="total > 0" class="pager">
+      <span class="pager-total">共 {{ total }} 条</span>
+      <div class="pager-controls">
+        <button class="btn" :disabled="loading || !hasPrev" @click="prevPage">上一页</button>
+        <span class="pager-info">第 {{ page }} / {{ totalPages }} 页</span>
+        <button class="btn" :disabled="loading || !hasNext" @click="nextPage">下一页</button>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -274,6 +305,9 @@ watch(version, load)
 }
 
 @media (max-width: 640px) {
+  .filter {
+    flex-wrap: wrap;
+  }
   .tx-item {
     flex-direction: column;
     align-items: flex-start;

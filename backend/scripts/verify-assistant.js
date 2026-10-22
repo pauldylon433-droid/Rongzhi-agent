@@ -194,7 +194,7 @@ const demoUserId = u1
   // 手动把会话标记为过期
   assistant._sessions.get(r1.sessionId).lastActiveAt = Date.now() - 31 * 60 * 1000
   const r2 = await assistant.chat({ message: '上个月呢？', sessionId: r1.sessionId })
-  check('6.2 过期会话生成新 sessionId', r2.sessionId !== r1.sessionId)
+  check('6.2 过期会话沿用同一 sessionId（可见历史保留，上下文重新开始）', r2.sessionId === r1.sessionId)
   const userMsgs = mock.calls[1].messages.filter((m) => m.role === 'user').map((m) => m.content)
   check('6.3 过期会话不保留旧上下文', userMsgs.length === 1 && userMsgs[0] === '上个月呢？', JSON.stringify(userMsgs))
 }

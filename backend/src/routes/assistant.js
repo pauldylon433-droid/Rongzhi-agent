@@ -1,4 +1,4 @@
-// AI 助手路由：POST /api/assistant/chat。
+// AI 助手路由：POST /api/assistant/chat、GET /api/assistant/current、POST /api/assistant/new。
 // 只接受用户消息与可选会话标识；拒绝 system 消息、tool 结果、完整模型历史等字段。
 // 用户身份由服务端固定演示用户提供（demoUserId），不接受客户端切换。
 import { Router } from 'express'
@@ -66,6 +66,26 @@ export function createAssistantRouter(db, demoUserId) {
       }
       console.error('[助手] 未预期错误：', e && e.message ? e.message : e)
       res.status(500).json({ success: false, message: '助手服务内部错误' })
+    }
+  })
+
+  // 读取当前对话（只读恢复）：不调用模型、不重发消息、不修改数据。未配置密钥也可用（用于刷新恢复历史）。
+  router.get('/current', (req, res) => {
+    try {
+      ok(res, assistant.getCurrent())
+    } catch (e) {
+      console.error('[助手] 读取当前对话失败：', e && e.message ? e.message : e)
+      res.status(500).json({ success: false, message: '读取聊天记录失败' })
+    }
+  })
+
+  // 服务端切换「新建对话」：清除当前对话指针，刷新不再恢复旧对话。不删除历史、不改业务数据，无需模型密钥。
+  router.post('/new', (req, res) => {
+    try {
+      ok(res, assistant.newConversation())
+    } catch (e) {
+      console.error('[助手] 切换新对话失败：', e && e.message ? e.message : e)
+      res.status(500).json({ success: false, message: '切换新对话失败' })
     }
   })
 

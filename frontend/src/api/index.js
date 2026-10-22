@@ -38,12 +38,13 @@ export async function fetchSubscriptions() {
   return body.data
 }
 
-// month 为空表示不筛选（全部月份）
-export async function fetchTransactions({ month, limit, offset }) {
+// month 为空表示不筛选（全部月份）；status 为空表示不筛选（全部入账状态）
+export async function fetchTransactions({ month, status, limit, offset }) {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
   params.set('offset', String(offset))
   if (month) params.set('month', month)
+  if (status) params.set('status', status)
   const body = await request(`/api/transactions?${params.toString()}`)
   return { rows: body.data, total: body.meta.total }
 }
@@ -99,6 +100,18 @@ export async function chatAssistant({ message, sessionId }) {
   return body.data
 }
 
+// 读取当前对话（刷新恢复；只读，不调用模型、不重发消息）
+export async function fetchCurrentChat() {
+  const body = await request('/api/assistant/current')
+  return body.data
+}
+
+// 服务端切换「新建对话」（清除当前对话指针；不删除历史、不改业务数据）
+export async function newConversation() {
+  const body = await postJson('/api/assistant/new', {})
+  return body.data
+}
+
 // —— 模拟转账 ——
 
 export async function fetchTransferRecipients() {
@@ -137,5 +150,33 @@ export async function fetchVerificationStatus() {
 // 强验证确认转账（交易密码 + 动态验证码；凭据仅发往专用验证接口，不进入 AI 请求 / 聊天历史 / 本地存储）
 export async function verifyTransfer(refNo, { password, totp }) {
   const body = await postJson(`/api/transfers/${refNo}/verify`, { password, totp })
+  return body.data
+}
+
+// —— 银行卡操作（查询 + 临时冻结 / 解冻）——
+
+export async function createCardOperation({ card_id, action }) {
+  const body = await postJson('/api/card-operations', { card_id, action })
+  return body.data
+}
+
+export async function fetchCardOperation(refNo) {
+  const body = await request(`/api/card-operations/${refNo}`)
+  return body.data
+}
+
+export async function confirmCardOperation(refNo) {
+  const body = await postJson(`/api/card-operations/${refNo}/confirm`, { confirm: true })
+  return body.data
+}
+
+export async function cancelCardOperation(refNo) {
+  const body = await postJson(`/api/card-operations/${refNo}/cancel`, { cancel: true })
+  return body.data
+}
+
+// 强验证确认解冻（交易密码 + 动态验证码；凭据仅发往专用验证接口，不进入 AI 请求 / 聊天历史 / 本地存储）
+export async function verifyCardOperation(refNo, { password, totp }) {
+  const body = await postJson(`/api/card-operations/${refNo}/verify`, { password, totp })
   return body.data
 }

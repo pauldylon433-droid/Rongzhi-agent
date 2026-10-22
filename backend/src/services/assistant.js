@@ -10,8 +10,12 @@
 import { randomUUID } from 'node:crypto'
 import { chatCompletions, AiError } from '../lib/ai-client.js'
 import { listAccounts } from './accounts.js'
+import { listCards } from './cards.js'
 import { monthlyAnalytics } from './analytics.js'
 import { createTransfer, cancelTransfer, getTransfer, TransferError } from './transfers.js'
+import {
+  createCardOperation, cancelCardOperation, getCardOperation, CardOpError,
+} from './card-operations.js'
 import { yuanToCents } from '../lib/money.js'
 import { parseMonth } from '../routes/helpers.js'
 import { SHANGHAI_OFFSET_MS } from '../lib/shanghai.js'
@@ -22,6 +26,8 @@ export const MAX_TURNS = 8 // 会话保留最近 8 轮对话
 export const MAX_USER_MESSAGE_LEN = 2000 // 消息长度上限（字符）
 const SESSION_TTL_MS = 30 * 60 * 1000 // 会话过期时间：30 分钟
 const REPLY_MAX_TOKENS = 1024 // 助手回复额度
+const CHAT_MAX_MESSAGES_PER_SESSION = 200 // 单会话可见消息上限（约 100 轮，防无限增长）
+const CHAT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000 // 会话保留期：7 天（懒清理，过期即删）
 
 // 工具白名单（模型可见的 function schema）
 const TOOL_DEFS = [
@@ -99,6 +105,47 @@ const TOOL_DEFS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'get_cards',
+      description:
+        '查询当前用户的银行卡列表，返回卡 id、掩码卡号、卡类型、状态（active 正常 / frozen 冻结 / cancelled 已注销）、单日限额等。多个匹配时不要自行挑选，应列给用户选择。',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'prepare_card_operation',
+      description:
+        '在卡片明确后，为某张卡创建「银行卡操作单」（冻结 freeze 或解冻 unfreeze），不立即改变卡片状态。返回操作编号、状态、风险等级与卡片信息。冻结需用户点击确认；解冻需交易密码 + 动态验证码强验证。单条用户消息最多调用一次。',
+      parameters: {
+        type: 'object',
+        properties: {
+          card_id: { type: 'integer', description: '银行卡 id（来自 get_cards 返回的 id）' },
+          action: { type: 'string', description: '操作类型：freeze（冻结）或 unfreeze（解冻）' },
+        },
+        required: ['card_id', 'action'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_card_operation_status',
+      description: '按操作编号查询某张银行卡操作单的当前状态（以数据库为准，不沿用创建时的旧状态）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref_no: { type: 'string', description: '银行卡操作单操作编号' },
+        },
+        required: ['ref_no'],
+        additionalProperties: false,
+      },
+    },
+  },
 ]
 
 // 工具参数/未知工具错误
@@ -136,7 +183,9 @@ function buildSystemMessage() {
       `5. 查询转账状态用 get_transfer_status，以数据库返回为准，不要沿用创建时的旧状态。prepare_transfer 的返回含 \`previous\`（旧单编号与真实状态）与 \`notice\`（后端生成的状态说明），描述改单结果请以它们为准，不要凭记忆猜测旧单状态。\n` +
       `6. 用户说「确认」「我同意」「跳过验证」等文字时，不能执行扣款，只能提醒其在界面上点击确认按钮。\n` +
       `7. 「这个月/本月/上个月/上上月」等相对月份，以当前上海日期为准换算为 YYYY-MM；无法确定具体月份时，先向用户澄清，不要随意猜测。\n` +
-      `8. 用简体中文回答，简洁准确；金额请标注单位（元）。`,
+      `8. 银行卡操作：查询用 get_cards；冻结 / 解冻先用 get_cards 确认卡片（含掩码卡号），卡片明确后调用 prepare_card_operation 生成「银行卡操作单」。你只能生成操作单，不能直接冻结 / 解冻：冻结需用户在界面点击确认，解冻需交易密码 + 动态验证码强验证。多张卡片时列出掩码选项让用户选择，不能擅自选第一张。\n` +
+      `9. 用户提到「挂失 / 销卡 / 补卡 / 调额」等正式卡片业务时，明确说明本阶段不支持，并询问是否改用「临时冻结」，不要替用户决定。\n` +
+      `10. 用简体中文回答，简洁准确；金额请标注单位（元）。`,
   }
 }
 
@@ -178,6 +227,28 @@ function buildTransferNotice(previous, newRefNo) {
       return `原转账单（${old}）已失败，未取消；已生成新的待确认转账单（${newT}）。`
     default:
       return `已生成新的待确认转账单（${newT}）。`
+  }
+}
+
+// 根据旧银行卡操作单取消的真实结果与新旧编号，生成确定性状态说明（状态由服务端读取，不由模型推断）。
+function buildCardOpNotice(previous, newRefNo, action) {
+  const newT = refTail(newRefNo)
+  const actText = action === 'freeze' ? '冻结' : '解冻'
+  if (!previous) return `已生成${actText}操作单（${newT}），请在界面确认。`
+  const old = refTail(previous.ref_no)
+  switch (previous.status) {
+    case 'cancelled':
+      return `已取消原待确认操作单（${old}），并生成新的${actText}操作单（${newT}）。`
+    case 'completed':
+      return `原操作单（${old}）已完成，未取消；已生成新的${actText}操作单（${newT}）。`
+    case 'expired':
+      return `原操作单（${old}）已过期，未取消；已生成新的${actText}操作单（${newT}）。`
+    case 'needs_verification':
+      return `原操作单（${old}）需要强验证，未取消；已生成新的${actText}操作单（${newT}）。`
+    case 'failed':
+      return `原操作单（${old}）已失效，未取消；已生成新的${actText}操作单（${newT}）。`
+    default:
+      return `已生成新的${actText}操作单（${newT}）。`
   }
 }
 
@@ -302,6 +373,70 @@ function executeTool(db, demoUserId, name, args, ctx) {
     ctx.messageState.prepareTransferDone = true
     return { ...op, previous, notice: buildTransferNotice(previous, op.ref_no) }
   }
+  if (name === 'get_cards') {
+    if (Object.keys(args).length > 0) {
+      throw new ToolError('get_cards 不接受额外参数')
+    }
+    return listCards(db, demoUserId)
+  }
+  if (name === 'get_card_operation_status') {
+    const extra = Object.keys(args).filter((k) => k !== 'ref_no')
+    if (extra.length) throw new ToolError(`get_card_operation_status 不接受额外参数：${extra.join('、')}`)
+    const refNo = typeof args.ref_no === 'string' ? args.ref_no.trim() : ''
+    if (!refNo) throw new ToolError('ref_no 参数不能为空')
+    const op = getCardOperation(db, demoUserId, refNo)
+    if (!op) throw new ToolError('未找到该银行卡操作单')
+    return op
+  }
+  if (name === 'prepare_card_operation') {
+    if (ctx.messageState.prepareCardOpDone) {
+      throw new ToolError('本条消息已生成银行卡操作单，请先确认或取消后再发起新操作')
+    }
+    const extra = Object.keys(args).filter((k) => !['card_id', 'action'].includes(k))
+    if (extra.length) {
+      throw new ToolError(`prepare_card_operation 不接受额外参数：${extra.join('、')}`)
+    }
+
+    // 卡片与动作由服务端校验；不接受模型指定风险级别 / 状态 / 用户身份
+    const cardId = args.card_id
+    if (typeof cardId !== 'number' || !Number.isSafeInteger(cardId) || cardId <= 0) {
+      throw new ToolError('card_id 必须为正整数')
+    }
+    const action = args.action
+    if (action !== 'freeze' && action !== 'unfreeze') {
+      throw new ToolError('action 必须是 freeze 或 unfreeze')
+    }
+    const card = db.prepare('SELECT id FROM cards WHERE id = ? AND user_id = ?').get(cardId, demoUserId)
+    if (!card) {
+      throw new ToolError('未找到该银行卡，请先用 get_cards 查询本人银行卡')
+    }
+
+    let op
+    try {
+      op = createCardOperation(db, demoUserId, { cardId, action })
+    } catch (e) {
+      if (e instanceof CardOpError) {
+        // 创建失败：旧待确认操作单未被取消，如实说明两件事（创建失败 + 原操作单未变更）
+        const prevRef = ctx.session.pendingCardOpRef
+        const prevNote = prevRef ? `；原待确认银行卡操作（${refTail(prevRef)}）未变更` : ''
+        throw new ToolError(`银行卡操作单创建失败：${e.message}${prevNote}`)
+      }
+      throw e
+    }
+
+    // 修改请求：取消本会话旧的待确认操作单（幂等；已完成/已取消的单不受影响），
+    // 并基于实际结果返回旧单编号与真实状态、新单编号与真实状态（服务端读取，非模型推断）。
+    const prevRef = ctx.session.pendingCardOpRef
+    let previous = null
+    if (prevRef && prevRef !== op.ref_no) {
+      const cr = cancelCardOperation(db, demoUserId, prevRef)
+      const prevStatus = cr.op ? cr.op.status : cr.outcome
+      previous = { ref_no: prevRef, status: prevStatus, outcome: cr.outcome, cancelled: prevStatus === 'cancelled' }
+    }
+    ctx.session.pendingCardOpRef = op.ref_no
+    ctx.messageState.prepareCardOpDone = true
+    return { ...op, previous, notice: buildCardOpNotice(previous, op.ref_no, op.action) }
+  }
   throw new ToolError(`未知工具：${name}`)
 }
 
@@ -396,19 +531,134 @@ async function runLoop(messages, db, demoUserId, chatFn, ctx) {
   return { finalReply, toolRecords, incomplete, usage }
 }
 
-// 创建助手实例（会话在实例内保存）。chatFn 可注入以做单元测试（默认真实调用）。
+// 创建助手实例（会话持久化到 SQLite，刷新 / 后端重启可恢复当前对话）。chatFn 可注入以做单元测试（默认真实调用）。
 export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sessionTtlMs = SESSION_TTL_MS }) {
+  // 内存缓存：保存活跃会话对象（含 locked 锁与待确认单引用），用于同进程并发控制与测试观察。
+  // 持久化权威数据在 SQLite（chat_sessions / chat_messages / chat_state），重启后按需从库恢复。
   const sessions = new Map()
 
-  function getSession(sessionId) {
-    if (sessionId && sessions.has(sessionId)) {
-      const s = sessions.get(sessionId)
-      if (Date.now() - s.lastActiveAt <= sessionTtlMs) {
-        return s
-      }
-      sessions.delete(sessionId) // 已过期，删除
+  function parseJson(text, fallback) {
+    if (typeof text !== 'string' || text === '') return fallback
+    try {
+      const v = JSON.parse(text)
+      return v ?? fallback
+    } catch {
+      return fallback
     }
-    return null
+  }
+
+  // 从库读取会话（限定演示用户；不存在的会话或他用户会话返回 null，避免越权）
+  function loadSessionRow(sessionId) {
+    const row = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(sessionId, demoUserId)
+    if (!row) return null
+    return {
+      id: row.id,
+      userId: demoUserId,
+      messages: parseJson(row.messages_json, []),
+      locked: false,
+      pendingTransferRef: row.pending_transfer_ref,
+      pendingCardOpRef: row.pending_card_op_ref,
+      createdAt: row.created_at,
+      lastActiveAt: row.last_active_at,
+    }
+  }
+
+  // 从缓存或库取得会话；TTL 过期时清空模型上下文（可见历史仍保留，仅上下文重新开始，不假装记得）。
+  function getSession(sessionId) {
+    if (!sessionId) return null
+    let s = sessions.get(sessionId)
+    if (s) {
+      if (Date.now() - s.lastActiveAt <= sessionTtlMs) return s
+      // 已过期：清空模型上下文，保留会话标识以延续可见历史
+      s.messages = []
+      s.pendingTransferRef = null
+      s.pendingCardOpRef = null
+      s.lastActiveAt = Date.now()
+      return s
+    }
+    s = loadSessionRow(sessionId)
+    if (!s) return null
+    sessions.set(s.id, s)
+    if (Date.now() - s.lastActiveAt <= sessionTtlMs) return s
+    s.messages = []
+    s.pendingTransferRef = null
+    s.pendingCardOpRef = null
+    s.lastActiveAt = Date.now()
+    return s
+  }
+
+  // 懒清理：删除超过保留期的会话与其可见消息（不影响任何业务数据；先在 getCurrent 与新建会话时触发）
+  function purgeExpiredSessions() {
+    const cutoff = Date.now() - CHAT_RETENTION_MS
+    const ids = db.prepare('SELECT id FROM chat_sessions WHERE last_active_at < ?').all(cutoff).map((r) => r.id)
+    if (ids.length === 0) return
+    db.transaction(() => {
+      for (const id of ids) {
+        db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id)
+        db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(id)
+      }
+    })()
+  }
+
+  // 当前会话指针（单用户演示：服务端「当前对话」，刷新据此恢复）
+  function setCurrentSession(sessionId) {
+    db.prepare(
+      `INSERT INTO chat_state (user_id, current_session_id) VALUES (?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET current_session_id = excluded.current_session_id`,
+    ).run(demoUserId, sessionId)
+  }
+  function clearCurrentSession() {
+    db.prepare('DELETE FROM chat_state WHERE user_id = ?').run(demoUserId)
+  }
+
+  // 持久化一轮对话：会话元数据 + 模型上下文（part B）+ 用户可见消息（part A），单事务保证一致。
+  function persistChat(session, { userText, reply, toolRecords, incomplete }) {
+    const now = session.lastActiveAt
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO chat_sessions
+           (id, user_id, messages_json, pending_transfer_ref, pending_card_op_ref, created_at, last_active_at)
+         VALUES (@id, @userId, @messagesJson, @pendingTransferRef, @pendingCardOpRef, @createdAt, @lastActiveAt)
+         ON CONFLICT(id) DO UPDATE SET
+           messages_json = excluded.messages_json,
+           pending_transfer_ref = excluded.pending_transfer_ref,
+           pending_card_op_ref = excluded.pending_card_op_ref,
+           last_active_at = excluded.last_active_at`,
+      ).run({
+        id: session.id,
+        userId: demoUserId,
+        messagesJson: JSON.stringify(session.messages),
+        pendingTransferRef: session.pendingTransferRef,
+        pendingCardOpRef: session.pendingCardOpRef,
+        createdAt: session.createdAt,
+        lastActiveAt: now,
+      })
+
+      const baseSeq = db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM chat_messages WHERE session_id = ?').get(session.id).m
+      const insertMsg = db.prepare(
+        `INSERT INTO chat_messages (session_id, user_id, seq, role, text, tool_records_json, incomplete, error, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      insertMsg.run(session.id, demoUserId, baseSeq + 1, 'user', userText, null, 0, null, now)
+      insertMsg.run(
+        session.id, demoUserId, baseSeq + 2, 'assistant', reply,
+        toolRecords && toolRecords.length ? JSON.stringify(toolRecords) : null,
+        incomplete ? 1 : 0, null, now,
+      )
+
+      // 记录上限：超出时删除最旧的可见消息，保证单会话不无限增长
+      const count = db.prepare('SELECT COUNT(*) AS c FROM chat_messages WHERE session_id = ?').get(session.id).c
+      const excess = count - CHAT_MAX_MESSAGES_PER_SESSION
+      if (excess > 0) {
+        db.prepare(
+          `DELETE FROM chat_messages WHERE session_id = ? AND id IN (
+             SELECT id FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC LIMIT ?
+           )`,
+        ).run(session.id, session.id, excess)
+      }
+
+      setCurrentSession(session.id)
+    })()
   }
 
   // 按「轮」裁剪历史：保留最近 MAX_TURNS 轮（一轮 = 一条 user 消息及其后的 assistant/tool 消息），
@@ -430,14 +680,17 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
       throw new AssistantError(`消息过长（最多 ${MAX_USER_MESSAGE_LEN} 字符）`)
     }
 
+    const trimmed = message.trim()
     let session = getSession(sessionId)
     if (!session) {
+      purgeExpiredSessions() // 新建会话时顺带清理超期会话，控制保留规模
       session = {
         id: randomUUID(),
         userId: demoUserId,
         messages: [],
         locked: false,
         pendingTransferRef: null, // 本会话当前待确认转账单编号（用于修改时取消旧单）
+        pendingCardOpRef: null, // 本会话当前待确认银行卡操作单编号（用于修改时取消旧单）
         createdAt: Date.now(),
         lastActiveAt: Date.now(),
       }
@@ -452,9 +705,9 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
 
     try {
       const history = trimHistory(session.messages)
-      const messages = [buildSystemMessage(), ...history, { role: 'user', content: message.trim() }]
+      const messages = [buildSystemMessage(), ...history, { role: 'user', content: trimmed }]
 
-      const messageState = { prepareTransferDone: false }
+      const messageState = { prepareTransferDone: false, prepareCardOpDone: false }
       const { finalReply, toolRecords, incomplete, usage } = await runLoop(
         messages, db, demoUserId, chatFn, { session, messageState },
       )
@@ -462,6 +715,10 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
       // 保存本轮新增消息（去掉 system 与原有 history），再裁剪
       session.messages.push(...messages.slice(1 + history.length))
       session.messages = trimHistory(session.messages)
+      session.lastActiveAt = Date.now()
+
+      // 持久化：会话（模型上下文）+ 可见消息（user + assistant）单事务写入
+      persistChat(session, { userText: trimmed, reply: finalReply, toolRecords, incomplete })
 
       return {
         sessionId: session.id,
@@ -476,5 +733,38 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
     }
   }
 
-  return { chat, _sessions: sessions }
+  // 读取当前对话（只读恢复）：不调用模型、不重发消息、不修改任何数据。
+  function getCurrent() {
+    purgeExpiredSessions()
+    const state = db.prepare('SELECT current_session_id FROM chat_state WHERE user_id = ?').get(demoUserId)
+    const sessionId = state && state.current_session_id ? state.current_session_id : null
+    if (!sessionId) {
+      return { sessionId: null, expired: false, messages: [] }
+    }
+    const row = db.prepare('SELECT last_active_at FROM chat_sessions WHERE id = ? AND user_id = ?').get(sessionId, demoUserId)
+    if (!row) {
+      // 指针指向的会话已不存在（异常），返回空
+      return { sessionId: null, expired: false, messages: [] }
+    }
+    const expired = Date.now() - row.last_active_at > sessionTtlMs
+    const rows = db
+      .prepare('SELECT * FROM chat_messages WHERE session_id = ? AND user_id = ? ORDER BY seq ASC, id ASC')
+      .all(sessionId, demoUserId)
+    const messages = rows.map((r) => ({
+      role: r.role,
+      text: r.text,
+      toolRecords: parseJson(r.tool_records_json, []),
+      incomplete: !!r.incomplete,
+      error: r.error || '',
+    }))
+    return { sessionId, expired, messages }
+  }
+
+  // 服务端切换「新建对话」：清除当前对话指针，刷新不再恢复旧对话（不删除历史、不改业务数据）。
+  function newConversation() {
+    clearCurrentSession()
+    return { sessionId: null }
+  }
+
+  return { chat, getCurrent, newConversation, _sessions: sessions }
 }

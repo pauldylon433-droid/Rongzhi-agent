@@ -84,6 +84,17 @@ try {
     `INSERT INTO transactions (user_id, account_id, direction, amount_cents, category, merchant, description, transaction_at, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(demo.id, 1, 'expense', 100, '餐饮', '月末边界测试', '边界', '2026-09-30T15:30:00.000Z', 'posted')
+
+  // 入账状态筛选测试数据：已知 posted / pending 各若干笔，商家名可唯一定位
+  const insertTx = (merchant, ts, status, amount) => db.prepare(
+    `INSERT INTO transactions (user_id, account_id, direction, amount_cents, category, merchant, description, transaction_at, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(demo.id, 1, 'expense', amount, '测试', merchant, '状态筛选', ts, status)
+  insertTx('状态筛选-已入账', '2026-10-15T04:00:00.000Z', 'posted', 111)
+  insertTx('状态筛选-已入账2', '2026-10-20T04:00:00.000Z', 'posted', 222)
+  insertTx('状态筛选-已入账9', '2026-09-10T04:00:00.000Z', 'posted', 333)
+  insertTx('状态筛选-未入账', '2026-10-25T04:00:00.000Z', 'pending', 444)
+  insertTx('状态筛选-未入账11', '2026-11-05T04:00:00.000Z', 'pending', 555)
   db.close()
 
   // 2. 启动服务器（独立端口 + 临时库）
@@ -116,16 +127,16 @@ try {
   check('GET /api/subscriptions 返回 6 条', subs.body?.success === true && subs.body.data.length === 6, `订阅数 ${subs.body?.data?.length}`)
 
   const txDefault = await get('/api/transactions')
-  check('GET /api/transactions 默认 limit=50', txDefault.body.data.length === 50 && txDefault.body.meta.total === 60, `data=${txDefault.body.data.length} total=${txDefault.body.meta.total}`)
+  check('GET /api/transactions 默认 limit=50', txDefault.body.data.length === 50 && txDefault.body.meta.total === 65, `data=${txDefault.body.data.length} total=${txDefault.body.meta.total}`)
 
   const txAll = await get('/api/transactions?limit=100')
   const leaked = txAll.body.data.some((t) => t.merchant === '李四专属商户')
-  check('第二用户数据不泄露（total=60 且无李四数据）', txAll.body.meta.total === 60 && txAll.body.data.length === 60 && !leaked)
+  check('第二用户数据不泄露（total=65 且无李四数据）', txAll.body.meta.total === 65 && txAll.body.data.length === 65 && !leaked)
 
   const txPage = await get('/api/transactions?limit=5&offset=0')
-  check('分页 limit=5 offset=0', txPage.body.data.length === 5 && txPage.body.meta.total === 60 && txPage.body.meta.limit === 5 && txPage.body.meta.offset === 0)
-  const txPage2 = await get('/api/transactions?limit=5&offset=55')
-  check('分页 offset=55 返回剩余 5 条', txPage2.body.data.length === 5 && txPage2.body.meta.total === 60)
+  check('分页 limit=5 offset=0', txPage.body.data.length === 5 && txPage.body.meta.total === 65 && txPage.body.meta.limit === 5 && txPage.body.meta.offset === 0)
+  const txPage2 = await get('/api/transactions?limit=5&offset=60')
+  check('分页 offset=60 返回剩余 5 条', txPage2.body.data.length === 5 && txPage2.body.meta.total === 65)
 
   let sorted = true
   const at = txAll.body.data.map((t) => t.transaction_at)
@@ -145,6 +156,60 @@ try {
     && sep.body.data.some((t) => t.merchant === '月末边界测试')
     && !sep.body.data.some((t) => t.merchant === '月初边界测试')
   check('month=2026-09 上海时区边界正确', sepOk, `9月 ${sep.body.data.length} 条`)
+
+  // —— 入账状态筛选 ——
+  const allTx = await get('/api/transactions?limit=100')
+  const postedCount = allTx.body.data.filter((t) => t.status === 'posted').length
+  const pendingCount = allTx.body.data.filter((t) => t.status === 'pending').length
+  check('全量数据同时含 posted 与 pending', postedCount > 0 && pendingCount > 0, `posted=${postedCount} pending=${pendingCount}`)
+
+  const posted = await get('/api/transactions?status=posted&limit=100')
+  const postedOk = posted.body.data.length === postedCount
+    && posted.body.meta.total === postedCount
+    && posted.body.data.every((t) => t.status === 'posted')
+    && posted.body.data.some((t) => t.merchant === '状态筛选-已入账')
+    && !posted.body.data.some((t) => t.merchant === '状态筛选-未入账')
+    && !posted.body.data.some((t) => t.merchant === '李四专属商户')
+  check('status=posted 返回全部已入账、total 正确、不含未入账/他用户', postedOk, `total=${posted.body.meta.total}`)
+
+  const pending = await get('/api/transactions?status=pending&limit=100')
+  const pendingOk = pending.body.data.length === pendingCount
+    && pending.body.meta.total === pendingCount
+    && pending.body.data.every((t) => t.status === 'pending')
+    && pending.body.data.some((t) => t.merchant === '状态筛选-未入账')
+    && !pending.body.data.some((t) => t.merchant === '状态筛选-已入账')
+  check('status=pending 返回全部未入账、total 正确、不含已入账', pendingOk, `total=${pending.body.meta.total}`)
+
+  check('posted + pending 条数等于全量 total', postedCount + pendingCount === allTx.body.meta.total, `${postedCount}+${pendingCount}=${allTx.body.meta.total}`)
+
+  const octPosted = await get('/api/transactions?month=2026-10&status=posted&limit=100')
+  const octPostedOk = octPosted.body.data.length > 0
+    && octPosted.body.data.every((t) => shanghaiMonthOfIso(t.transaction_at) === '2026-10' && t.status === 'posted')
+    && octPosted.body.data.some((t) => t.merchant === '状态筛选-已入账')
+    && !octPosted.body.data.some((t) => t.merchant === '状态筛选-已入账9')
+    && !octPosted.body.data.some((t) => t.merchant === '状态筛选-未入账')
+  check('month=2026-10&status=posted 组合正确', octPostedOk, `10月已入账 ${octPosted.body.data.length} 条`)
+
+  const postedPage = await get('/api/transactions?status=posted&limit=10&offset=0')
+  const postedPageOk = postedPage.body.data.length <= 10 && postedPage.body.meta.total === postedCount
+  check('status=posted 分页 limit=10 返回正确 total', postedPageOk, `data=${postedPage.body.data.length} total=${postedPage.body.meta.total}`)
+
+  // pending 位于原列表后续页时仍能被完整筛出（limit=1 逐页取到最后一笔，越界为空）
+  const pendingLast = await get(`/api/transactions?status=pending&limit=1&offset=${pendingCount - 1}`)
+  const pendingBeyond = await get(`/api/transactions?status=pending&limit=1&offset=${pendingCount}`)
+  const pendingPagingOk = pendingLast.body.data.length === 1
+    && pendingLast.body.data[0].status === 'pending'
+    && pendingBeyond.body.data.length === 0
+  check('pending 跨页完整筛出（末页 + 越界为空）', pendingPagingOk)
+
+  const badStatus1 = await get('/api/transactions?status=foo')
+  check('status=foo 返回 400', badStatus1.status === 400)
+  const badStatus2 = await get('/api/transactions?status=posted&status=pending')
+  check('status 重复参数返回 400', badStatus2.status === 400)
+  const badStatus3 = await get('/api/transactions?status[]=posted')
+  check('status 数组形式返回 400', badStatus3.status === 400)
+  const badStatus4 = await get('/api/transactions?status=')
+  check('status 空值返回 400', badStatus4.status === 400)
 
   const empty = await get('/api/transactions?month=1999-01')
   check('无匹配返回空数组 total=0', empty.status === 200 && empty.body.success === true && empty.body.data.length === 0 && empty.body.meta.total === 0)

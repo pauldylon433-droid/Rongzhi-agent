@@ -82,6 +82,7 @@
 | status | TEXT | NOT NULL, active/frozen/cancelled | 状态 |
 | daily_limit_cents | INTEGER | NOT NULL, >= 0 | 日限额（分） |
 | issued_on | TEXT | 可空，演示数据为 2026-08-01 | 开卡日期（业务日期 YYYY-MM-DD） |
+| version | INTEGER | NOT NULL DEFAULT 1 | 乐观锁版本号（冻结/解冻状态 CAS 用） |
 | created_at | TEXT | NOT NULL | 创建时间 |
 
 ### 5. subscriptions — 订阅与代扣
@@ -150,6 +151,71 @@
 > 保存不可被确认请求覆盖的付款账户、收款人、金额、备注快照；金额为整数分。
 > `needs_verification` 表示「需要强验证」（红色），本阶段不执行。
 
+### 9. card_operations — 银行卡操作记录（临时冻结 / 解冻）
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 记录 ID |
+| ref_no | TEXT | NOT NULL UNIQUE | 操作唯一编号（`card-op-` 前缀，区别于转账） |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户（服务端演示用户） |
+| card_id | INTEGER | NOT NULL, FK→cards.id | 目标银行卡 |
+| card_masked | TEXT | NOT NULL | 掩码卡号快照 |
+| card_type | TEXT | NOT NULL | 卡类型快照 |
+| action | TEXT | NOT NULL, freeze/unfreeze | 冻结 / 解冻 |
+| from_status | TEXT | NOT NULL | 建单时卡片状态快照 |
+| to_status | TEXT | NOT NULL | 目标卡片状态快照 |
+| card_version | INTEGER | NOT NULL | 建单时卡片版本快照（乐观锁 CAS 依据） |
+| risk_level | TEXT | NOT NULL, yellow/red | 风险级别（后端判定，冻结 yellow / 解冻 red） |
+| status | TEXT | NOT NULL, pending/needs_verification/completed/cancelled/expired/failed | 状态 |
+| created_at | TEXT | NOT NULL | 创建时间 |
+| expires_at | TEXT | NOT NULL | 确认有效期（5 分钟） |
+| confirmed_at | TEXT | 可空 | 确认时间 |
+
+> 创建操作单**不改变卡片状态**；冻结在确认时执行，解冻在强验证时执行，均以 `card_version` 做
+> 状态 CAS（`UPDATE cards ... WHERE id=? AND status=? AND version=?`），建单后卡片被改动（含「正常→冻结→正常」）
+> 的旧单不可覆盖新状态。`cancelled` 卡不可解冻 / 冻结；除到期外不允许任意跳转。
+
+### 10. chat_sessions — AI 助手会话（模型上下文 + 会话元数据，part B）
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | TEXT | PRIMARY KEY | 会话 UUID |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户（服务端演示用户） |
+| messages_json | TEXT | NOT NULL DEFAULT '[]' | 模型上下文（user / assistant / tool 消息，含完整 tool_calls 与 tool 结果配对；不含 system） |
+| pending_transfer_ref | TEXT | 可空 | 本会话当前待确认转账单编号 |
+| pending_card_op_ref | TEXT | 可空 | 本会话当前待确认银行卡操作单编号 |
+| created_at | INTEGER | NOT NULL | 创建时间（epoch 毫秒） |
+| last_active_at | INTEGER | NOT NULL | 最近活跃时间（epoch 毫秒，用于 30 分钟会话 TTL） |
+
+> system 提示**不持久化**，每次由服务端按当前上海时间生成；不持久化任何密码 / 验证码 / TOTP 密钥 / 模型密钥 / 敏感请求体。
+
+### 11. chat_messages — AI 助手用户可见消息（part A）
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 记录 ID |
+| session_id | TEXT | NOT NULL, FK→chat_sessions.id | 所属会话 |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户 |
+| seq | INTEGER | NOT NULL | 会话内顺序（单调递增） |
+| role | TEXT | NOT NULL, user/assistant | 消息角色（tool 消息不入此表） |
+| text | TEXT | NOT NULL | 用户消息文本 / 助手回复文本 |
+| tool_records_json | TEXT | 可空 | 助手消息的工具展示记录（user 消息为 NULL） |
+| incomplete | INTEGER | NOT NULL DEFAULT 0 | 助手回答是否因达到调用 / 工具上限而未完成 |
+| error | TEXT | 可空 | 助手回复失败说明（正常为空） |
+| created_at | INTEGER | NOT NULL | 创建时间（epoch 毫秒） |
+
+> 每轮对话存 user 与 assistant 各一行；工具调用 / 结果的原始消息只存于 `chat_sessions.messages_json`（模型上下文）。
+
+### 12. chat_state — 当前对话指针
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| user_id | INTEGER | PRIMARY KEY, FK→users.id | 所属用户 |
+| current_session_id | TEXT | 可空 | 当前会话 id（「新建对话」置空） |
+
+> 单用户演示：刷新按此指针恢复「当前对话」；新建对话仅清除指针，不删除历史。
+> 记录上限：单会话最多 200 条用户可见消息（超出截断最旧）；保留期：7 天，过期会话在访问时惰性清除上下文与消息。
+
 ### 索引
 
 为各外键列及常用查询列建立了索引（`idx_*`），例如：
@@ -157,6 +223,10 @@
 `idx_subscriptions_next_billing_date` 等。
 转账相关：`idx_transfer_operations_user_id` / `_status` / `_confirmed_at`，
 以及唯一索引 `idx_transactions_transfer_ref`（同一转账单最多对应一条流水，数据库层面防重复入账）。
+银行卡操作相关：`idx_card_operations_user_id` / `_status` / `_confirmed_at`，
+以及唯一索引 `idx_card_operations_ref_no`（操作编号唯一）。
+AI 助手相关：`idx_chat_sessions_user_id` / `_last_active_at`、
+`idx_chat_messages_session_id`（`session_id` + `seq`）等。
 
 ## 四、模拟数据生成方式
 
@@ -178,8 +248,10 @@
   - 重复执行检测到已有用户数据即跳过，不重复插入、不清空、不覆盖；
   - 建表与种子数据写入均在事务中完成；
   - 未提供自动清库/重置功能。
-- 迁移：`backend/src/db/migrate.js`（幂等）。建表后自动执行，对已有库增量补列 `opened_on` / `issued_on` / `transactions.transfer_ref` 并回填 `2026-08-01`，建立唯一关联索引 `idx_transactions_transfer_ref`，并在 `transfer_recipients` 为空时写入 4 条虚构收款人；仅回填 NULL 与空表，不删库、不清空、不重建交易、不改余额，重复执行数据不变。
+- 迁移：`backend/src/db/migrate.js`（幂等）。建表后自动执行，对已有库增量补列 `opened_on` / `issued_on` / `transactions.transfer_ref` 并回填 `2026-08-01`、补列 `cards.version` 并回填 `1`，建立唯一关联索引 `idx_transactions_transfer_ref`，新增 `card_operations` 表及索引，并在 `transfer_recipients` 为空时写入 4 条虚构收款人；仅回填 NULL 与空表，不删库、不清空、不重建交易、不改余额，重复执行数据不变。
 - 普通后端启动（`npm run dev` / `npm start`）确保表结构存在并执行迁移，不灌入、不清空数据。
+  `chat_sessions` / `chat_messages` / `chat_state` 三张表由 `createSchema`（`CREATE TABLE IF NOT EXISTS`）在每次启动时
+  幂等创建，无需额外迁移步骤。
 
 ## 六、验证脚本
 
@@ -196,4 +268,14 @@
 防重复、取消 / 过期 / 余额不足 / 异常账户不扣款、1000 元边界与累计跨过、上海跨日重置、
 确认时重新判累计、归属与篡改、红色无法普通确认、转账后余额与流水一致（61 项断言）。
 
-运行：`node backend/scripts/verify-db.js`、`node backend/scripts/verify-transfers.js`
+`backend/scripts/verify-card-operations.js` 在独立临时库上验证银行卡查询 / 临时冻结 / 解冻：
+创建不改状态、归属与状态流转校验、版本 CAS（含「正常→冻结→正常」旧单不可覆盖）、
+冻结确认 / 解冻强验证 / 取消 / 过期 / 重复执行幂等、与转账强验证共用防重放与失败锁定（78 项断言）。
+
+`backend/scripts/verify-chat-persistence.js` 在独立临时库上验证 AI 助手会话持久化（mock 模型，不调用收费模型）：
+两轮对话刷新恢复、后端重启后上下文恢复、过期会话历史可查看且上下文重新开始、tool_calls/tool 配对与归属隔离、
+新建对话隔离（旧迟到响应不污染新会话）、只读恢复不伪造历史、操作卡回读业务库最新状态、
+不持久化任何凭据、200 条上限 + 7 天保留 + 损坏 JSON 容错（35 项断言）。
+
+运行：`node backend/scripts/verify-db.js`、`node backend/scripts/verify-transfers.js`、
+`node backend/scripts/verify-card-operations.js`、`node backend/scripts/verify-chat-persistence.js`

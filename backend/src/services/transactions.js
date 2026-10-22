@@ -6,8 +6,8 @@ const COLUMNS = `
 `
 
 // 交易流水查询（只读）。
-// month 为 { year, month }（已解析）或 undefined；分页参数 limit/offset 已校验。
-export function listTransactions(db, userId, { month, limit, offset }) {
+// month 为 { year, month }（已解析）或 undefined；status 为 'posted' | 'pending' 或 undefined；分页参数 limit/offset 已校验。
+export function listTransactions(db, userId, { month, status, limit, offset }) {
   const conditions = ['user_id = ?']
   const params = [userId]
 
@@ -15,6 +15,11 @@ export function listTransactions(db, userId, { month, limit, offset }) {
     const { start, end } = shanghaiMonthRange(month.year, month.month)
     conditions.push('transaction_at >= ?', 'transaction_at < ?')
     params.push(start, end)
+  }
+
+  if (status) {
+    conditions.push('status = ?')
+    params.push(status)
   }
 
   const where = conditions.join(' AND ')

@@ -1,6 +1,6 @@
 # API 接口文档
 
-融智 Agent 后端接口（只读查询 + 模拟转账）。当前为**单用户演示模式**：服务端固定演示用户「张三」
+融智 Agent 后端接口（只读查询 + 模拟转账 + 银行卡冻结/解冻）。当前为**单用户演示模式**：服务端固定演示用户「张三」
 （用户 id 由服务端解析），所有查询均按该用户限制数据范围，不接受客户端通过 `user_id` 切换用户。
 该模式尚未实现正式登录认证。
 
@@ -117,18 +117,21 @@
 
 ### GET /api/transactions
 
-返回演示用户交易流水，支持月份筛选与分页。
+返回演示用户交易流水，支持月份筛选、入账状态筛选与分页。
 
 #### 查询参数
 
 | 参数 | 类型 | 默认 | 说明 |
 | ---- | ---- | ---- | ---- |
 | month | string | 无 | `YYYY-MM`，按上海时区自然月筛选；不传则不限制 |
+| status | string | 无 | `posted`（已入账）/ `pending`（待入账）；不传则不限制 |
 | limit | integer | 50 | 每页条数，1-100 |
 | offset | integer | 0 | 偏移量，非负整数 |
 
 - 结果按 `transaction_at DESC, id DESC` 排序（时间倒序，稳定）。
 - `limit` / `offset` 非法返回 400；`month` 非法格式或非法月份返回 400。
+- `status` 仅接受单个 `posted` / `pending`；非法值、重复参数（数组）或 `status[]=` 数组形式均返回 400。
+- `meta.total` 始终为「月份 + 状态」完整筛选条件下的计数，与列表同条件（同一 `WHERE`），不受分页影响。
 
 #### 响应
 
@@ -223,6 +226,8 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 - 客户端**只能**提交 `message` 与 `sessionId` 两个字段；提交 `system`、`tool`、完整模型历史、`user_id` 等其他字段返回 400。
 - 用户身份由服务端固定演示用户提供，不接受客户端切换。
 - 同一会话同时只处理一个请求；并发请求返回 409。
+- 会话与模型上下文由服务端持久化到 SQLite；刷新 / 后端重启可通过 `GET /api/assistant/current` 恢复当前对话。
+  system 提示每次由服务端按当前上海时间生成，不持久化；不持久化任何交易密码 / 验证码 / TOTP 密钥 / 模型密钥 / 敏感请求体。
 
 #### 响应
 
@@ -256,6 +261,9 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | search_transfer_recipients | `name`（字符串） | 按姓名 / 虚构联系方式搜索收款人，仅返回 `id`、姓名、掩码账户 |
 | prepare_transfer | `recipient_id`、`amount_yuan`（字符串）、`remark`（可选）、`account_id`（可选） | 调用现有转账服务生成「待确认转账单」（不扣款） |
 | get_transfer_status | `ref_no`（字符串） | 按操作编号查询转账单当前状态（以数据库为准） |
+| get_cards | 无 | 查询本人银行卡列表（复用 `listCards`，含掩码卡号 / 卡类型 / 状态 / 日限额） |
+| prepare_card_operation | `card_id`、`action`（freeze/unfreeze） | 调用银行卡操作服务生成「银行卡操作单」（不改状态）；冻结需点击确认、解冻需强验证 |
+| get_card_operation_status | `ref_no`（字符串） | 按操作编号查询银行卡操作单当前状态（以数据库为准） |
 
 - 转账流程：先用 `search_transfer_recipients` 确认收款人；信息齐全且收款人明确后调用 `prepare_transfer` 生成草稿。
   金额参数用 `amount_yuan` 字符串（如 `"100.00"`），服务端用字符串拆分精确转换为整数分（拒绝负数、零、
@@ -271,7 +279,13 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
   服务端取消本会话旧的待确认单并生成新单，旧确认卡不可再执行。新单创建失败时返回错误并附加
   「原待确认转账单（…）未变更」，旧单保持原状。
 - **不开放任何扣款执行工具**（如 `confirm_transfer`）；「确认」「我同意」「跳过验证」等聊天文字不会触发扣款。
-- 未开放改余额、挂失、取消订阅等写操作。未知工具、额外参数、非法 JSON、非法参数均被拒绝；
+- 银行卡操作：查询用 `get_cards`；冻结 / 解冻用 `prepare_card_operation`（只生成操作单，不改状态）。
+  多张卡片时列出掩码卡号选项，不擅自选第一张；卡片模糊时先澄清。`prepare_card_operation` 的 `data` 含
+  `notice` 与 `previous`（服务端读真实状态，语义同转账改单，`previous.status` 为 cancelled/completed/…）。
+  用户提到「挂失 / 销卡 / 补卡 / 调额」时明确说明不支持，询问是否改用「临时冻结」，不替用户决定。
+- **不开放任何执行 / 强验证工具**（如 `confirm_card_operation`、`verify_card_operation`）；聊天文字
+  「确认」「我同意」不会冻结 / 解冻，只能提醒用户在界面确认卡上操作。
+- 未开放改余额、挂失、销卡、补卡、调额、取消订阅等写操作。未知工具、额外参数、非法 JSON、非法参数均被拒绝；
   模型不得传 `user_id`、SQL、文件路径或 URL。相对月份（「这个月 / 上个月」）由服务端按当前上海日期换算。
 
 #### 错误码
@@ -285,6 +299,41 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | 500 | 助手服务内部错误 |
 
 错误响应不泄露密钥、原始异常、SQL、文件路径。
+
+### GET /api/assistant/current
+
+读取服务端「当前对话」用于刷新恢复（**只读**）。不调用模型、不重发消息、不修改任何数据；未配置模型密钥也可用。
+
+```json
+{
+  "success": true,
+  "data": {
+    "sessionId": "0d7c...-...",
+    "expired": false,
+    "messages": [
+      { "role": "user", "text": "我的账户余额是多少？", "toolRecords": null, "incomplete": false, "error": null },
+      { "role": "assistant", "text": "...", "toolRecords": [ "本次工具执行记录" ], "incomplete": false, "error": null }
+    ]
+  }
+}
+```
+
+- `sessionId`：当前会话标识；无当前对话时为 `null`。
+- `expired`：会话模型上下文是否已过期（超过 30 分钟未活跃）。为 `true` 时历史仍可查看，但后续对话将从全新上下文开始。
+- `messages`：用户可见消息（按顺序）。`role` 为 `user` / `assistant`；助手消息含 `toolRecords`（工具展示记录）、
+  `incomplete`（是否因达到调用/工具上限而未完成）、`error`（失败说明，正常为空）。
+- 历史消息为查询时的**快照**；转账 / 银行卡操作卡以其中的 `ref_no` 回读业务库**最新状态**，不会沿用历史里的旧状态。
+- 不返回模型上下文（tool_calls / tool 原始消息）、system 消息、任何密码 / 验证码 / TOTP 密钥 / 模型密钥。
+
+### POST /api/assistant/new
+
+服务端切换「新建对话」：清除当前对话指针，刷新不再恢复旧对话。不删除历史、不修改业务数据、不调用模型。
+
+```json
+{ "success": true, "data": { "sessionId": null } }
+```
+
+- 请求体可留空（`{}`）。客户端仅能切换当前对话指针，不能传入 `user_id` 或会话内容。
 
 ### 模拟转账接口
 
@@ -355,6 +404,59 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 
 转账成功写入一条 `direction=expense`、`category=转账` 的已入账流水，`transfer_ref` 关联操作编号。
 当前月度「支出」为账户流出口径，**包含转账**；转账不描述为商户消费。
+
+### 银行卡操作接口
+
+银行卡查询（只读）复用 `GET /api/cards`。临时冻结 / 解冻走「操作单」流程：创建操作单**不改变卡片状态**，
+用户在界面明确点击确认（冻结）或交易密码 + 动态验证码强验证（解冻）后才执行。明确标注「模拟银行环境」，
+仅改变卡片状态 `active ↔ frozen`，不改变余额、交易流水、订阅与日限额。正式挂失 / 销卡 / 补卡 / 调额本阶段不支持。
+
+| 方法 | 路径 | 说明 |
+| ---- | ---- | ---- |
+| POST | `/api/card-operations` | 创建银行卡操作单（不改变卡片状态） |
+| GET | `/api/card-operations/:refNo` | 查看操作单详情（含当前卡片状态） |
+| POST | `/api/card-operations/:refNo/confirm` | 确认并执行冻结（需 `{ "confirm": true }`） |
+| POST | `/api/card-operations/:refNo/cancel` | 取消操作单（不改变卡片状态） |
+| POST | `/api/card-operations/:refNo/verify` | 强验证确认解冻（交易密码 + 动态验证码） |
+
+#### 创建银行卡操作单
+
+请求体（仅允许以下字段，多余字段返回 400）：
+
+```json
+{ "card_id": 1, "action": "freeze" }
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| card_id | integer | 是 | 银行卡 id（来自 `GET /api/cards`） |
+| action | string | 是 | `freeze`（冻结）或 `unfreeze`（解冻） |
+
+- 冻结：仅 `active → frozen`，风险等级 `yellow`、状态 `pending`（待确认）；
+- 解冻：仅 `frozen → active`，风险等级 `red`、状态 `needs_verification`（需强验证）；
+- 已注销（cancelled）卡、已处于目标状态的卡、未知状态一律拒绝（如实返回 400，不伪造成功）；
+- 服务端校验卡片归属；创建不改变卡片状态，写入建单时卡片版本快照 `card_version`。
+
+#### 确认冻结 / 取消
+
+- 确认仅接受 `{ "confirm": true }`；从数据库重新读取卡片状态与版本，建单后卡片被改动
+  （含「正常→冻结→正常」回环）的旧单不可执行（返回 409 `stale` / `failed`），不覆盖新状态；重复确认幂等返回原回执。
+- 解冻单（`needs_verification`）不可通过普通确认接口执行（返回 409）。
+- 取消不改变卡片状态；已完成 / 已失效的单不可取消。
+
+#### 强验证解冻（红色单）
+
+请求体仅允许 `{ "password": "...", "totp": "..." }`；多余字段（如 `user_id`、`risk_level`、`verified`）返回 400。
+
+- 仅限解冻单（`needs_verification`）；交易密码 + TOTP 均正确后在**同一事务**内「消费时间步 + 更新卡片状态 + 审计」。
+- 防重放与失败锁定复用转账强验证的同一套：`totp_used_steps` 的 `UNIQUE(user_id, step)` 保证
+  「已用于转账的时间步不可再用于解冻，反之亦然」；`verification_failures` 以 `user_id` 为键，跨业务累计失败同样锁定 15 分钟。
+- 未绑定 / 缺密钥 / 解密失败 / 已锁定时解冻保持阻断。
+
+#### 状态流转
+
+冻结：`pending` → `completed`（确认）/ `cancelled` / `expired` / `failed`（版本变化或状态已变）；
+解冻：`needs_verification` → `completed`（强验证）/ `cancelled` / `expired` / `failed`。除到期外不允许任意跳转。
 
 ## 错误处理
 

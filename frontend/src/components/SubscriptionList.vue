@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { fetchSubscriptions } from '../api/index.js'
 import { useAsyncData } from '../composables/useAsyncData.js'
 import { formatCentsToYuan, formatShanghaiDate } from '../utils/format.js'
@@ -16,22 +16,51 @@ function statusTone(status) {
 function cycleLabel(cycle) {
   return cycleText[cycle] || cycle || '—'
 }
+
+// —— 按状态筛选（仅前端完整列表过滤；接口返回完整列表、无分页）——
+const subStatusFilter = ref('') // '' = 全部
+
+// 状态枚举与后端一致（active / paused / cancelled），不按商户名、扣费日期或金额猜测
+const SUB_STATUS_OPTIONS = [
+  { value: '', label: '全部' },
+  { value: 'active', label: '生效' },
+  { value: 'paused', label: '暂停' },
+  { value: 'cancelled', label: '已取消' },
+]
+
+// 按状态筛选，保持接口原有记录顺序；未知状态仅在「全部」中展示（statusText 兜底「未知状态」）
+const filteredSubs = computed(() => {
+  const list = data.value || []
+  return subStatusFilter.value === '' ? list : list.filter((s) => s.status === subStatusFilter.value)
+})
+
+const isEmptyAll = computed(() => !loading.value && !error.value && !(data.value && data.value.length))
+const isEmptyFilter = computed(() => !loading.value && !error.value && !isEmptyAll.value && filteredSubs.value.length === 0)
+const emptyText = computed(() => (isEmptyFilter.value ? '该状态下暂无订阅' : '暂无订阅'))
 </script>
 
 <template>
   <section class="section">
-    <h2 class="section-title">订阅与代扣</h2>
+    <div class="section-head">
+      <h2 class="section-title">订阅与代扣</h2>
+      <div class="filter">
+        <label class="filter-label">状态</label>
+        <select v-model="subStatusFilter" class="select" aria-label="订阅状态">
+          <option v-for="o in SUB_STATUS_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+        </select>
+      </div>
+    </div>
 
     <SectionState
       :loading="loading"
       :error="error"
-      :empty="!loading && !error && (!data || data.length === 0)"
-      empty-text="暂无订阅"
+      :empty="isEmptyAll || isEmptyFilter"
+      :empty-text="emptyText"
       @retry="load"
     />
 
-    <ul v-if="!loading && !error && data && data.length" class="sub-list">
-      <li v-for="s in data" :key="s.id" class="sub-item">
+    <ul v-if="!loading && !error && filteredSubs.length" class="sub-list">
+      <li v-for="s in filteredSubs" :key="s.id" class="sub-item">
         <div class="sub-main">
           <span class="sub-merchant">{{ s.merchant }}</span>
           <span class="sub-meta">
@@ -52,6 +81,26 @@ function cycleLabel(cycle) {
 </template>
 
 <style scoped>
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.section-head .section-title {
+  margin: 0;
+}
+.filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.filter-label {
+  font-size: 13px;
+  color: var(--muted);
+}
 .sub-list {
   list-style: none;
   margin: 0;
@@ -95,6 +144,9 @@ function cycleLabel(cycle) {
 }
 
 @media (max-width: 640px) {
+  .filter {
+    flex-wrap: wrap;
+  }
   .sub-item {
     flex-direction: column;
     align-items: flex-start;

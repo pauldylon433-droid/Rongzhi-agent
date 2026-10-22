@@ -1,19 +1,23 @@
 <script setup>
-import { ref, nextTick } from 'vue'
-import { chatAssistant } from '../api/index.js'
+import { ref, nextTick, onMounted } from 'vue'
+import { chatAssistant, fetchCurrentChat, newConversation } from '../api/index.js'
 import { formatMoney, formatCentsToYuan, formatShanghaiDateTime } from '../utils/format.js'
 import { useDataRefresh } from '../composables/useDataRefresh.js'
 import { useTransferSignal } from '../composables/useTransferSignal.js'
+import { useCardOpSignal } from '../composables/useCardOpSignal.js'
 import TransferConfirmCard from './TransferConfirmCard.vue'
+import CardOperationConfirmCard from './CardOperationConfirmCard.vue'
+import MarkdownContent from './MarkdownContent.vue'
 
 const examples = [
   '我的账户余额是多少？',
   '这个月支出最多的是哪一类？',
-  '给李雷转100元，备注还饭钱',
+  '我有哪些银行卡？',
 ]
 
 const { refresh } = useDataRefresh()
 const { notifyChange } = useTransferSignal()
+const { notifyChange: notifyCardOpChange } = useCardOpSignal()
 
 const opStatusText = {
   pending: '待确认',
@@ -26,8 +30,15 @@ const opStatusText = {
 function statusText(s) {
   return opStatusText[s] || s
 }
+const cardStatusText = { active: '正常', frozen: '冻结', cancelled: '已注销' }
+function cardStatus(s) {
+  return cardStatusText[s] || s
+}
 function onTransferConfirmed() {
   refresh() // 确认后刷新账户 / 流水 / 月度统计
+}
+function onCardOpConfirmed() {
+  refresh() // 冻结 / 解冻后刷新卡片列表等
 }
 
 const messages = ref([])
@@ -35,6 +46,11 @@ const input = ref('')
 const sending = ref(false)
 const sessionId = ref(null)
 const listEl = ref(null)
+const inputEl = ref(null)
+const composing = ref(false)
+const loading = ref(true)
+const loadError = ref('')
+const sessionExpired = ref(false)
 
 let seq = 0
 function nextId() {
@@ -69,6 +85,30 @@ async function scrollToBottom() {
   if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight
 }
 
+function focusInput() {
+  if (inputEl.value) inputEl.value.focus()
+}
+
+// 组合输入（中文输入法选字 / 组字）标记，避免回车误发送
+function onCompositionStart() {
+  composing.value = true
+}
+function onCompositionEnd() {
+  composing.value = false
+}
+
+function onKeydown(e) {
+  // 仅处理「回车发送」；Shift+Enter 走默认换行（textarea 原生行为）
+  if (e.key !== 'Enter' || e.shiftKey) return
+  // 组合输入中 / Safari keyCode 229 时回车不发送
+  if (composing.value || e.isComposing || e.keyCode === 229) {
+    e.preventDefault()
+    return
+  }
+  e.preventDefault()
+  send(input.value)
+}
+
 async function send(text) {
   const value = typeof text === 'string' ? text.trim() : ''
   if (!value || sending.value) return
@@ -76,11 +116,14 @@ async function send(text) {
   messages.value.push({ id: nextId(), role: 'user', text: value, toolRecords: [], incomplete: false, error: '' })
   input.value = ''
   sending.value = true
+  await nextTick()
+  focusInput() // 发送后立即聚焦，便于边等待边继续输入
   await scrollToBottom()
 
   try {
     const data = await chatAssistant({ message: value, sessionId: sessionId.value })
     sessionId.value = data.sessionId || sessionId.value
+    sessionExpired.value = false
     messages.value.push({
       id: nextId(),
       role: 'assistant',
@@ -93,6 +136,9 @@ async function send(text) {
     for (const rec of data.toolRecords || []) {
       if (rec.name === 'prepare_transfer' && rec.data && rec.data.previous && rec.data.previous.ref_no) {
         notifyChange(rec.data.previous.ref_no)
+      }
+      if (rec.name === 'prepare_card_operation' && rec.data && rec.data.previous && rec.data.previous.ref_no) {
+        notifyCardOpChange(rec.data.previous.ref_no)
       }
     }
   } catch (e) {
@@ -110,11 +156,47 @@ async function send(text) {
   }
 }
 
-function newChat() {
+async function newChat() {
+  if (sending.value) return
   messages.value = []
   sessionId.value = null
   input.value = ''
+  sessionExpired.value = false
+  loadError.value = ''
+  loading.value = false
+  try {
+    await newConversation()
+  } catch {
+    // 服务端切换失败不阻塞本地清空；下次发送会新建会话
+  }
+  await nextTick()
+  focusInput()
 }
+
+async function loadCurrent() {
+  loading.value = true
+  loadError.value = ''
+  try {
+    const data = await fetchCurrentChat()
+    sessionId.value = data.sessionId || null
+    sessionExpired.value = !!data.expired
+    messages.value = (data.messages || []).map((m) => ({
+      id: nextId(),
+      role: m.role,
+      text: m.text || '',
+      toolRecords: m.toolRecords || [],
+      incomplete: !!m.incomplete,
+      error: m.error || '',
+    }))
+  } catch (e) {
+    loadError.value = e && e.message ? e.message : '加载聊天记录失败'
+  } finally {
+    loading.value = false
+    await scrollToBottom()
+  }
+}
+
+onMounted(loadCurrent)
 </script>
 
 <template>
@@ -125,8 +207,19 @@ function newChat() {
     </div>
 
     <div ref="listEl" class="chat-list">
-      <p v-if="messages.length === 0" class="chat-empty">
-        我是融智 AI 助手，可以查询账户余额、账单统计，也能帮你生成待确认转账单。例如「给李雷转100元，备注还饭钱」。
+      <p v-if="loading" class="chat-empty">正在加载聊天记录…</p>
+
+      <div v-if="!loading && loadError" class="chat-load-error">
+        <p class="chat-error">{{ loadError }}</p>
+        <button class="btn-ghost" @click="loadCurrent">重试</button>
+      </div>
+
+      <p v-if="!loading && !loadError && sessionExpired" class="chat-expired">
+        会话已过期：历史记录仍可查看，但后续对话将从全新上下文开始，不会「记得」之前的细节。
+      </p>
+
+      <p v-if="!loading && !loadError && messages.length === 0" class="chat-empty">
+        我是融智 AI 助手，可以查询账户余额、账单统计、银行卡，也能帮你生成待确认转账单或银行卡冻结 / 解冻操作单。例如「我有哪些银行卡？」。
       </p>
 
       <div v-for="m in messages" :key="m.id" class="chat-row" :class="m.role">
@@ -138,7 +231,7 @@ function newChat() {
           <template v-else>
             <p v-if="m.error" class="chat-error">{{ m.error }}</p>
             <template v-else>
-              <p v-if="m.text" class="chat-text">{{ m.text }}</p>
+              <MarkdownContent v-if="m.text" :text="m.text" />
               <p v-if="m.incomplete" class="chat-incomplete">（本轮回答未完成，请稍后重试）</p>
 
               <!-- 结果卡片：账户余额 / 月度账单（数值来自工具结果，权威） -->
@@ -208,6 +301,32 @@ function newChat() {
                     <span v-if="rec.data.amount_cents" class="rc-note">¥{{ formatCentsToYuan(rec.data.amount_cents) }}</span>
                   </div>
                 </template>
+
+                <template v-else-if="rec.name === 'get_cards'">
+                  <div class="result-card cards">
+                    <span class="rc-label">我的银行卡</span>
+                    <div v-if="rec.data && rec.data.length" class="rc-cards">
+                      <div v-for="c in rec.data" :key="c.id" class="rc-card-row">
+                        <span>{{ c.masked_card_number }}（{{ c.card_type }}）</span>
+                        <span class="rc-card-status">{{ cardStatus(c.status) }}</span>
+                      </div>
+                    </div>
+                    <span v-else class="rc-none">暂无银行卡</span>
+                  </div>
+                </template>
+
+                <template v-else-if="rec.name === 'prepare_card_operation'">
+                  <p v-if="rec.data && rec.data.notice" class="transfer-notice">{{ rec.data.notice }}</p>
+                  <CardOperationConfirmCard :op="rec.data" @confirmed="onCardOpConfirmed" />
+                </template>
+
+                <template v-else-if="rec.name === 'get_card_operation_status'">
+                  <div class="result-card status">
+                    <span class="rc-label">银行卡操作单 · {{ rec.data.ref_no }}</span>
+                    <span class="rc-value">{{ statusText(rec.data.status) }}</span>
+                    <span v-if="rec.data.masked_card_number" class="rc-note">{{ rec.data.masked_card_number }}（{{ rec.data.action === 'freeze' ? '冻结' : '解冻' }}）</span>
+                  </div>
+                </template>
               </div>
 
               <!-- 工具执行记录（由后端生成） -->
@@ -232,14 +351,16 @@ function newChat() {
     </div>
 
     <div class="chat-input-row">
-      <input
+      <textarea
+        ref="inputEl"
         v-model="input"
         class="chat-input"
-        type="text"
-        placeholder="例如：我的账户余额是多少？"
-        :disabled="sending"
-        @keyup.enter="send(input)"
-      />
+        rows="1"
+        placeholder="例如：我的账户余额是多少？（Enter 发送，Shift+Enter 换行）"
+        @keydown="onKeydown"
+        @compositionstart="onCompositionStart"
+        @compositionend="onCompositionEnd"
+      ></textarea>
       <button class="btn" :disabled="sending || !input.trim()" @click="send(input)">发送</button>
     </div>
 
@@ -248,7 +369,7 @@ function newChat() {
       <button v-for="q in examples" :key="q" class="chip" :disabled="sending" @click="send(q)">{{ q }}</button>
     </div>
 
-    <p class="chat-disclaimer">AI 助手可查询与生成待确认转账单，但不执行扣款；转账需你在确认卡上点击确认。数据均为模拟，仅供演示。</p>
+    <p class="chat-disclaimer">AI 助手可查询账户 / 账单 / 银行卡，并可生成待确认转账单与银行卡冻结 / 解冻操作单，但不执行扣款或直接改变卡片状态；冻结 / 解冻需你在确认卡上确认或强验证。数据均为模拟，仅供演示。</p>
   </section>
 </template>
 
@@ -276,6 +397,25 @@ function newChat() {
   color: var(--muted);
   font-size: 14px;
   margin: 8px 0;
+}
+.chat-load-error {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  background: #fef2f2;
+}
+.chat-expired {
+  margin: 0 0 4px;
+  padding: 8px 12px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #92400e;
 }
 .chat-row {
   display: flex;
@@ -364,6 +504,21 @@ function newChat() {
   font-size: 13px;
   color: var(--muted);
   margin-top: 6px;
+}
+.rc-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.rc-card-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+}
+.rc-card-status {
+  color: var(--muted);
 }
 .transfer-notice {
   margin: 0 0 8px;
@@ -485,6 +640,11 @@ function newChat() {
   border-radius: 8px;
   font-size: 14px;
   color: var(--text);
+  font-family: inherit;
+  line-height: 1.5;
+  resize: none;
+  min-height: 40px;
+  max-height: 120px;
 }
 .chat-input:focus {
   outline: none;

@@ -52,6 +52,12 @@ db.exec(`
     amount_cents INTEGER NOT NULL,
     status TEXT NOT NULL
   );
+  CREATE TABLE transfer_recipients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    masked_account TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `)
 
 const createdAt = '2026-10-21 10:00:00'
@@ -74,9 +80,10 @@ check('迁移前账户无 opened_on 字段', beforeAcc.opened_on === undefined)
 // 2. 第一次迁移：补列 + 回填
 migrate(db)
 const acc = db.prepare('SELECT opened_on, created_at FROM accounts LIMIT 1').get()
-const card = db.prepare('SELECT issued_on, created_at FROM cards LIMIT 1').get()
+const card = db.prepare('SELECT issued_on, version, created_at FROM cards LIMIT 1').get()
 check('迁移后账户 opened_on = 2026-08-01', acc.opened_on === '2026-08-01', acc.opened_on)
 check('迁移后银行卡 issued_on = 2026-08-01', card.issued_on === '2026-08-01', card.issued_on)
+check('迁移后银行卡 version 回填为 1', card.version === 1, card.version)
 check('迁移不改动 created_at', acc.created_at === createdAt && card.created_at === createdAt)
 check('迁移不改动交易', db.prepare('SELECT COUNT(*) AS c FROM transactions').get().c === 1)
 

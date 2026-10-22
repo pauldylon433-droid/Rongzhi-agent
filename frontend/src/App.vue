@@ -10,7 +10,7 @@ import SubscriptionList from './components/SubscriptionList.vue'
 const scenarios = [
   { name: '智能转账', desc: '对话式发起转账', state: '模拟转账已实现' },
   { name: '账单分析', desc: '账单洞察与可视化', state: '数据展示已实现' },
-  { name: '卡片管理', desc: '卡片状态统一管理', state: '数据展示已实现' },
+  { name: '卡片管理', desc: '卡片状态统一管理', state: '查询/冻结/解冻已实现' },
   { name: '订阅与代扣', desc: '订阅与自动扣款管理', state: '数据展示已实现' },
   { name: '跨场景联动', desc: '多场景任务协同', state: '规划中' },
 ]
@@ -45,7 +45,7 @@ const scenarios = [
 
       <section class="section scenarios">
         <h2 class="section-title">业务场景规划</h2>
-        <p class="scenarios-note">当前已实现只读数据展示与模拟小额转账；其余管理操作与跨场景联动仍在规划中。</p>
+        <p class="scenarios-note">当前已实现只读数据展示、模拟小额转账，以及银行卡查询 / 临时冻结 / 解冻；正式挂失、销卡、补卡、调额与跨场景联动仍在规划中。</p>
         <div class="grid">
           <div v-for="(s, i) in scenarios" :key="s.name" class="card">
             <div class="card-top">
