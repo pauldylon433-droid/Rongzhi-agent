@@ -63,6 +63,61 @@ function todayCompletedTransferCents(db, userId, now) {
     .get(userId, start, end).s
 }
 
+// —— 供强验证服务复用的读取 / 视图 / 执行核心（避免复制第二套扣款实现） ——
+
+export function getTransferRow(db, refNo) {
+  return db.prepare(`SELECT ${OPERATION_COLS} FROM transfer_operations WHERE ref_no = ?`).get(refNo)
+}
+
+export function viewTransfer(db, row) {
+  return toView(db, row)
+}
+
+// 转账执行核心：账户/余额校验 + 状态 CAS 认领 + 扣款 + 入账流水 + 审计。
+// 黄色确认（expectedStatus='pending'）与红色强验证（'needs_verification'）复用同一套
+// 扣款 / 流水 / 状态 CAS / 唯一索引 / 审计逻辑。
+// 前置：归属、到期、终态、当日累计（以及红色验证码）均已在校验通过后调用。
+export function finalizeTransfer(db, userId, row, now, expectedStatus) {
+  const acct = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').get(row.from_account_id, userId)
+  if (!acct || acct.status !== 'active') {
+    db.prepare(`UPDATE transfer_operations SET status = 'failed' WHERE id = ? AND status = ?`).run(row.id, expectedStatus)
+    return { outcome: 'failed', op: viewTransfer(db, getById(db, row.id)) }
+  }
+  if (acct.balance_cents < row.amount_cents) {
+    db.prepare(`UPDATE transfer_operations SET status = 'failed' WHERE id = ? AND status = ?`).run(row.id, expectedStatus)
+    return { outcome: 'failed', op: viewTransfer(db, getById(db, row.id)) }
+  }
+
+  // 原子认领（CAS）：仅目标状态 → completed，防重复/并发确认
+  const claim = db
+    .prepare(`UPDATE transfer_operations SET status = 'completed', confirmed_at = ? WHERE id = ? AND status = ?`)
+    .run(now.toISOString(), row.id, expectedStatus)
+  if (claim.changes !== 1) {
+    return { outcome: 'completed', op: viewTransfer(db, getById(db, row.id)) }
+  }
+
+  const deduct = db
+    .prepare('UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ? AND balance_cents >= ?')
+    .run(row.amount_cents, row.from_account_id, row.amount_cents)
+  if (deduct.changes !== 1) throw new Error('扣款失败（余额不足）') // 回滚整个事务
+
+  const txInfo = db
+    .prepare(
+      `INSERT INTO transactions
+        (user_id, account_id, direction, amount_cents, category, merchant, description, transaction_at, status, transfer_ref)
+       VALUES (?, ?, 'expense', ?, '转账', ?, ?, ?, 'posted', ?)`,
+    )
+    .run(userId, row.from_account_id, row.amount_cents, row.recipient_name, row.remark || '转账', now.toISOString(), row.ref_no)
+  const txId = txInfo.lastInsertRowid
+
+  db.prepare(
+    `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
+     VALUES (?, 'transfer', ?, 'confirm', 'success', ?)`,
+  ).run(userId, row.ref_no, JSON.stringify({ amount_cents: row.amount_cents, transaction_id: txId }))
+
+  return { outcome: 'completed', op: viewTransfer(db, getById(db, row.id)), transaction_id: txId }
+}
+
 export function listRecipients(db) {
   return db.prepare('SELECT id, name, masked_account FROM transfer_recipients ORDER BY id').all()
 }
@@ -131,15 +186,15 @@ export function createTransfer(db, userId, { recipientId, amountCents, remark, f
   return toView(db, run())
 }
 
-// 查看转账单（读取时惰性过期）
+// 查看转账单（读取时惰性过期，含红色待验证单）
 export function getTransfer(db, userId, refNo, now = new Date()) {
-  const row = db.prepare(`SELECT ${OPERATION_COLS} FROM transfer_operations WHERE ref_no = ?`).get(refNo)
+  const row = getTransferRow(db, refNo)
   if (!row || row.user_id !== userId) return null
-  if (row.status === 'pending' && now.toISOString() > row.expires_at) {
-    db.prepare("UPDATE transfer_operations SET status = 'expired' WHERE id = ? AND status = 'pending'").run(row.id)
-    return toView(db, getById(db, row.id))
+  if ((row.status === 'pending' || row.status === 'needs_verification') && now.toISOString() > row.expires_at) {
+    db.prepare(`UPDATE transfer_operations SET status = 'expired' WHERE id = ? AND status = ?`).run(row.id, row.status)
+    return viewTransfer(db, getById(db, row.id))
   }
-  return toView(db, row)
+  return viewTransfer(db, row)
 }
 
 // 确认并执行转账（同一事务内：扣款 + 入账流水 + 更新状态 + 审计）。
@@ -147,94 +202,49 @@ export function getTransfer(db, userId, refNo, now = new Date()) {
 //          'needs_verification'、'failed'。
 export function confirmTransfer(db, userId, refNo, now = new Date()) {
   const run = db.transaction(() => {
-    const row = db.prepare(`SELECT ${OPERATION_COLS} FROM transfer_operations WHERE ref_no = ?`).get(refNo)
+    const row = getTransferRow(db, refNo)
     if (!row || row.user_id !== userId) return { outcome: 'not_found' }
 
     if (row.status === 'pending' && now.toISOString() > row.expires_at) {
       db.prepare("UPDATE transfer_operations SET status = 'expired' WHERE id = ? AND status = 'pending'").run(row.id)
-      return { outcome: 'expired', op: toView(db, getById(db, row.id)) }
+      return { outcome: 'expired', op: viewTransfer(db, getById(db, row.id)) }
     }
-    if (row.status === 'completed') {
-      return { outcome: 'completed', op: toView(db, row) }
-    }
-    if (row.status !== 'pending') {
-      return { outcome: row.status, op: toView(db, row) }
-    }
+    if (row.status === 'completed') return { outcome: 'completed', op: viewTransfer(db, row) }
+    if (row.status !== 'pending') return { outcome: row.status, op: viewTransfer(db, row) }
 
-    const acct = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').get(row.from_account_id, userId)
-    if (!acct || acct.status !== 'active') {
-      db.prepare("UPDATE transfer_operations SET status = 'failed' WHERE id = ? AND status = 'pending'").run(row.id)
-      return { outcome: 'failed', op: toView(db, getById(db, row.id)) }
-    }
-
-    // 创建后可能又有转账成功，确认时重新判断当日累计
+    // 创建后可能又有转账成功，确认时重新判断当日累计（仍过线则转红，进入强验证）
     const todayCum = todayCompletedTransferCents(db, userId, now)
     if (todayCum + row.amount_cents > DAILY_TRANSFER_LIMIT_CENTS) {
       db.prepare("UPDATE transfer_operations SET status = 'needs_verification' WHERE id = ? AND status = 'pending'").run(row.id)
-      return { outcome: 'needs_verification', op: toView(db, getById(db, row.id)) }
+      return { outcome: 'needs_verification', op: viewTransfer(db, getById(db, row.id)) }
     }
 
-    if (acct.balance_cents < row.amount_cents) {
-      db.prepare("UPDATE transfer_operations SET status = 'failed' WHERE id = ? AND status = 'pending'").run(row.id)
-      return { outcome: 'failed', op: toView(db, getById(db, row.id)) }
-    }
-
-    // 原子认领（CAS）：仅 pending → completed，防重复/并发确认
-    const claim = db
-      .prepare("UPDATE transfer_operations SET status = 'completed', confirmed_at = ? WHERE id = ? AND status = 'pending'")
-      .run(now.toISOString(), row.id)
-    if (claim.changes !== 1) {
-      return { outcome: 'completed', op: toView(db, getById(db, row.id)) }
-    }
-
-    const deduct = db
-      .prepare('UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ? AND balance_cents >= ?')
-      .run(row.amount_cents, row.from_account_id, row.amount_cents)
-    if (deduct.changes !== 1) {
-      throw new Error('扣款失败（余额不足）') // 回滚整个事务
-    }
-
-    const txInfo = db
-      .prepare(
-        `INSERT INTO transactions
-          (user_id, account_id, direction, amount_cents, category, merchant, description, transaction_at, status, transfer_ref)
-         VALUES (?, ?, 'expense', ?, '转账', ?, ?, ?, 'posted', ?)`,
-      )
-      .run(userId, row.from_account_id, row.amount_cents, row.recipient_name, row.remark || '转账', now.toISOString(), row.ref_no)
-    const txId = txInfo.lastInsertRowid
-
-    db.prepare(
-      `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
-       VALUES (?, 'transfer', ?, 'confirm', 'success', ?)`,
-    ).run(userId, row.ref_no, JSON.stringify({ amount_cents: row.amount_cents, transaction_id: txId }))
-
-    return { outcome: 'completed', op: toView(db, getById(db, row.id)), transaction_id: txId }
+    return finalizeTransfer(db, userId, row, now, 'pending')
   })
   return run()
 }
 
-// 取消转账单（不扣款）。outcome：'cancelled'、'not_found'、'expired'、'completed'、
-// 'needs_verification'、'failed'。
+// 取消转账单（不扣款；含红色待验证单）。outcome：'cancelled'、'not_found'、'expired'、'completed'、'failed'。
 export function cancelTransfer(db, userId, refNo, now = new Date()) {
   const run = db.transaction(() => {
-    const row = db.prepare(`SELECT ${OPERATION_COLS} FROM transfer_operations WHERE ref_no = ?`).get(refNo)
+    const row = getTransferRow(db, refNo)
     if (!row || row.user_id !== userId) return { outcome: 'not_found' }
 
-    if (row.status === 'cancelled') return { outcome: 'cancelled', op: toView(db, row) }
-    if (row.status === 'pending' && now.toISOString() > row.expires_at) {
-      db.prepare("UPDATE transfer_operations SET status = 'expired' WHERE id = ? AND status = 'pending'").run(row.id)
-      return { outcome: 'expired', op: toView(db, getById(db, row.id)) }
+    if (row.status === 'cancelled') return { outcome: 'cancelled', op: viewTransfer(db, row) }
+    if ((row.status === 'pending' || row.status === 'needs_verification') && now.toISOString() > row.expires_at) {
+      db.prepare(`UPDATE transfer_operations SET status = 'expired' WHERE id = ? AND status = ?`).run(row.id, row.status)
+      return { outcome: 'expired', op: viewTransfer(db, getById(db, row.id)) }
     }
-    if (row.status !== 'pending') {
-      return { outcome: row.status, op: toView(db, row) }
+    if (row.status !== 'pending' && row.status !== 'needs_verification') {
+      return { outcome: row.status, op: viewTransfer(db, row) }
     }
 
-    db.prepare("UPDATE transfer_operations SET status = 'cancelled' WHERE id = ? AND status = 'pending'").run(row.id)
+    db.prepare(`UPDATE transfer_operations SET status = 'cancelled' WHERE id = ? AND status IN ('pending','needs_verification')`).run(row.id)
     db.prepare(
       `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
        VALUES (?, 'transfer', ?, 'cancel', 'success', ?)`,
     ).run(userId, row.ref_no, JSON.stringify({ amount_cents: row.amount_cents }))
-    return { outcome: 'cancelled', op: toView(db, getById(db, row.id)) }
+    return { outcome: 'cancelled', op: viewTransfer(db, getById(db, row.id)) }
   })
   return run()
 }

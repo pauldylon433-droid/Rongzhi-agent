@@ -125,3 +125,17 @@ export async function cancelTransfer(refNo) {
   const body = await postJson(`/api/transfers/${refNo}/cancel`, { cancel: true })
   return body.data
 }
+
+// —— 强验证 ——
+
+// 读取验证器绑定 / 锁定状态（不含任何密码 / 密钥 / 验证码）
+export async function fetchVerificationStatus() {
+  const body = await request('/api/verification/status')
+  return body.data
+}
+
+// 强验证确认转账（交易密码 + 动态验证码；凭据仅发往专用验证接口，不进入 AI 请求 / 聊天历史 / 本地存储）
+export async function verifyTransfer(refNo, { password, totp }) {
+  const body = await postJson(`/api/transfers/${refNo}/verify`, { password, totp })
+  return body.data
+}

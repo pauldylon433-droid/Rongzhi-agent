@@ -1,9 +1,10 @@
 <script setup>
-// 共享转账确认卡：手动入口与 AI 聊天入口复用同一套确认 / 取消规则。
+// 共享转账确认卡：手动入口与 AI 聊天入口复用同一套确认 / 取消 / 强验证规则。
 // 仅从后端结构化操作数据（op 视图，含 ref_no）渲染，绝不从 AI 文字提取金额或操作编号。
-// 挂载时回读最新状态（以数据库为准）；确认按钮直接调用现有转账确认接口，不经过模型。
+// 挂载时回读最新状态（以数据库为准）；确认 / 强验证按钮直接调用现有接口，不经过模型。
+// 强验证凭据（交易密码 + 动态验证码）仅发往专用验证接口，不进入 AI 请求 / 聊天历史 / 本地存储 / URL / 日志。
 import { ref, computed, onMounted, watch } from 'vue'
-import { fetchTransfer, confirmTransfer, cancelTransfer } from '../api/index.js'
+import { fetchTransfer, confirmTransfer, cancelTransfer, verifyTransfer, fetchVerificationStatus } from '../api/index.js'
 import { formatCentsToYuan, formatShanghaiDateTime } from '../utils/format.js'
 import { useTransferSignal } from '../composables/useTransferSignal.js'
 
@@ -17,10 +18,18 @@ const opError = ref('')
 const confirming = ref(false)
 const cancelling = ref(false)
 
+// —— 强验证状态 ——
+const password = ref('')
+const totpCode = ref('')
+const verifying = ref(false)
+const vStatus = ref(null) // { bound, locked, locked_until, remaining_attempts }
+const vLoading = ref(false)
+
 const { notifyChange, isChanged, version } = useTransferSignal()
 
 const isPending = computed(() => !!op.value && op.value.status === 'pending')
 const isRed = computed(() => !!op.value && (op.value.risk_level === 'red' || op.value.status === 'needs_verification'))
+const isRedPending = computed(() => !!op.value && op.value.status === 'needs_verification')
 const isCompleted = computed(() => !!op.value && op.value.status === 'completed')
 const showRisk = computed(
   () => !!op.value && (op.value.status === 'pending' || op.value.status === 'needs_verification'),
@@ -43,6 +52,19 @@ async function load() {
     if (fresh) op.value = fresh
   } catch {
     // 回读失败则保留初始视图
+  }
+  if (isRedPending.value) await loadVerificationStatus()
+}
+
+// 读取验证器绑定 / 锁定状态（供红色表单渲染；不请求任何秘密）
+async function loadVerificationStatus() {
+  vLoading.value = true
+  try {
+    vStatus.value = await fetchVerificationStatus()
+  } catch {
+    vStatus.value = { bound: false }
+  } finally {
+    vLoading.value = false
   }
 }
 
@@ -82,6 +104,31 @@ async function onCancel() {
     } catch { /* 保留原状 */ }
   } finally {
     cancelling.value = false
+    password.value = ''
+    totpCode.value = ''
+  }
+}
+
+async function onVerify() {
+  if (!op.value || verifying.value) return
+  opError.value = ''
+  verifying.value = true
+  try {
+    op.value = await verifyTransfer(op.value.ref_no, { password: password.value, totp: totpCode.value })
+    notifyChange(op.value.ref_no)
+    emit('confirmed')
+  } catch (e) {
+    opError.value = e && e.message ? e.message : '强验证失败'
+    // 失败可能已锁定 / 过期 / 取消，回读最新状态
+    try {
+      const fresh = await fetchTransfer(op.value.ref_no)
+      if (fresh) op.value = fresh
+    } catch { /* 保留原状 */ }
+    await loadVerificationStatus()
+  } finally {
+    verifying.value = false
+    password.value = ''
+    totpCode.value = ''
   }
 }
 
@@ -135,10 +182,53 @@ watch(version, () => {
         <div class="detail-row"><dt>确认有效期</dt><dd>{{ formatShanghaiDateTime(op.expires_at) }}</dd></div>
       </dl>
 
-      <p v-if="isRed" class="red-note">需要强验证，本阶段尚未开放，无法执行该笔转账。</p>
+      <!-- 红色待验证单：强验证表单（交易密码 + 动态验证码） -->
+      <div v-if="isRedPending" class="verify-section">
+        <p class="red-note">当日累计转账金额已超限，需用交易密码与手机验证器动态码二次确认。</p>
 
+        <p v-if="vLoading" class="verify-hint">正在读取验证器状态…</p>
+        <p v-else-if="!vStatus || vStatus.bound === false" class="verify-blocked">尚未绑定验证器，无法执行强验证转账。</p>
+        <p v-else-if="vStatus.locked" class="verify-blocked">
+          强验证已锁定，{{ formatShanghaiDateTime(vStatus.locked_until) }} 后可重试。
+        </p>
+        <template v-else>
+          <label class="verify-field">
+            <span class="verify-label">交易密码</span>
+            <input
+              v-model="password"
+              type="password"
+              class="verify-input"
+              autocomplete="off"
+              placeholder="请输入交易密码"
+            />
+          </label>
+          <label class="verify-field">
+            <span class="verify-label">动态验证码</span>
+            <input
+              v-model="totpCode"
+              type="text"
+              inputmode="numeric"
+              maxlength="6"
+              class="verify-input"
+              autocomplete="off"
+              placeholder="6 位验证码"
+            />
+          </label>
+          <p v-if="vStatus.remaining_attempts < 5" class="verify-hint">剩余尝试次数：{{ vStatus.remaining_attempts }}</p>
+          <p v-if="opError" class="form-error">{{ opError }}</p>
+          <div class="card-actions">
+            <button class="btn" :disabled="verifying || cancelling || !password || !totpCode" @click="onVerify">
+              {{ verifying ? '验证中…' : '验证并确认转账' }}
+            </button>
+            <button class="btn-ghost" :disabled="verifying || cancelling" @click="onCancel">
+              {{ cancelling ? '取消中…' : '取消' }}
+            </button>
+          </div>
+        </template>
+      </div>
+
+      <!-- 黄色待确认单：普通确认 / 取消 -->
       <p v-if="opError" class="form-error">{{ opError }}</p>
-
       <div v-if="isPending" class="card-actions">
         <button class="btn" :disabled="confirming || cancelling" @click="onConfirm">
           {{ confirming ? '确认中…' : '确认转账' }}
@@ -247,6 +337,48 @@ watch(version, () => {
   border-radius: 8px;
   font-size: 13px;
   color: #b91c1c;
+}
+.verify-section {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.verify-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.verify-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.verify-input {
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--text);
+  background: #fff;
+}
+.verify-input:focus {
+  outline: none;
+  border-color: #2563eb;
+}
+.verify-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.verify-blocked {
+  margin: 0;
+  padding: 10px 12px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #9a3412;
 }
 .form-error {
   margin: 8px 0 0;

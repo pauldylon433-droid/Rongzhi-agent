@@ -120,6 +120,38 @@ CREATE TABLE IF NOT EXISTS transfer_operations (
 CREATE INDEX IF NOT EXISTS idx_transfer_operations_user_id       ON transfer_operations(user_id);
 CREATE INDEX IF NOT EXISTS idx_transfer_operations_status        ON transfer_operations(status);
 CREATE INDEX IF NOT EXISTS idx_transfer_operations_confirmed_at  ON transfer_operations(confirmed_at);
+
+-- 强验证：验证器绑定（交易密码哈希 + TOTP 密钥密文）
+CREATE TABLE IF NOT EXISTS verification_bindings (
+  user_id          INTEGER PRIMARY KEY,
+  password_salt    TEXT NOT NULL,
+  password_hash    TEXT NOT NULL,
+  totp_secret_enc  TEXT NOT NULL, -- JSON {iv,tag,data}（AES-256-GCM 认证加密）
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  bound_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- 强验证：已消费的 TOTP 时间步（防重放，跨单/并发/重启均不可复用）
+CREATE TABLE IF NOT EXISTS totp_used_steps (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL,
+  step        INTEGER NOT NULL,
+  purpose     TEXT NOT NULL,
+  consumed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (user_id, step),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_totp_used_steps_user_id ON totp_used_steps(user_id);
+
+-- 强验证：持久化失败计数与锁定（连续失败 5 次锁定 15 分钟，跨单/重启不失效）
+CREATE TABLE IF NOT EXISTS verification_failures (
+  user_id      INTEGER PRIMARY KEY,
+  fail_count   INTEGER NOT NULL DEFAULT 0,
+  locked_until TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
 `
 
 export function createSchema(db) {

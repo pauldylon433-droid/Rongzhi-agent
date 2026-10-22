@@ -9,6 +9,9 @@ dist-ssr/
 .env.local
 .env.*.local
 
+# 强验证加密主密钥（本地受限文件，禁止提交）
+.verification-key
+
 # SQLite 数据库及关联文件
 *.db
 *.db-wal

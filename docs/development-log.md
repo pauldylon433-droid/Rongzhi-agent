@@ -607,3 +607,90 @@ npm run dev
 - 路径：`rongzhi-agent-source-20261021235053.zip`（项目根目录）。
 - 内容：与暂存基线一致的 84 个文件，已确认不含 `.env`、`data/`、`node_modules`、`dist`、数据库或备份文件。
 
+---
+
+## 第十四阶段：红色转账强验证（交易密码 + 动态验证码）
+
+日期：2026-10-22
+
+本轮实现红色转账单（当日累计过线）的**强验证**：交易密码 + 手机验证器 TOTP 动态验证码，集成进共享确认卡。
+
+### 一、新增 / 修改
+
+- `backend/src/lib/totp.js`：RFC 6238 TOTP（HMAC-SHA1、6 位、30 秒、±1 窗口）+ base32 + otpauth URI。
+- `backend/src/lib/crypto-util.js`：scrypt 密码哈希（随机盐 + `timingSafeEqual`）、AES-256-GCM 认证加密。
+- `backend/src/lib/verification-key.js`：加密主密钥与数据库分离（`backend/data/.verification-key`，受限文件）。
+- `backend/src/lib/rate-limit.js`：请求级限流（与失败计数分离）。
+- `backend/src/db/schema.js`：新增 `verification_bindings` / `totp_used_steps` / `verification_failures` 三表。
+- `backend/src/services/verification.js`：绑定（拒绝覆盖）、锁定、两步强验证（凭据校验独立提交，
+  失败计数不被回滚吞掉；消费时间步 + 扣款 + 流水 + 状态 + 审计同事务）。
+- `backend/src/services/transfers.js`：抽出 `finalizeTransfer` 共用扣款核心；`needs_verification` 可过期 / 可取消。
+- `backend/src/routes/verification.js` + `routes/transfers.js`：`GET /verification/status`、
+  `POST /transfers/:refNo/verify`（限流 + 字段白名单 + 状态码映射）。
+- `backend/scripts/bind-verification.js`：一次性本地交互绑定命令（隐藏输入 + 双重确认密码、随机 TOTP 密钥、
+  临时二维码、验证码通过后启用绑定、清理临时明文）；修复 Windows PowerShell 交互：显式 TTY 守卫 + raw mode
+  读取 `data` 事件，处理退格 / 粘贴 / CR/LF/CRLF / Ctrl+C / ANSI 控制序列，全程不回显，异常恢复终端状态。
+- `backend/scripts/verify-bind-interaction.js`：交互输入状态机单元校验（13 项，纯逻辑 + 伪造 stdin 流）。
+- `frontend`：`TransferConfirmCard.vue` 红色表单（密码 + 6 位验证码 + 「验证并确认转账」+ 取消；
+  未绑定 / 锁定 / 剩余次数状态；提交后清空输入）；`api/index.js` 新增 `fetchVerificationStatus` / `verifyTransfer`。
+
+### 二、安全规则
+
+- 防重放：TOTP 时间步 `UNIQUE(user_id, step)` 消费，跨单 / 并发 / 重启不可复用；绑定码同样消费。
+- 失败锁定：连续 5 次错误锁 15 分钟（跨单 / 重启不失效）；失败计数独立提交，不被回滚吞掉。
+- 凭据保护：密码 scrypt 哈希；TOTP 密钥 AES-256-GCM 加密，密钥分离存储；审计不落密码 / 验证码 / 密钥。
+- 未绑定 / 缺密钥 / 解密失败 → 红色单保持阻断；黄色单不可走强验证接口；普通确认不可绕过红色。
+- AI 边界不变：仍无任何「执行转账 / 校验密码 / 校验验证码」模型工具。
+
+### 三、自动测试（命令行，与人工验收区分）
+
+| 项目 | 结果 |
+| ---- | ---- |
+| `node scripts/verify-strong-verification.js` | ✅ 73/73（含 RFC 6238 已知向量、防重放、锁定、回滚、黄色不绕过） |
+| `node scripts/verify-transfers.js` | ✅ 61/61（黄色流程无回归） |
+| `node scripts/verify-assistant-transfer.js` | ✅ 通过（NL 转账 / 改单无回归） |
+| `node scripts/verify-assistant.js` | ✅ 通过（无回归） |
+| `node scripts/verify-bind-interaction.js` | ✅ 13/13（隐藏输入状态机：退格 / 粘贴 / CR/LF/CRLF / Ctrl+C / ANSI 序列 / 非 TTY 拒绝） |
+| `npm run build`（前端） | ✅ 通过（dist/index.html 0.46 kB / css 17.48 kB / js 100.10 kB） |
+| 收费模型 | ✅ 未调用（仅本地模拟） |
+
+### 四、人工验收（用户已确认，与自动测试区分）
+
+本轮由用户在本地网页 + 终端人工验收，与上述命令行自动测试明确区分：
+
+1. 绑定验证器成功（本地 `bind-verification.js`，Windows PowerShell 交互式终端）。
+2. 红色转账单生成时不扣款。
+3. 错误凭据被拦截，余额不变。
+4. 正确交易密码 + TOTP 可执行转账。
+5. 只扣款一次，余额、流水、月度统计同步刷新。
+
+### 五、一致性备份
+
+- 结构变更前备份：`backend/data/backups/rongzhi.pre-transfer-20261022042058042.db`（复用 `backup-db.js`）。
+
+### 六、绑定命令（用户本人执行）
+
+```
+cd backend && node scripts/bind-verification.js
+```
+
+扫码步骤：运行后按提示两次输入交易密码（≥8 位，隐藏输入）→ 在系统临时目录生成临时二维码
+（`tmpdir()` 下的 `rongzhi-verification-*.png`，未暴露给 Vite / Express 静态服务）→ 用手机验证器（如 Google Authenticator /
+Microsoft Authenticator）扫码，验证器名「融智 Agent」、账户为演示账户 → 输入当前 6 位动态码验证通过后
+绑定启用；完成 / 取消 / 失败均清理二维码与临时明文。已有绑定拒绝覆盖，无快捷重置。
+
+### 七、网页验收步骤
+
+1. 启动后端 + 前端，先用本地命令完成一次绑定（见上）。
+2. 在「手动转账」或「AI 助手」发起一笔使当日累计 >¥1000 的转账，生成**红色**单。
+3. 红色卡显示收款人 / 掩码账户 / 付款账户 / 金额 / 备注 / 红色原因，以及交易密码 + 6 位验证码输入框与「验证并确认转账」按钮。
+4. 输入正确密码 + 验证器当前动态码 → 显示成功回执，余额 / 流水 / 月度统计同步刷新，只扣一次。
+5. 反向核对：未绑定时显示「尚未绑定验证器」且无可执行按钮；密码或验证码错误提示失败并显示剩余次数；
+   连续 5 次错误锁定 15 分钟并显示解锁时间；黄色单仍走普通确认。
+6. 同一验证码不可重复用于第二笔红色单；已取消 / 已过期的红色单不可再验证。
+
+### 八、已知限制
+
+- 尚未实现正式登录认证与多用户隔离；TOTP 时间步窗口为 ±1（约 90 秒）；仅本地绑定命令，无 Web 绑定 / 重置。
+- 强验证交互的自动化覆盖为输入状态机单元测试（非真实 TTY 端到端）；真实 PowerShell 交互由用户人工验收。
+
