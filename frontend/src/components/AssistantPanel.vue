@@ -9,6 +9,7 @@ import { useSubscriptionOpSignal } from '../composables/useSubscriptionOpSignal.
 import TransferConfirmCard from './TransferConfirmCard.vue'
 import CardOperationConfirmCard from './CardOperationConfirmCard.vue'
 import SubscriptionOperationConfirmCard from './SubscriptionOperationConfirmCard.vue'
+import AgentTasksSection from './AgentTasksSection.vue'
 import MarkdownContent from './MarkdownContent.vue'
 
 const examples = [
@@ -69,6 +70,12 @@ const composing = ref(false)
 const loading = ref(true)
 const loadError = ref('')
 const sessionExpired = ref(false)
+const tasksRef = ref(null)
+
+// 任务区业务变更（如暂停订阅确认）后刷新相关分区
+function onTaskChanged() {
+  refresh()
+}
 
 let seq = 0
 function nextId() {
@@ -161,6 +168,10 @@ async function send(text) {
       if (rec.name === 'prepare_subscription_operation' && rec.data && rec.data.previous && rec.data.previous.ref_no) {
         notifySubscriptionOpChange(rec.data.previous.ref_no)
       }
+      if (rec.name === 'start_subscription_review') {
+        // 模型启动了跨场景任务：刷新任务区，展示任务进度卡
+        if (tasksRef.value) tasksRef.value.refresh()
+      }
     }
   } catch (e) {
     messages.value.push({
@@ -226,6 +237,8 @@ onMounted(loadCurrent)
       <h2 class="section-title">AI 助手</h2>
       <button class="btn-ghost" :disabled="sending" @click="newChat">新建对话</button>
     </div>
+
+    <AgentTasksSection ref="tasksRef" @changed="onTaskChanged" />
 
     <div ref="listEl" class="chat-list">
       <p v-if="loading" class="chat-empty">正在加载聊天记录…</p>
@@ -373,6 +386,14 @@ onMounted(loadCurrent)
                     <span class="rc-label">订阅操作单 · {{ rec.data.ref_no }}</span>
                     <span class="rc-value">{{ statusText(rec.data.status) }}</span>
                     <span v-if="rec.data.merchant" class="rc-note">{{ rec.data.merchant }}（{{ subAction(rec.data.action) }}）</span>
+                  </div>
+                </template>
+
+                <template v-else-if="rec.name === 'start_subscription_review'">
+                  <div class="result-card task-started">
+                    <span class="rc-label">已启动「订阅审查」跨场景任务</span>
+                    <span class="rc-value">{{ rec.data.month }}</span>
+                    <span class="rc-note">请在「跨场景任务」卡片中选择要暂停的生效订阅。</span>
                   </div>
                 </template>
               </div>
@@ -529,7 +550,8 @@ onMounted(loadCurrent)
 .result-card.monthly,
 .result-card.recipients,
 .result-card.status,
-.result-card.subs {
+.result-card.subs,
+.result-card.task-started {
   flex-direction: column;
   align-items: stretch;
 }

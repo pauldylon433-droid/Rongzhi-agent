@@ -1,6 +1,6 @@
 # API 接口文档
 
-融智 Agent 后端接口（只读查询 + 模拟转账 + 银行卡冻结/解冻 + 订阅暂停/恢复/取消）。当前为**单用户演示模式**：服务端固定演示用户「张三」
+融智 Agent 后端接口（只读查询 + 模拟转账 + 银行卡冻结/解冻 + 订阅暂停/恢复/取消 + 跨场景任务）。当前为**单用户演示模式**：服务端固定演示用户「张三」
 （用户 id 由服务端解析），所有查询均按该用户限制数据范围，不接受客户端通过 `user_id` 切换用户。
 该模式尚未实现正式登录认证。
 
@@ -267,6 +267,7 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | get_subscriptions | 无 | 查询本人订阅与代扣列表（复用 `listSubscriptions`，含商户 / 金额 / 周期 / 下次扣费日期 / 状态） |
 | prepare_subscription_operation | `subscription_id`、`action`（pause/resume/cancel） | 调用订阅操作服务生成「订阅操作单」（不改状态）；暂停/取消需点击确认、恢复需强验证 |
 | get_subscription_operation_status | `ref_no`（字符串） | 按操作编号查询订阅操作单当前状态（以数据库为准） |
+| start_subscription_review | `month`（YYYY-MM，必填） | 启动跨场景「订阅审查」任务（分析该月支出 + 列出生效订阅，落到等待选择；仅此一条任务链） |
 
 - 转账流程：先用 `search_transfer_recipients` 确认收款人；信息齐全且收款人明确后调用 `prepare_transfer` 生成草稿。
   金额参数用 `amount_yuan` 字符串（如 `"100.00"`），服务端用字符串拆分精确转换为整数分（拒绝负数、零、
@@ -293,6 +294,11 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
   `notice` 与 `previous`（服务端读真实状态，语义同转账改单）。已取消（cancelled）的订阅不可再操作。
   **不开放任何执行 / 强验证工具**（如 `confirm_subscription_operation`、`verify_subscription_operation`）；
   聊天文字「确认」不会暂停 / 取消 / 恢复，只能提醒用户在界面确认卡上操作。
+- 跨场景任务：仅支持一条任务链——「分析某月支出 → 列出生效订阅 → 用户选择一项 → 生成暂停单 → 界面确认 → 核验 → 汇总回执」，
+  由 `start_subscription_review` 启动（仅接受 `month`，多余参数被拒）。模型只负责理解意图与提取月份，
+  服务端用白名单节点构建任务图并校验依赖，**不执行模型生成的任意代码 / URL / SQL / 操作步骤**；
+  模型不能代用户选择订阅，也不能仅凭聊天文字「确认」推进任务——选择与确认分别走 `POST /api/agent-tasks/:taskNo/select`
+  与订阅操作单确认接口。其它任务组合（多场景任意编排）一律说明「不支持」。
 - 未开放改余额、挂失、销卡、补卡、调额等写操作。未知工具、额外参数、非法 JSON、非法参数均被拒绝；
   模型不得传 `user_id`、SQL、文件路径或 URL。相对月份（「这个月 / 上个月」）由服务端按当前上海日期换算。
 
@@ -519,6 +525,76 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 
 暂停 / 取消：`pending` → `completed`（确认）/ `cancelled` / `expired` / `failed`（版本变化或状态已变）；
 恢复：`needs_verification` → `completed`（强验证）/ `cancelled` / `expired` / `failed`。除到期外不允许任意跳转。
+
+### 跨场景任务接口
+
+当前仅支持**一条**任务链：「分析某月支出 → 列出生效订阅 → 用户选择一项 → 准备暂停单 → 界面确认 → 核验执行结果 → 汇总回执」，
+任务类型 `kind = subscription_review`。任务由 AI 助手工具 `start_subscription_review` 创建（或已存在任务），
+后续通过下列接口推进。客户端不能指定任务类型、节点、依赖或任何业务步骤。
+
+| 方法 | 路径 | 说明 |
+| ---- | ---- | ---- |
+| GET | `/api/agent-tasks/recent` | 最近任务列表（按更新时间倒序，轻量入口，便于新对话后继续查看） |
+| GET | `/api/agent-tasks/:taskNo` | 查看任务详情（先对账再返回，刷新 / 后端重启可恢复） |
+| POST | `/api/agent-tasks/:taskNo/select` | 选择要暂停的一项订阅（生成暂停操作单，不执行） |
+| POST | `/api/agent-tasks/:taskNo/pause` | 暂停任务（后端阻断关联未执行操作单） |
+| POST | `/api/agent-tasks/:taskNo/resume` | 继续任务（重新校验订阅 / 版本 / 操作单有效期） |
+| POST | `/api/agent-tasks/:taskNo/cancel` | 取消任务（后端阻断关联未执行操作单；已确认变更不反向） |
+| POST | `/api/agent-tasks/:taskNo/manual` | 转手动处理（复用已有订阅操作入口） |
+
+#### 任务状态
+
+`waiting_selection`（等待选择）/ `waiting_confirmation`（等待确认）/ `completed`（已完成）/ `failed`（失败）/
+`paused`（已暂停）/ `cancelled`（已取消）/ `manual`（手动处理）。
+
+#### 任务视图字段
+
+```json
+{
+  "task_no": "task-…",
+  "kind": "subscription_review",
+  "status": "waiting_selection",
+  "month": "2026-10",
+  "selected_subscription_id": null,
+  "selected_subscription": null,
+  "op_ref": null,
+  "op": null,
+  "selectable_subscriptions": [ "生效订阅列表（以实时业务状态为准）" ],
+  "result_summary": null,
+  "failure_reason": "",
+  "created_at": 1760000000000,
+  "updated_at": 1760000000000,
+  "completed_at": null,
+  "nodes": [
+    { "node_key": "monthly_analysis", "label": "月度支出分析", "status": "completed", "result": { "...月度统计..." }, "error": "" }
+  ]
+}
+```
+
+- `nodes` 依次为 7 个白名单节点：`monthly_analysis` / `subscription_query` / `await_selection` / `prepare_pause` /
+  `await_confirmation` / `verify_result` / `summary`。只读节点（月度分析、订阅查询）自动执行；
+  选择（await_selection）与确认（await_confirmation）等待用户在界面操作；`prepare_pause` 生成操作单但**不执行**。
+- 月度分析与订阅查询结果带 `month` / `as_of` 快照标记，不冒充实时数据；选择时以业务库当前生效订阅为准。
+- `result_summary` 为服务端生成的确定性回执（分析月份、该月支出、订阅每期金额、当前状态、操作编号与防误解提示）；
+  不编造「长期未使用」或「节省金额」。
+
+#### 选择订阅
+
+请求体仅允许 `{ "subscription_id": 1 }`；多余字段返回 400。`subscription_id` 必须为正整数；服务端校验订阅归属与生效状态
+（`active`），不信任快照。选择成功后生成「待确认暂停单」（复用 `POST /api/subscription-operations` 的暂停单规则，风险等级黄色），
+任务转入 `waiting_confirmation`，订阅状态**不变**。
+
+- 非 `waiting_selection` 状态返回 409；订阅不存在 / 非生效状态返回 400 / 404（如实说明）。
+- 生成暂停单后，确认仍需在订阅操作单确认卡（`POST /api/subscription-operations/:refNo/confirm`）点击执行；
+  聊天文字「确认」不推进任务。确认后任务由服务端对账（核验操作单 `completed` + 业务库订阅确实 `paused`）推进到 `completed`。
+
+#### 暂停 / 继续 / 取消 / 转手动
+
+- 四个接口请求体均不接受任何额外字段（`{}` 或空），多余字段返回 400。
+- 暂停 / 取消 / 转手动会**在后端阻断**关联的未执行操作单（`cancelSubscriptionOperation`），而非仅隐藏前端按钮；
+  若关联操作单已确认完成（确认与取消竞态），以事务结果为准：任务按真实结果对账为 `completed`，**不反向**已发生的订阅变更。
+- 继续（resume）重新检查任务、订阅版本与操作单有效期；过期 / 失效单需重新生成并要求再次确认，不直接执行。
+- 失败（failed）任务可「继续」回到等待选择，重新选择；已确认的订阅变更不会因任务取消 / 失败 / 转手动被自动反向。
 
 ## 错误处理
 

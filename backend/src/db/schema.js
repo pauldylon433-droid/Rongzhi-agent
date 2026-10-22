@@ -253,6 +253,49 @@ CREATE TABLE IF NOT EXISTS chat_state (
   current_session_id TEXT,
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
+
+-- 跨场景任务模板（当前仅支持「订阅审查」一条任务链）：
+-- 任务、节点、依赖、状态、结果摘要与业务单引用均持久化，刷新 / 后端重启可恢复。
+-- 模型只负责理解意图与提取月份；服务端用白名单节点构建任务图并校验依赖。
+CREATE TABLE IF NOT EXISTS agent_tasks (
+  id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_no                  TEXT NOT NULL UNIQUE,       -- 任务编号（task- 前缀）
+  user_id                  INTEGER NOT NULL,
+  kind                     TEXT NOT NULL DEFAULT 'subscription_review' CHECK (kind IN ('subscription_review')),
+  status                   TEXT NOT NULL DEFAULT 'waiting_selection' CHECK (status IN ('waiting_selection','waiting_confirmation','completed','failed','paused','cancelled','manual')),
+  month                    TEXT,                       -- 分析月份（YYYY-MM，模型提取、服务端校验）
+  session_id               TEXT,                       -- 发起该任务的助手会话（可空，仅溯源）
+  selected_subscription_id INTEGER,                    -- 用户选定的订阅（等待/已确认）
+  op_ref                   TEXT,                       -- 关联的订阅操作单编号（业务单引用）
+  result_summary           TEXT,                       -- 汇总回执（JSON）
+  failure_reason           TEXT,                       -- 失败原因
+  created_at               INTEGER NOT NULL,           -- epoch 毫秒
+  updated_at               INTEGER NOT NULL,
+  completed_at             INTEGER,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (selected_subscription_id) REFERENCES subscriptions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_user_id ON agent_tasks(user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status  ON agent_tasks(status);
+
+-- 任务节点：白名单节点执行状态、依赖（持久化）、结果摘要与失败原因。
+CREATE TABLE IF NOT EXISTS agent_task_nodes (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id      INTEGER NOT NULL,
+  node_key     TEXT NOT NULL,
+  seq          INTEGER NOT NULL,                       -- 白名单内的顺序
+  status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','failed','skipped')),
+  depends_on   TEXT,                                   -- JSON 数组：依赖的节点 key
+  result_json  TEXT,                                   -- 节点结果摘要（JSON）
+  error        TEXT,                                   -- 节点失败原因
+  started_at   INTEGER,
+  completed_at INTEGER,
+  FOREIGN KEY (task_id) REFERENCES agent_tasks(id),
+  UNIQUE (task_id, node_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_task_nodes_task_id ON agent_task_nodes(task_id);
 `
 
 export function createSchema(db) {

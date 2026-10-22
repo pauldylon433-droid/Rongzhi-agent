@@ -208,3 +208,40 @@ export async function verifySubscriptionOperation(refNo, { password, totp }) {
   const body = await postJson(`/api/subscription-operations/${refNo}/verify`, { password, totp })
   return body.data
 }
+
+// —— 跨场景任务（当前仅支持「订阅审查」一条任务链）——
+
+export async function fetchRecentAgentTasks() {
+  const body = await request('/api/agent-tasks/recent')
+  return body.data
+}
+
+export async function fetchAgentTask(taskNo) {
+  const body = await request(`/api/agent-tasks/${taskNo}`)
+  return body.data
+}
+
+export async function selectAgentTaskSubscription(taskNo, subscription_id) {
+  const body = await postJson(`/api/agent-tasks/${taskNo}/select`, { subscription_id })
+  return body.data
+}
+
+export async function pauseAgentTask(taskNo) {
+  const body = await postJson(`/api/agent-tasks/${taskNo}/pause`, {})
+  return body.data
+}
+
+export async function resumeAgentTask(taskNo) {
+  const body = await postJson(`/api/agent-tasks/${taskNo}/resume`, {})
+  return body.data
+}
+
+export async function cancelAgentTask(taskNo) {
+  const body = await postJson(`/api/agent-tasks/${taskNo}/cancel`, {})
+  return body.data
+}
+
+export async function manualAgentTask(taskNo) {
+  const body = await postJson(`/api/agent-tasks/${taskNo}/manual`, {})
+  return body.data
+}

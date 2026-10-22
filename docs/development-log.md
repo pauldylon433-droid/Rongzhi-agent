@@ -1055,3 +1055,108 @@ Microsoft Authenticator）扫码，验证器名「融智 Agent」、账户为演
 
 （见最终交付报告）
 
+---
+
+## 第二十一阶段：跨场景任务模板（订阅审查单链）
+
+日期：2026-10-22
+
+本轮实现**唯一一条**跨场景任务链：「分析某月支出 → 列出生效订阅 → 用户选择一项 → 生成暂停单 → 界面确认 →
+核验执行结果 → 汇总回执」。不引入通用工作流框架或图表库；其它任务组合一律说明「不支持」。模型只负责理解意图与提取月份，
+服务端用白名单节点构建任务图并校验依赖，**不执行模型生成的任意代码 / URL / SQL / 操作步骤**。
+
+### 一、新增 / 修改
+
+#### 后端（backend/）
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `src/db/schema.js` | 修改：新增 `agent_tasks`（任务元数据 / 状态 / 结果摘要 / 业务单引用）、`agent_task_nodes`（节点 key / seq / 状态 / 依赖 / 结果）两表及索引 |
+| `src/services/agent-tasks.js` | 新建：跨场景任务服务（白名单 7 节点 + `validateGraph` 校验、`createTask` / `selectSubscription` / `getTask` / `listRecentTasks` / `pauseTask` / `resumeTask` / `cancelTask` / `manualTask`、`reconcile` 只读对账、`buildSummary` 确定性回执） |
+| `src/routes/agent-tasks.js` | 新建：`GET /recent`、`GET /:taskNo`、`POST /:taskNo/select|pause|resume|cancel|manual`（字段白名单 + 状态码映射） |
+| `src/routes/index.js` | 修改：注册 `/agent-tasks` 路由 |
+| `src/services/assistant.js` | 修改：工具白名单新增 `start_subscription_review`（仅接受 `month`）；系统提示新增跨场景任务规则（仅一条链、不代选订阅、不声称「长期未使用」、不同周期不直接相加、暂停成功≠退款） |
+
+#### 前端（frontend/）
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `src/api/index.js` | 修改：新增 `fetchRecentAgentTasks` / `fetchAgentTask` / `selectAgentTaskSubscription` / `pauseAgentTask` / `resumeAgentTask` / `cancelAgentTask` / `manualAgentTask` |
+| `src/components/AgentTaskCard.vue` | 新建：轻量任务进度卡（当前步骤 / 等待事项 / 月度·订阅快照 / 可选择订阅 / 确认卡 / 回执 / 失败原因 / 暂停·继续·取消·转手动入口） |
+| `src/components/AgentTasksSection.vue` | 新建：跨场景任务区（活动任务卡 + 最近任务入口，刷新 / 后端重启后重新拉取恢复） |
+| `src/components/AssistantPanel.vue` | 修改：引入任务区、`start_subscription_review` 结果卡、确认后联动刷新 |
+| `src/App.vue` | 修改：场景状态「跨场景联动」→「订阅审查单链已实现」+ 说明文案 |
+
+#### 脚本与文档
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `scripts/verify-agent-tasks.js` | 新建：mock 模型 + 独立临时库 70 项断言验证 |
+| `docs/api.md` / `docs/database-design.md` / `docs/security-design.md` / `docs/development-log.md` | 文档同步 |
+
+### 二、实现要点
+
+- **白名单任务图**：7 个节点 `monthly_analysis` / `subscription_query` / `await_selection` / `prepare_pause` /
+  `await_confirmation` / `verify_result` / `summary`；`validateGraph` 校验 key 唯一、依赖存在、无环、顺序连续。
+- **只读自动执行 / 变更复用操作单**：月度分析复用 `monthlyAnalytics`、订阅查询复用 `listSubscriptions`（只读，自动执行）；
+  选择后「准备暂停单」复用 `createSubscriptionOperation`（不执行），确认复用订阅操作单确认接口。
+- **模型与界面边界**：模型不能代选订阅、聊天「确认」不执行；选择与确认分别经专用接口；节点完成由服务端对账驱动
+  （核验操作单 `completed` + 业务库订阅 `paused`），不由模型回复决定。
+- **持久化与恢复**：任务 / 节点 / 依赖 / 状态 / 结果摘要 / 业务单引用全部持久化 SQLite；刷新 / 后端重启经只读对账恢复，
+  不重发模型请求、不自动重发业务操作。
+- **竞态与阻断**：暂停 / 取消 / 转手动在后端阻断关联未执行操作单；确认与取消竞态以事务结果为准，已确认变更不反向。
+- **继续重新校验**：继续（resume）重新检查订阅版本与操作单有效期，过期 / 失效单重新生成并再次确认。
+- **诚实不编造**：查询快照带 `month` / `as_of`；回执提示「暂停成功≠退款/节省」；无使用频率数据不声称「长期未使用」。
+
+### 三、验证结果（真实执行，mock 模型 + 独立临时库）
+
+| 验证项 | 结果 |
+| ---- | ---- |
+| `node scripts/verify-agent-tasks.js` | ✅ 70/70（完整链、选择前不建单、准备不执行、真实确认后才完成、重复幂等、依赖/参数校验、越权、旧版本/过期单、暂停/取消与确认竞态、刷新/重启恢复、失败后继续、手动接管、助手启动任务、HTTP 路由字段校验、原业务无回归） |
+| `node scripts/verify-subscription-operations.js` | ✅ 84/84（无回归） |
+| `node scripts/verify-assistant.js` | ✅ 通过（无回归） |
+| `node scripts/verify-chat-persistence.js` | ✅ 35/35（无回归） |
+| `node scripts/verify-strong-verification.js` | ✅ 73/73（无回归） |
+| `node scripts/verify-card-operations.js` | ✅ 78/78（无回归） |
+| `node scripts/verify-transfers.js` | ✅ 61/61（无回归） |
+| `node scripts/verify-analytics.js` / `verify-api.js` / `verify-db.js` / `verify-migrate.js` / `verify-assistant-session.js` / `verify-assistant-transfer.js` / `verify-bind-interaction.js` / `verify-fix.js` | ✅ 全部通过（无回归） |
+| `npm run build`（前端） | ✅ 通过（69 模块，dist/index.html 0.46 kB / css 32.23 kB / js 262.66 kB） |
+| 收费模型 | ✅ 未调用（仅 mock 模型 + 本地模拟） |
+| 开发库业务数据 | ✅ 未修改；未在开发库自动暂停任何订阅 |
+| 浏览器可视验收 | ⚠️ 未做（命令行环境，仅验证构建与接口数据链路） |
+
+### 四、一致性备份
+
+- 结构变更（`agent_tasks` / `agent_task_nodes` 两表）前：本项目按约定「需要迁移时先做 SQLite 一致性备份」，
+  本轮两表由 `createSchema` 幂等新建（无数据迁移、不改存量表），开发库暂未在本轮执行结构写入；
+  若需在开发库落地，先用 `node backend/scripts/backup-db.js` 做一致性备份后再启动后端。
+
+### 五、已知限制
+
+- 仅支持「订阅审查」一条任务链；其它组合明确「不支持」。
+- 无使用频率 / 长期未用数据；暂停成功不承诺节省金额或退款。
+- 恢复后原扣费日期「更新」为占位展示（沿用既有订阅管理限制）。
+- 正式登录认证与多用户隔离仍未实现（单用户演示模式）。
+- 浏览器端任务卡交互（选择 / 确认 / 继续 / 转手动）未做真实浏览器可视验收。
+
+### 六、重启与验收步骤
+
+后端以 `npm run dev`（nodemon）运行会随源码改动自动重启并执行 `createSchema` 幂等建表；若以 `npm start` 运行则需重启以加载新增路由与两表。前端 `npm run dev` 热更新。
+
+验收：
+1. 打开前端 → 「AI 助手」分区输入「分析这个月的支出，列出生效订阅，让我选择后暂停一项」→ 出现「跨场景任务」进度卡（等待选择），月度支出与生效订阅为带月份/时间的快照。
+2. 点击要暂停的一项 → 任务转入「等待确认」，出现订阅操作确认卡（订阅状态未变）。
+3. 确认卡点「确认暂停」→ 任务完成，显示回执（分析月份 / 支出 / 每期金额 / 操作编号 / 防误解提示），订阅列表同步刷新为「暂停」。
+4. 反向核对：只回复「确认」文字不推进任务；「暂停任务 / 取消任务 / 转手动」在后台阻断未执行操作单；「继续」过期 / 失效单重新生成并再次确认；刷新页面后任务可恢复，不重发操作。
+5. 其它任务组合（如「分析支出并自动给某人转账」）AI 明确说明不支持。
+
+### 七、全轮实际耗时
+
+开始：2026-10-22（跨会话续作，见会话记录）；结束：2026-10-22 16:58:58 +0800。
+
+### 八、用户验收
+
+- 2026-10-22 用户网页验收通过：单链「分析本月支出 → 列出生效订阅 → 选择后暂停一项」全流程可用，
+  选择 / 确认 / 回执 / 订阅列表刷新均符合预期。
+- 范围确认：仅此一条任务链；其余任务组合明确「不支持」，不提供通用工作流编排。
+

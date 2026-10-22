@@ -20,6 +20,7 @@ import {
 import {
   createSubscriptionOperation, cancelSubscriptionOperation, getSubscriptionOperation, SubscriptionOpError,
 } from './subscription-operations.js'
+import { createTask } from './agent-tasks.js'
 import { yuanToCents } from '../lib/money.js'
 import { parseMonth } from '../routes/helpers.js'
 import { SHANGHAI_OFFSET_MS } from '../lib/shanghai.js'
@@ -191,6 +192,22 @@ const TOOL_DEFS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'start_subscription_review',
+      description:
+        '启动「订阅审查」跨场景任务：分析指定月份的支出、列出生效订阅，等待用户选择后暂停其中一项。仅支持这一条任务链；服务端会构建任务图并自动执行只读分析，订阅选择与确认由用户在任务卡上完成，本工具不选择、不执行任何订阅变更。单条用户消息最多调用一次。',
+      parameters: {
+        type: 'object',
+        properties: {
+          month: { type: 'string', description: '分析月份，格式 YYYY-MM，例如 2026-10' },
+        },
+        required: ['month'],
+        additionalProperties: false,
+      },
+    },
+  },
 ]
 
 // 工具参数/未知工具错误
@@ -231,7 +248,8 @@ function buildSystemMessage() {
       `8. 银行卡操作：查询用 get_cards；冻结 / 解冻先用 get_cards 确认卡片（含掩码卡号），卡片明确后调用 prepare_card_operation 生成「银行卡操作单」。你只能生成操作单，不能直接冻结 / 解冻：冻结需用户在界面点击确认，解冻需交易密码 + 动态验证码强验证。多张卡片时列出掩码选项让用户选择，不能擅自选第一张。\n` +
       `9. 用户提到「挂失 / 销卡 / 补卡 / 调额」等正式卡片业务时，明确说明本阶段不支持，并询问是否改用「临时冻结」，不要替用户决定。\n` +
       `10. 订阅与代扣：查询用 get_subscriptions；暂停 / 恢复 / 取消先用 get_subscriptions 确认订阅（含商户与状态），订阅明确后调用 prepare_subscription_operation 生成「订阅操作单」。你只能生成操作单，不能直接暂停 / 取消 / 恢复：暂停与取消需用户在界面点击确认，恢复需交易密码 + 动态验证码强验证。已取消（cancelled）的订阅不可再操作。多项订阅时列出选项让用户选择，不能擅自选第一项。查询操作状态用 get_subscription_operation_status，以数据库返回为准。\n` +
-      `11. 用简体中文回答，简洁准确；金额请标注单位（元）。`,
+      `11. 跨场景任务：仅支持一条任务链——「分析某月支出 → 列出生效订阅 → 用户选择后暂停一项」。用户提出该组合需求时，先确定月份（「这个月/本月/上月」按当前上海日期换算为 YYYY-MM），再调用 start_subscription_review 传入 month 启动任务；任务启动后订阅选择与确认都由用户在任务卡上完成，你不能替用户选择、不能声称已暂停、不能声称某订阅「长期未使用」（你没有使用频率数据），也不能把不同扣费周期的金额直接相加成月度费用。除这一条任务链外的任何跨场景组合（如「分析后自动取消订阅」「多任务并行」「按月分析并解冻银行卡」等）本阶段不支持，明确告知用户尚未支持。\n` +
+      `12. 用简体中文回答，简洁准确；金额请标注单位（元）。`,
   }
 }
 
@@ -569,6 +587,19 @@ function executeTool(db, demoUserId, name, args, ctx) {
     ctx.messageState.prepareSubscriptionOpDone = true
     return { ...op, previous, notice: buildSubscriptionOpNotice(previous, op.ref_no, op.action) }
   }
+  if (name === 'start_subscription_review') {
+    if (ctx.messageState.startTaskDone) {
+      throw new ToolError('本条消息已启动跨场景任务，请先处理当前任务')
+    }
+    const extra = Object.keys(args).filter((k) => k !== 'month')
+    if (extra.length) {
+      throw new ToolError(`start_subscription_review 不接受额外参数：${extra.join('、')}`)
+    }
+    // 月份由模型提取，服务端校验格式；任务图与节点由服务端白名单构建，不执行模型生成的任何步骤。
+    const task = createTask(db, demoUserId, { month: args.month, sessionId: ctx.session.id })
+    ctx.messageState.startTaskDone = true
+    return task
+  }
   throw new ToolError(`未知工具：${name}`)
 }
 
@@ -845,7 +876,7 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
       const history = trimHistory(session.messages)
       const messages = [buildSystemMessage(), ...history, { role: 'user', content: trimmed }]
 
-      const messageState = { prepareTransferDone: false, prepareCardOpDone: false, prepareSubscriptionOpDone: false }
+      const messageState = { prepareTransferDone: false, prepareCardOpDone: false, prepareSubscriptionOpDone: false, startTaskDone: false }
       const { finalReply, toolRecords, incomplete, usage } = await runLoop(
         messages, db, demoUserId, chatFn, { session, messageState },
       )

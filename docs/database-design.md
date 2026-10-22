@@ -244,6 +244,44 @@
 > 单用户演示：刷新按此指针恢复「当前对话」；新建对话仅清除指针，不删除历史。
 > 记录上限：单会话最多 200 条用户可见消息（超出截断最旧）；保留期：7 天，过期会话在访问时惰性清除上下文与消息。
 
+### 14. agent_tasks — 跨场景任务（当前仅「订阅审查」一条任务链）
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 任务 ID |
+| task_no | TEXT | NOT NULL UNIQUE | 任务唯一编号（`task-` 前缀） |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户（服务端演示用户） |
+| kind | TEXT | NOT NULL, subscription_review | 任务类型（当前仅此一种） |
+| status | TEXT | NOT NULL, waiting_selection/waiting_confirmation/completed/failed/paused/cancelled/manual | 任务状态 |
+| month | TEXT | 可空 | 分析月份（YYYY-MM，服务端校验） |
+| session_id | TEXT | 可空 | 启动任务的会话 id |
+| selected_subscription_id | INTEGER | 可空, FK→subscriptions.id | 用户选定的订阅 |
+| op_ref | TEXT | 可空 | 关联订阅操作单编号（复用 subscription_operations） |
+| result_summary | TEXT | 可空 | 汇总回执 JSON（服务端生成） |
+| failure_reason | TEXT | 可空 | 失败原因 |
+| created_at | INTEGER | NOT NULL | 创建时间（epoch 毫秒） |
+| updated_at | INTEGER | NOT NULL | 更新时间（epoch 毫秒） |
+| completed_at | INTEGER | 可空 | 完成时间（epoch 毫秒） |
+
+### 15. agent_task_nodes — 跨场景任务节点（白名单图 + 依赖 + 状态持久化）
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 节点 ID |
+| task_id | INTEGER | NOT NULL, FK→agent_tasks.id | 所属任务 |
+| node_key | TEXT | NOT NULL | 节点白名单 key（monthly_analysis 等 7 个） |
+| seq | INTEGER | NOT NULL | 节点顺序 |
+| status | TEXT | NOT NULL, pending/completed/failed/skipped | 节点状态 |
+| depends_on | TEXT | 可空 | 依赖节点 key（JSON 数组，服务端构建时校验） |
+| result_json | TEXT | 可空 | 节点结果 JSON（月度统计 / 订阅快照 / 操作单编号等） |
+| error | TEXT | 可空 | 节点失败说明 |
+| started_at | INTEGER | 可空 | 开始时间（epoch 毫秒） |
+| completed_at | INTEGER | 可空 | 完成时间（epoch 毫秒） |
+
+> 任务图由服务端用白名单节点构建并校验（key 唯一、依赖存在、无环、顺序连续），**不执行模型生成的任意步骤**。
+> 任务、节点、依赖、状态、结果摘要与业务单引用全部持久化，刷新 / 后端重启可恢复；恢复不重发模型请求、不重发业务操作。
+> `UNIQUE(task_id, node_key)` 保证同一任务内节点唯一。
+
 ### 索引
 
 为各外键列及常用查询列建立了索引（`idx_*`），例如：
@@ -257,6 +295,8 @@
 `ref_no` 以 `UNIQUE` 约束保证操作编号唯一。
 AI 助手相关：`idx_chat_sessions_user_id` / `_last_active_at`、
 `idx_chat_messages_session_id`（`session_id` + `seq`）等。
+跨场景任务相关：`idx_agent_tasks_user_id` / `idx_agent_tasks_status`、`idx_agent_task_nodes_task_id`，
+`agent_tasks.task_no` 以 `UNIQUE` 约束保证编号唯一，`agent_task_nodes` 以 `UNIQUE(task_id, node_key)` 保证节点唯一。
 
 ## 四、模拟数据生成方式
 
@@ -280,8 +320,8 @@ AI 助手相关：`idx_chat_sessions_user_id` / `_last_active_at`、
   - 未提供自动清库/重置功能。
 - 迁移：`backend/src/db/migrate.js`（幂等）。建表后自动执行，对已有库增量补列 `opened_on` / `issued_on` / `transactions.transfer_ref` 并回填 `2026-08-01`、补列 `cards.version` 并回填 `1`，建立唯一关联索引 `idx_transactions_transfer_ref`，新增 `card_operations` 表及索引，并在 `transfer_recipients` 为空时写入 4 条虚构收款人；新增 `subscription_operations` 表及索引、补列 `subscriptions.version` 并回填 `1`、补列 `chat_sessions.pending_subscription_op_ref`；仅回填 NULL 与空表，不删库、不清空、不重建交易、不改余额，重复执行数据不变。
 - 普通后端启动（`npm run dev` / `npm start`）确保表结构存在并执行迁移，不灌入、不清空数据。
-  `chat_sessions` / `chat_messages` / `chat_state` 三张表由 `createSchema`（`CREATE TABLE IF NOT EXISTS`）在每次启动时
-  幂等创建，无需额外迁移步骤。
+  `chat_sessions` / `chat_messages` / `chat_state` / `agent_tasks` / `agent_task_nodes` 五张表由 `createSchema`
+  （`CREATE TABLE IF NOT EXISTS`）在每次启动时幂等创建，无需额外迁移步骤。
 
 ## 六、验证脚本
 
@@ -312,6 +352,11 @@ AI 助手相关：`idx_chat_sessions_user_id` / `_last_active_at`、
 两轮对话刷新恢复、后端重启后上下文恢复、过期会话历史可查看且上下文重新开始、tool_calls/tool 配对与归属隔离、
 新建对话隔离（旧迟到响应不污染新会话）、只读恢复不伪造历史、操作卡回读业务库最新状态、
 不持久化任何凭据、200 条上限 + 7 天保留 + 损坏 JSON 容错（35 项断言）。
+
+`backend/scripts/verify-agent-tasks.js` 在独立临时库上验证跨场景任务模板（mock 模型，不调用收费模型）：
+完整任务链（分析→列订阅→选择→暂停单→确认→核验→回执）、选择前不建变更单、准备不执行、真实确认后才完成、
+重复请求幂等、依赖与参数校验、越权、旧版本 / 过期单、暂停 / 取消与确认竞态、刷新 / 重启恢复、
+失败后安全继续、手动接管、助手模型启动任务、HTTP 路由字段校验、原业务无回归（70 项断言）。
 
 运行：`node backend/scripts/verify-db.js`、`node backend/scripts/verify-transfers.js`、
 `node backend/scripts/verify-card-operations.js`、`node backend/scripts/verify-subscription-operations.js`、

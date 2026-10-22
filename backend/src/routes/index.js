@@ -9,6 +9,7 @@ import { createTransfersRouter } from './transfers.js'
 import { createVerificationRouter } from './verification.js'
 import { createCardOperationsRouter } from './card-operations.js'
 import { createSubscriptionOperationsRouter } from './subscription-operations.js'
+import { createAgentTasksRouter } from './agent-tasks.js'
 
 export function createApiRouter(db, demoUserId) {
   const router = Router()
@@ -22,5 +23,6 @@ export function createApiRouter(db, demoUserId) {
   router.use('/verification', createVerificationRouter(db, demoUserId))
   router.use('/card-operations', createCardOperationsRouter(db, demoUserId))
   router.use('/subscription-operations', createSubscriptionOperationsRouter(db, demoUserId))
+  router.use('/agent-tasks', createAgentTasksRouter(db, demoUserId))
   return router
 }

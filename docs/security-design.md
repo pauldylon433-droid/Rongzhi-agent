@@ -104,10 +104,11 @@
 
 ## 七、AI 助手安全边界
 
-- AI 助手工具白名单共 11 个：`get_accounts`、`get_monthly_analytics`、`search_transfer_recipients`、
+- AI 助手工具白名单共 12 个：`get_accounts`、`get_monthly_analytics`、`search_transfer_recipients`、
   `prepare_transfer`、`get_transfer_status`，银行卡相关的 `get_cards`、`prepare_card_operation`、
-  `get_card_operation_status`，以及订阅相关的 `get_subscriptions`、`prepare_subscription_operation`、
-  `get_subscription_operation_status`。其中 `prepare_transfer` / `prepare_card_operation` /
+  `get_card_operation_status`，订阅相关的 `get_subscriptions`、`prepare_subscription_operation`、
+  `get_subscription_operation_status`，以及跨场景任务相关的 `start_subscription_review`。其中
+  `prepare_transfer` / `prepare_card_operation` /
   `prepare_subscription_operation` 只能生成「待确认单」（写入 transfer_operations / card_operations /
   subscription_operations 草稿），**绝不扣款、绝不改卡片或订阅状态**；执行必须由用户在界面
   点击确认（冻结 / 暂停 / 取消）或强验证（解冻 / 恢复），调用现有确认 / 验证接口执行。
@@ -129,6 +130,25 @@
 - 订阅操作同样：多个订阅匹配或指向不明确时先澄清，不擅自选第一项；已取消订阅不可再操作，恢复需强验证，
   暂停 / 取消为普通确认。用户仅回复「确认」等文字不触发订阅状态变更，须在确认卡上明确操作。
 - 模型不能通过工具写库、传 `user_id`、SQL、文件路径、URL；未知工具 / 额外参数 / 非法参数均被拒。
+
+### 跨场景任务安全边界（订阅审查单链）
+
+- **唯一任务链**：当前仅支持一条任务链「分析某月支出 → 列出生效订阅 → 用户选择 → 准备暂停单 → 界面确认 →
+  核验 → 汇总回执」，任务类型 `subscription_review`；其它任务组合一律说明「不支持」，不提供通用工作流编排框架。
+- **白名单任务图**：任务由服务端用白名单节点（7 个 `node_key`）构建并校验（key 唯一、依赖存在、无环、顺序连续），
+  **不执行模型生成的任意代码 / URL / SQL / 操作步骤**；模型只负责理解意图与提取月份（`month` 经 `parseMonth` 严格校验），
+  不能注入节点、依赖或业务步骤。
+- **模型不代用户决策、聊天文字不执行**：模型不能代用户选择订阅；订阅选择只能经 `POST /api/agent-tasks/:taskNo/select`
+  （服务端校验归属与生效状态）完成；生成暂停单后订阅状态不变，确认只能经订阅操作单确认接口点击执行，
+  聊天文字「确认」不推进任务。
+- **只读节点自动执行，变更复用操作单**：月度分析复用 `monthlyAnalytics`、订阅查询复用 `listSubscriptions`（均为只读）；
+  「准备暂停单」复用 `createSubscriptionOperation`（只生成操作单，不执行），与订阅管理的版本 CAS / 风险判定 / 审计同一套规则。
+- **节点完成以服务端事实为准**：任务推进由服务端对账驱动（核验操作单 `completed` + 业务库订阅确实 `paused`），
+  不由模型回复或界面文案决定；查询结果带 `month` / `as_of` 快照标记，不冒充实时数据。
+- **竞态与阻断**：暂停 / 取消 / 转手动在后端调用 `cancelSubscriptionOperation` 阻断关联未执行操作单（不仅隐藏前端按钮）；
+  确认与取消竞态以事务结果为准，已确认的订阅变更不因任务取消 / 失败 / 转手动被反向。
+- **恢复不重放**：刷新 / 后端重启经只读对账恢复任务，不重发模型请求、不自动重发业务操作；过期 / 失效单需重新生成并再次确认。
+- **诚实不编造**：无使用频率数据则不声称「长期未使用」；不同扣费周期不直接相加成月度费用；暂停成功不等于已退款 / 已实现节省金额。
 
 ## 八、敏感信息与错误处理
 
