@@ -1160,3 +1160,57 @@ Microsoft Authenticator）扫码，验证器名「融智 Agent」、账户为演
   选择 / 确认 / 回执 / 订阅列表刷新均符合预期。
 - 范围确认：仅此一条任务链；其余任务组合明确「不支持」，不提供通用工作流编排。
 
+---
+
+## 第二十二阶段：补齐 README 与部署 / 测试说明（含干净源码副本验证）
+
+日期：2026-10-22
+
+本轮不新增业务功能、不调用收费模型、不自动提交 Git，仅补文档并对部署 / 测试步骤做**干净源码副本验证**。
+
+### 一、修改文件
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `README.md` | 重写：准确描述五场景已实现能力、模拟边界与未实现项（删除「聊天未开发」「ECharts 尚未接入」等过时描述）；补 Windows PowerShell 部署 / 测试 / 备份 / 绑定步骤；明确端口以启动输出为准；区分无 AI 密钥可用范围；说明备份恢复需数据库 + 加密主密钥 |
+| `frontend/README.md` | 重写：替换 Vite 脚手架样板，说明前端技术、命令与「密钥只在后端」 |
+| `docs/development-log.md` | 本日志 |
+
+### 二、验证环境（实际执行）
+
+- 操作系统：Windows 11 Home China 10.0.26200（Git Bash / MINGW64 内执行，PowerShell 命令跨 Shell 等价）。
+- Node.js：`v24.21.0`；npm：`11.19.0`。
+- 说明：本次为「**干净源码副本验证**」，即在隔离临时目录从 Git 归档重建源码后安装依赖并运行验证，
+  **不等同于「全新电脑验证」**（未在另一台无 Node / 无网络缓存的物理机复测）。
+
+### 三、干净源码副本验证过程
+
+1. 用 `git archive HEAD | tar -x` 导出到临时目录 `/tmp/rongzhi-verify.*`，共 **113 个受跟踪文件**；
+   已确认不含 `.env`、`.verification-key`、`*.db` / WAL / SHM、`data/backups/`、`node_modules/`、`dist/`、`*.zip`。
+2. 后端 `npm ci`：122 packages；`npm run db:init` 成功建表 + 种子（1 用户 / 1 账户 / 58 交易 / 1 卡 / 6 订阅）。
+3. 后端全部 mock 验证脚本（独立临时库，不调用真实模型）**15/15 通过**：
+   `verify-db` / `verify-api` / `verify-analytics` / `verify-migrate` / `verify-fix` / `verify-transfers`(61) /
+   `verify-assistant` / `verify-assistant-session` / `verify-assistant-transfer` / `verify-strong-verification`(73) /
+   `verify-bind-interaction`(13) / `verify-card-operations`(78) / `verify-chat-persistence`(35) /
+   `verify-subscription-operations`(84) / `verify-agent-tasks`(70)。
+4. 前端 `npm ci`：79 packages，0 漏洞；`node scripts/verify-markdown.mjs` 32/32 通过；`npm run build` 通过（69 模块，
+   dist js 262.66 kB）。
+5. 后端启动冒烟：`PORT=3999` + 副本已初始化库 `node src/index.js` → `GET /api/health` 200、`GET /api/accounts` 200，
+   演示用户「张三」；进程与临时库已清理，未触碰 3000 / 5174 与开发库。
+
+### 四、验证中确认的关键事实
+
+- 后端启动**须先 `npm run db:init`**：空库直接 `npm start` 会因 `resolveDemoUser` 找不到「张三」而退出（已在冒烟中复现）。
+- `ai:check` 与两个 `smoke-assistant-*-live.js` 为**真实模型调用**，属手动可选，未混入默认自动测试。
+- 前端默认端口为 `vite.config.js` 的 5173，本机实际 5174（被占用自动顺延），README 已注明「以启动输出为准」。
+
+### 五、仍存在的复现问题
+
+- 「干净源码副本验证」≠「全新电脑验证」：未在无 Node 环境 / 无 npm 缓存的物理机上复测 `better-sqlite3` 原生模块的
+  node-gyp 本地编译回退路径（本次走的是预编译二进制下载）。
+- 浏览器可视验收仍为命令行环境限制（未做真实浏览器自动截图 / 交互），网页流程由用户人工验收。
+
+### 六、起止时间
+
+开始：约 2026-10-22 18:53 +0800；结束：2026-10-22 18:59 +0800（约 6 分钟）。
+
