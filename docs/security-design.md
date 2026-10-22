@@ -45,9 +45,23 @@
   除到期外不允许任意跳转；解冻单不可通过普通确认接口执行；`completed` 不可取消或重复执行。
 - 冻结 / 解冻**仅改变卡片状态**，不改变余额、交易流水、订阅与日限额；不涉及真实扣款或真实卡片操作。
 
-## 四、强验证（交易密码 + 动态验证码，转账与解冻共用）
+### 订阅 / 代扣状态机（后端判定）
 
-红色转账单与解冻单（均为 `needs_verification`）必须同时通过**交易密码**与**手机验证器动态验证码（TOTP）**验证，
+订阅操作同样由后端判定风险与合法性：暂停为黄色（待确认）、取消为黄色（待确认）、恢复为红色（需强验证）。
+
+- 合法状态流转：`active → paused`（暂停）、`paused → active`（恢复）、`active → cancelled` / `paused → cancelled`（取消）；
+  已取消（cancelled）为终态，不可暂停 / 恢复 / 取消；已处于目标状态的订阅拒绝重复创建操作单，未知状态一律拒绝。
+- 创建操作单（prepare）**不改变订阅状态**，写入建单时订阅版本快照 `subscription_version`。
+- 订阅状态更新用**乐观锁版本 CAS**：`UPDATE subscriptions SET status=?, version=version+1 WHERE id=? AND version=?`。
+  建单后订阅被改动（含「生效→暂停→生效」回环）的旧单不可覆盖新状态（返回 `stale` / 标记 `failed`）。
+- 状态机：`pending`（暂停 / 取消待确认）/ `needs_verification`（恢复待强验证）→ `completed` / `cancelled` / `expired` / `failed`，
+  除到期外不允许任意跳转；恢复单不可通过普通确认接口执行；`completed` 不可取消或重复执行。
+- 暂停 / 取消 / 恢复**仅改变订阅状态**，不改变余额、交易流水、银行卡状态、金额、周期或原扣费日期；不取消真实商户合约，
+  也不触发真实扣款。暂停 / 取消后不再提示「即将扣费」；恢复后若原扣费日期已过，仅显示「扣费日期待更新」，不编造日期。
+
+## 四、强验证（交易密码 + 动态验证码，转账、解冻与订阅恢复共用）
+
+红色转账单、解冻单与订阅恢复单（均为 `needs_verification`）必须同时通过**交易密码**与**手机验证器动态验证码（TOTP）**验证，
 再由用户明确点击「验证并确认」，不能通过普通确认接口绕过。
 
 - **凭据保护**：交易密码用随机盐 + scrypt 哈希（`timingSafeEqual` 比对）存储；TOTP 密钥用
@@ -66,9 +80,9 @@
 - **本地绑定**：不提供任意 Web 绑定 / 重置 / 替换接口；由用户本人执行一次性本地交互命令
   `node backend/scripts/bind-verification.js`（隐藏输入 + 双重确认交易密码、随机 TOTP 密钥、
   临时二维码、输入验证码通过后才启用绑定，完成后清理临时明文）。已有绑定拒绝覆盖，无快捷重置。
-- **AI 边界不变**：AI 仍不开放任何「执行转账 / 执行冻结解冻 / 校验密码 / 校验验证码」的模型工具；强验证凭据仅发往专用验证接口。
-- **跨业务共用（转账与解冻）**：解冻复用同一套凭据保护 / TOTP / 防重放 / 失败锁定；转账与解冻共享同一用户的
-  `totp_used_steps` 与 `verification_failures`，已用于转账的时间步不可再用于解冻（反之亦然），
+- **AI 边界不变**：AI 仍不开放任何「执行转账 / 执行冻结解冻 / 执行订阅操作 / 校验密码 / 校验验证码」的模型工具；强验证凭据仅发往专用验证接口。
+- **跨业务共用（转账、解冻与订阅恢复）**：解冻与订阅恢复复用同一套凭据保护 / TOTP / 防重放 / 失败锁定；三者共享同一用户的
+  `totp_used_steps` 与 `verification_failures`，已用于转账的时间步不可再用于解冻或订阅恢复（反之亦然），
   跨业务累计失败同样锁定 15 分钟，不另起第二套独立规则。
 
 ## 五、防重复执行
@@ -90,25 +104,30 @@
 
 ## 七、AI 助手安全边界
 
-- AI 助手工具白名单共 8 个：`get_accounts`、`get_monthly_analytics`、`search_transfer_recipients`、
-  `prepare_transfer`、`get_transfer_status`，以及银行卡相关的 `get_cards`、`prepare_card_operation`、
-  `get_card_operation_status`。其中 `prepare_transfer` / `prepare_card_operation` 只能生成「待确认单」
-  （写入 transfer_operations / card_operations 草稿），**绝不扣款、绝不改卡片状态**；执行必须由用户在界面
-  点击确认（冻结）或强验证（解冻），调用现有确认 / 验证接口执行。
-- **不开放任何扣款 / 执行 / 强验证工具**（如 `confirm_transfer`、`confirm_card_operation`、`verify_card_operation`）；
-  模型请求确认、改余额、改卡片状态、写库等一律被拒。「确认」「我同意」「跳过验证」等聊天文字不会触发扣款或冻结 / 解冻。
-- 转账 / 银行卡工具均不接受模型传入用户身份、风险等级、确认状态或验证状态；收款人、付款账户、目标卡片均由服务端
-  校验归属与状态；**不存在**任何客户端「verified」布尔标记，凭据只能经专用验证接口提交。
+- AI 助手工具白名单共 11 个：`get_accounts`、`get_monthly_analytics`、`search_transfer_recipients`、
+  `prepare_transfer`、`get_transfer_status`，银行卡相关的 `get_cards`、`prepare_card_operation`、
+  `get_card_operation_status`，以及订阅相关的 `get_subscriptions`、`prepare_subscription_operation`、
+  `get_subscription_operation_status`。其中 `prepare_transfer` / `prepare_card_operation` /
+  `prepare_subscription_operation` 只能生成「待确认单」（写入 transfer_operations / card_operations /
+  subscription_operations 草稿），**绝不扣款、绝不改卡片或订阅状态**；执行必须由用户在界面
+  点击确认（冻结 / 暂停 / 取消）或强验证（解冻 / 恢复），调用现有确认 / 验证接口执行。
+- **不开放任何扣款 / 执行 / 强验证工具**（如 `confirm_transfer`、`confirm_card_operation`、`verify_card_operation`、
+  `confirm_subscription_operation`、`verify_subscription_operation`）；模型请求确认、改余额、改卡片 / 订阅状态、写库等
+  一律被拒。「确认」「我同意」「跳过验证」等聊天文字不会触发扣款、冻结 / 解冻或订阅暂停 / 恢复 / 取消。
+- 转账 / 银行卡 / 订阅工具均不接受模型传入用户身份、风险等级、确认状态或验证状态；收款人、付款账户、目标卡片、目标订阅
+  均由服务端校验归属与状态；**不存在**任何客户端「verified」布尔标记，凭据只能经专用验证接口提交。
 - 金额参数 `amount_yuan` 为字符串，服务端用字符串拆分精确转换为整数分（拒绝负数、零、超过两位小数、
   科学计数法、超出安全范围；不采用浮点乘 100）。
-- 单条用户消息最多生成一张转账单 / 一张银行卡操作单；会话维护「当前待确认单」引用，用户修改请求时服务端取消旧单，
-  旧确认卡因此不可再执行。模型重复工具调用不能生成重复操作单（同消息内去重）。
+- 单条用户消息最多生成一张转账单 / 一张银行卡操作单 / 一张订阅操作单；会话维护「当前待确认单」引用，用户修改请求时
+  服务端取消旧单，旧确认卡因此不可再执行。模型重复工具调用不能生成重复操作单（同消息内去重）。
 - 改单 / 改操作单的旧 / 新单状态与文案**由后端确定性生成**（`prepare_transfer` / `prepare_card_operation` 返回
   `previous` 与 `notice`），不依赖模型推断、不靠加强提示词保证正确；模型文字不作为操作成功依据。新单创建失败时如实
   说明「原单未变更」；旧单已完成时 `previous.status='completed'` 且不会被取消。前端旧卡依据信号自动回读数据库状态，
   但**后端仍以状态 / 版本 CAS 拒绝确认已取消的旧单**，不单靠前端禁用按钮。
 - 银行卡多张时列出掩码卡号选项、不擅自选第一张；卡片模糊时先澄清。用户提到「挂失 / 销卡 / 补卡 / 调额」时明确
   说明不支持并询问是否改用「临时冻结」，不替用户决定。
+- 订阅操作同样：多个订阅匹配或指向不明确时先澄清，不擅自选第一项；已取消订阅不可再操作，恢复需强验证，
+  暂停 / 取消为普通确认。用户仅回复「确认」等文字不触发订阅状态变更，须在确认卡上明确操作。
 - 模型不能通过工具写库、传 `user_id`、SQL、文件路径、URL；未知工具 / 额外参数 / 非法参数均被拒。
 
 ## 八、敏感信息与错误处理

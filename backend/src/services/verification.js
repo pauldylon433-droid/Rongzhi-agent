@@ -6,6 +6,7 @@ import { hashPassword, verifyPassword, encryptSecret, decryptSecret } from '../l
 import { base32Decode, verifyTotp } from '../lib/totp.js'
 import { finalizeTransfer, getTransferRow, viewTransfer } from './transfers.js'
 import { finalizeCardOperation, getCardOpRow, viewCardOperation } from './card-operations.js'
+import { finalizeSubscriptionOperation, getSubscriptionOpRow, viewSubscriptionOperation } from './subscription-operations.js'
 
 export const MAX_VERIFY_FAILURES = 5
 export const VERIFY_LOCK_MS = 15 * 60 * 1000 // 连续失败锁定 15 分钟
@@ -230,6 +231,60 @@ export function verifyAndConfirmCardUnfreeze(db, userId, refNo, { password, totp
         `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
          VALUES (?, 'verification', ?, 'verify_success', 'success', ?)`,
       ).run(userId, refNo, JSON.stringify({ step: matchedStep, card_id: row.card_id, action: 'unfreeze' }))
+      resetFailures(db, userId)
+    }
+    return res
+  })
+  const r = run()
+  if (r.outcome === 'code_reused') {
+    throw new VerificationError('该动态验证码已在当前时间窗口内使用过，请等待下一个验证码', 'code_reused')
+  }
+  return r
+}
+
+// 强验证确认恢复订阅：密码 + TOTP 均正确 → 消费时间步 + 更新订阅状态（同一事务）。
+// 与转账 / 解冻强验证复用同一套密码哈希、TOTP、失败锁定与用户级锁定状态；
+// 同一用户「已用于转账 / 解冻的时间步」不可再用于恢复订阅，反之亦然（totp_used_steps 的 UNIQUE(user_id, step)）。
+// 跨业务累计失败同样触发用户级锁定（verification_failures 以 user_id 为键）。
+// 返回 outcome：'completed'（含幂等）、'not_found'、'expired'、'cancelled'、'failed'、'stale'、'already'；
+// 校验类失败抛 VerificationError（not_bound / no_key / decrypt_failed / locked / bad_credentials / code_reused）。
+export function verifyAndConfirmSubscriptionResume(db, userId, refNo, { password, totp }, { encryptionKey, now = new Date() } = {}) {
+  // —— 阶段一：绑定 / 锁定 / 凭据校验（复用同一套用户级失败锁定）——
+  const { matchedStep } = verifyCredentials(db, userId, { password, totp }, { encryptionKey, now })
+  const nowIso = now.toISOString()
+
+  // —— 阶段二：原子消费验证码 + 更新订阅状态 + 审计（同一事务）——
+  const run = db.transaction(() => {
+    const row = getSubscriptionOpRow(db, refNo)
+    if (!row || row.user_id !== userId) return { outcome: 'not_found' }
+
+    if (row.status === 'needs_verification' && nowIso > row.expires_at) {
+      db.prepare("UPDATE subscription_operations SET status = 'expired' WHERE id = ? AND status = 'needs_verification'").run(row.id)
+      return { outcome: 'expired', op: viewSubscriptionOperation(db, { ...row, status: 'expired' }) }
+    }
+    if (row.status !== 'needs_verification') {
+      // 已完成 / 已取消 / 已过期 / 已失效 / 待确认（暂停/取消）的单不可通过验证（重新）执行
+      return { outcome: row.status, op: viewSubscriptionOperation(db, row) }
+    }
+    // 强验证接口仅执行恢复（resume）；暂停 / 取消（pending）单不可走该接口
+    if (row.action !== 'resume') return { outcome: row.status, op: viewSubscriptionOperation(db, row) }
+
+    // 消费该时间步（防重放：跨单、跨业务、并发、重启后均不可复用同一时间步）
+    try {
+      db.prepare('INSERT INTO totp_used_steps (user_id, step, purpose, consumed_at) VALUES (?, ?, ?, ?)')
+        .run(userId, matchedStep, 'resume', nowIso)
+    } catch (e) {
+      if (/UNIQUE/i.test(String(e && e.message))) return { outcome: 'code_reused' }
+      throw e
+    }
+
+    const res = finalizeSubscriptionOperation(db, userId, row, now, 'needs_verification')
+
+    if (res.outcome === 'completed') {
+      db.prepare(
+        `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
+         VALUES (?, 'verification', ?, 'verify_success', 'success', ?)`,
+      ).run(userId, refNo, JSON.stringify({ step: matchedStep, subscription_id: row.subscription_id, action: 'resume' }))
       resetFailures(db, userId)
     }
     return res

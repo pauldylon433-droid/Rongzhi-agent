@@ -951,3 +951,107 @@ Microsoft Authenticator）扫码，验证器名「融智 Agent」、账户为演
 | `npm run build`（前端） | ✅ 通过（62 模块） |
 | 浏览器可视验收（三区域切换 / 空结果 / 手机宽度） | ⚠️ 未做（命令行环境无浏览器，见交付报告） |
 
+---
+
+## 第二十阶段：订阅与代扣管理（暂停 / 恢复 / 取消 + 自然语言入口）
+
+日期：2026-10-22
+
+本轮实现订阅管理操作：暂停（黄色，需点击确认）、取消（黄色，需点击确认）、恢复（红色，需交易密码 + TOTP 强验证），
+并接入自然语言助手。已取消订阅为终态，本轮不重开；订阅操作仅改变订阅状态 `active ↔ paused / → cancelled`，
+不改变余额、交易流水、银行卡状态、金额、周期或原扣费日期，不取消真实商户合约、不触发真实扣款。
+
+### 一、新增 / 修改
+
+#### 后端（backend/）
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `src/db/schema.js` | 修改：`subscriptions.version` 列 + `subscription_operations` 表（含 `action` / `from_status` / `to_status` / `subscription_version` / `risk_level` / `status`）+ 3 索引；`chat_sessions.pending_subscription_op_ref` 列 |
+| `src/db/migrate.js` | 修改：`subscriptions.version` 回填 1 + 新建 `subscription_operations` 表（幂等） |
+| `src/services/subscription-operations.js` | 新建：订阅操作服务（创建 / 查看 / 确认 / 取消、乐观锁版本 CAS、风险判定、状态机校验、审计） |
+| `src/routes/subscription-operations.js` | 新建：订阅操作路由（创建 / 查看 / 确认 / 取消 / 强验证；字段白名单 + 限流 + 状态码映射） |
+| `src/routes/index.js` | 修改：注册 `/subscription-operations` 路由 |
+| `src/services/verification.js` | 修改：新增 `verifyAndConfirmSubscriptionResume`，复用转账 / 解冻同一套强验证（凭据 / TOTP / 防重放 / 失败锁定） |
+| `src/services/assistant.js` | 修改：工具白名单新增 `get_subscriptions` / `prepare_subscription_operation` / `get_subscription_operation_status`；`buildSubscriptionOpNotice`；会话 `pendingSubscriptionOpRef` + 单消息去重 |
+| `scripts/verify-subscription-operations.js` | 新建：独立临时库 84 项断言验证 |
+
+#### 前端（frontend/）
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `src/components/SubscriptionOperationConfirmCard.vue` | 新建：共享订阅操作确认卡（暂停 / 取消确认、恢复强验证、回执，挂载回读最新状态） |
+| `src/components/SubscriptionList.vue` | 修改：订阅分区新增暂停 / 恢复 / 取消辅助入口（与聊天入口共用同一确认卡），保留状态筛选与「扣费日期待更新」文案 |
+| `src/components/AssistantPanel.vue` | 修改：渲染 `get_subscriptions` / `prepare_subscription_operation` / `get_subscription_operation_status` 结果卡 + 改单信号 |
+| `src/composables/useSubscriptionOpSignal.js` | 新建：订阅操作状态变更信号（改单后旧卡自动回读） |
+| `src/api/index.js` | 修改：新增订阅操作接口请求封装 |
+
+#### 文档
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `docs/api.md` | 新增订阅操作接口文档 + AI 工具白名单扩为 11 个 |
+| `docs/database-design.md` | 新增 `subscription_operations` 表、`subscriptions.version`、`chat_sessions.pending_subscription_op_ref`、索引 / 迁移 / 验证说明 |
+| `docs/security-design.md` | 新增订阅状态机 / 版本 CAS / 强验证扩展到订阅恢复 |
+| `docs/development-log.md` | 本日志 |
+
+### 二、实现要点
+
+- **风险与状态机（后端判定）**：暂停 / 取消为黄色（普通确认），恢复为红色（交易密码 + TOTP 强验证）；
+  合法流转 `active → paused`、`paused → active`、`active|paused → cancelled`；`cancelled` 为终态；未知状态一律拒绝。
+- **操作单 + 版本 CAS**：创建（prepare）不改变订阅状态，写入建单时 `subscription_version` 快照；
+  订阅状态更新 `WHERE id=? AND version=?`；建单后订阅被改动（含「生效→暂停→生效」回环）的旧单不可覆盖新状态；
+  变更 + 完成操作 + 审计同事务；重复请求不重复执行。
+- **强验证复用**：恢复复用转账 / 解冻同一套凭据保护 / TOTP / `totp_used_steps` 防重放 / `verification_failures` 失败锁定，
+  跨业务共享，不另起第二套规则；普通确认接口不可绕过红色。
+- **凭据保护**：密码 / 验证码仅经专用验证接口，不进入模型、历史或日志。
+- **AI 边界**：只开放查询 / 准备 / 状态三工具，不开放任何执行 / 强验证工具；多个订阅匹配或指向不明确时先澄清；
+  单条消息最多一张订阅操作单；重复工具调用不重复建单；聊天「确认」文字不触发状态变更。
+- **文案与刷新**：状态文案由服务端真实结果生成（`buildSubscriptionOpNotice`），不靠模型推断；执行后订阅列表与聊天历史
+  操作卡回读最新状态；恢复聊天时重新读取真实订阅状态；保留状态筛选 / Markdown 渲染 / 输入焦点 / 会话持久化。
+- **模拟边界**：暂停 / 取消 / 恢复仅改变订阅状态，不改变余额 / 历史 / 金额 / 周期 / 原扣费日期；暂停 / 取消后不再提示
+  「即将扣费」；恢复后若原扣费日期已过仅显示「扣费日期待更新」，不编造日期。
+
+### 三、验证结果（真实执行）
+
+| 验证项 | 结果 |
+| ---- | ---- |
+| `node scripts/verify-subscription-operations.js` | ✅ 84/84（创建不改状态、归属/状态流转、版本 CAS 含「生效→暂停→生效」、暂停/取消确认与恢复强验证/取消/过期/重复幂等、越权/篡改/未知状态/订阅被删/事务回滚、多订阅澄清/模型重复建单、聊天「确认」不执行、跨业务防重放与失败锁定、HTTP 端到端） |
+| `node scripts/verify-card-operations.js` | ✅ 78/78（无回归） |
+| `node scripts/verify-strong-verification.js` | ✅ 73/73（无回归） |
+| `node scripts/verify-transfers.js` | ✅ 61/61（无回归） |
+| `node scripts/verify-assistant-transfer.js` | ✅ 通过（无回归） |
+| `node scripts/verify-assistant.js` | ✅ 通过（无回归） |
+| `node scripts/verify-chat-persistence.js` | ✅ 35/35（无回归） |
+| `node scripts/verify-migrate.js` / `verify-db.js` | ✅ 通过（无回归） |
+| `npm run build`（前端） | ✅ 通过（65 模块） |
+| 收费模型 | ✅ 未调用（仅本地模拟 + mock 模型） |
+| 开发库业务数据 | ✅ 未修改；未在开发库自动暂停 / 取消 / 恢复订阅 |
+| 浏览器可视验收 | ⚠️ 未做（命令行环境，仅验证构建与接口数据链路） |
+
+### 四、一致性备份
+
+- 结构变更前备份（复用 `backup-db.js`，SQLite `db.backup()` 正确处理 WAL）。
+
+### 五、已知限制
+
+- 已取消订阅为终态，本轮未实现「重新开通 / 恢复」；正式登录认证与多用户隔离仍未实现（单用户演示模式）。
+- 恢复后原扣费日期的「更新」为占位展示（「扣费日期待更新」），不模拟新的扣费计划。
+
+### 六、重启与验收步骤
+
+后端以 `npm run dev`（nodemon）运行会随源码改动自动重启并执行增量迁移；若以 `npm start` 运行则需重启以加载
+新增路由与 `subscriptions.version` / `subscription_operations` 迁移。前端 `npm run dev` 热更新。
+
+验收：
+1. 打开前端 → 「订阅与代扣」分区查看订阅列表与状态筛选；每行提供「暂停 / 取消」（生效）或「恢复 / 取消」（暂停）按钮。
+2. 点「暂停」→ 生成待确认暂停单（订阅状态不变）→ 确认卡点「确认暂停」→ 状态变「暂停」，列表同步刷新；日期文案变为「已暂停，不自动扣费」。
+3. 点「恢复」→ 生成需强验证恢复单 → 输入交易密码 + TOTP 动态码 → 「验证并确认恢复」→ 状态变「生效」；若原扣费日期已过则显示「扣费日期待更新」。
+4. 点「取消」→ 确认卡点「确认取消」→ 状态变「已取消」，该行不再出现操作按钮。
+5. 「AI 助手」输入「暂停爱奇艺会员的自动续费」→ AI 生成暂停操作单并在聊天中展示确认卡（与列表入口共用同一确认卡）；
+   输入「确认」等文字不触发状态变更；多个匹配时先澄清；执行后列表与聊天操作卡回读最新状态。
+
+### 七、全轮实际耗时
+
+（见最终交付报告）
+

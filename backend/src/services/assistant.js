@@ -11,11 +11,15 @@ import { randomUUID } from 'node:crypto'
 import { chatCompletions, AiError } from '../lib/ai-client.js'
 import { listAccounts } from './accounts.js'
 import { listCards } from './cards.js'
+import { listSubscriptions } from './subscriptions.js'
 import { monthlyAnalytics } from './analytics.js'
 import { createTransfer, cancelTransfer, getTransfer, TransferError } from './transfers.js'
 import {
   createCardOperation, cancelCardOperation, getCardOperation, CardOpError,
 } from './card-operations.js'
+import {
+  createSubscriptionOperation, cancelSubscriptionOperation, getSubscriptionOperation, SubscriptionOpError,
+} from './subscription-operations.js'
 import { yuanToCents } from '../lib/money.js'
 import { parseMonth } from '../routes/helpers.js'
 import { SHANGHAI_OFFSET_MS } from '../lib/shanghai.js'
@@ -146,6 +150,47 @@ const TOOL_DEFS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'get_subscriptions',
+      description:
+        '查询当前用户的订阅与代扣列表，返回订阅 id、商户、每期金额（分）、扣费周期、下次扣费日期、状态（active 生效 / paused 暂停 / cancelled 已取消）等。多个匹配时不要自行挑选，应列给用户选择。',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'prepare_subscription_operation',
+      description:
+        '在订阅明确后，为某项订阅创建「订阅操作单」（暂停 pause / 恢复 resume / 取消 cancel），不立即改变订阅状态。返回操作编号、状态、风险等级与订阅信息。暂停 / 取消需用户点击确认；恢复需交易密码 + 动态验证码强验证。已取消（cancelled）的订阅不可再操作。单条用户消息最多调用一次。',
+      parameters: {
+        type: 'object',
+        properties: {
+          subscription_id: { type: 'integer', description: '订阅 id（来自 get_subscriptions 返回的 id）' },
+          action: { type: 'string', description: '操作类型：pause（暂停）/ resume（恢复）/ cancel（取消）' },
+        },
+        required: ['subscription_id', 'action'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_subscription_operation_status',
+      description: '按操作编号查询某张订阅操作单的当前状态（以数据库为准，不沿用创建时的旧状态）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref_no: { type: 'string', description: '订阅操作单操作编号' },
+        },
+        required: ['ref_no'],
+        additionalProperties: false,
+      },
+    },
+  },
 ]
 
 // 工具参数/未知工具错误
@@ -185,7 +230,8 @@ function buildSystemMessage() {
       `7. 「这个月/本月/上个月/上上月」等相对月份，以当前上海日期为准换算为 YYYY-MM；无法确定具体月份时，先向用户澄清，不要随意猜测。\n` +
       `8. 银行卡操作：查询用 get_cards；冻结 / 解冻先用 get_cards 确认卡片（含掩码卡号），卡片明确后调用 prepare_card_operation 生成「银行卡操作单」。你只能生成操作单，不能直接冻结 / 解冻：冻结需用户在界面点击确认，解冻需交易密码 + 动态验证码强验证。多张卡片时列出掩码选项让用户选择，不能擅自选第一张。\n` +
       `9. 用户提到「挂失 / 销卡 / 补卡 / 调额」等正式卡片业务时，明确说明本阶段不支持，并询问是否改用「临时冻结」，不要替用户决定。\n` +
-      `10. 用简体中文回答，简洁准确；金额请标注单位（元）。`,
+      `10. 订阅与代扣：查询用 get_subscriptions；暂停 / 恢复 / 取消先用 get_subscriptions 确认订阅（含商户与状态），订阅明确后调用 prepare_subscription_operation 生成「订阅操作单」。你只能生成操作单，不能直接暂停 / 取消 / 恢复：暂停与取消需用户在界面点击确认，恢复需交易密码 + 动态验证码强验证。已取消（cancelled）的订阅不可再操作。多项订阅时列出选项让用户选择，不能擅自选第一项。查询操作状态用 get_subscription_operation_status，以数据库返回为准。\n` +
+      `11. 用简体中文回答，简洁准确；金额请标注单位（元）。`,
   }
 }
 
@@ -249,6 +295,28 @@ function buildCardOpNotice(previous, newRefNo, action) {
       return `原操作单（${old}）已失效，未取消；已生成新的${actText}操作单（${newT}）。`
     default:
       return `已生成新的${actText}操作单（${newT}）。`
+  }
+}
+
+// 根据旧订阅操作单取消的真实结果与新旧编号，生成确定性状态说明（状态由服务端读取，不由模型推断）。
+function buildSubscriptionOpNotice(previous, newRefNo, action) {
+  const newT = refTail(newRefNo)
+  const actText = { pause: '暂停', resume: '恢复', cancel: '取消' }[action] || action
+  if (!previous) return `已生成${actText}订阅操作单（${newT}），请在界面确认。`
+  const old = refTail(previous.ref_no)
+  switch (previous.status) {
+    case 'cancelled':
+      return `已取消原待确认操作单（${old}），并生成新的${actText}订阅操作单（${newT}）。`
+    case 'completed':
+      return `原操作单（${old}）已完成，未取消；已生成新的${actText}订阅操作单（${newT}）。`
+    case 'expired':
+      return `原操作单（${old}）已过期，未取消；已生成新的${actText}订阅操作单（${newT}）。`
+    case 'needs_verification':
+      return `原操作单（${old}）需要强验证，未取消；已生成新的${actText}订阅操作单（${newT}）。`
+    case 'failed':
+      return `原操作单（${old}）已失效，未取消；已生成新的${actText}订阅操作单（${newT}）。`
+    default:
+      return `已生成新的${actText}订阅操作单（${newT}）。`
   }
 }
 
@@ -437,6 +505,70 @@ function executeTool(db, demoUserId, name, args, ctx) {
     ctx.messageState.prepareCardOpDone = true
     return { ...op, previous, notice: buildCardOpNotice(previous, op.ref_no, op.action) }
   }
+  if (name === 'get_subscriptions') {
+    if (Object.keys(args).length > 0) {
+      throw new ToolError('get_subscriptions 不接受额外参数')
+    }
+    return listSubscriptions(db, demoUserId)
+  }
+  if (name === 'get_subscription_operation_status') {
+    const extra = Object.keys(args).filter((k) => k !== 'ref_no')
+    if (extra.length) throw new ToolError(`get_subscription_operation_status 不接受额外参数：${extra.join('、')}`)
+    const refNo = typeof args.ref_no === 'string' ? args.ref_no.trim() : ''
+    if (!refNo) throw new ToolError('ref_no 参数不能为空')
+    const op = getSubscriptionOperation(db, demoUserId, refNo)
+    if (!op) throw new ToolError('未找到该订阅操作单')
+    return op
+  }
+  if (name === 'prepare_subscription_operation') {
+    if (ctx.messageState.prepareSubscriptionOpDone) {
+      throw new ToolError('本条消息已生成订阅操作单，请先确认或取消后再发起新操作')
+    }
+    const extra = Object.keys(args).filter((k) => !['subscription_id', 'action'].includes(k))
+    if (extra.length) {
+      throw new ToolError(`prepare_subscription_operation 不接受额外参数：${extra.join('、')}`)
+    }
+
+    // 订阅与动作由服务端校验；不接受模型指定风险级别 / 状态 / 用户身份
+    const subscriptionId = args.subscription_id
+    if (typeof subscriptionId !== 'number' || !Number.isSafeInteger(subscriptionId) || subscriptionId <= 0) {
+      throw new ToolError('subscription_id 必须为正整数')
+    }
+    const action = args.action
+    if (action !== 'pause' && action !== 'resume' && action !== 'cancel') {
+      throw new ToolError('action 必须是 pause、resume 或 cancel')
+    }
+    const sub = db.prepare('SELECT id FROM subscriptions WHERE id = ? AND user_id = ?').get(subscriptionId, demoUserId)
+    if (!sub) {
+      throw new ToolError('未找到该订阅，请先用 get_subscriptions 查询本人订阅')
+    }
+
+    let op
+    try {
+      op = createSubscriptionOperation(db, demoUserId, { subscriptionId, action })
+    } catch (e) {
+      if (e instanceof SubscriptionOpError) {
+        // 创建失败：旧待确认操作单未被取消，如实说明两件事（创建失败 + 原操作单未变更）
+        const prevRef = ctx.session.pendingSubscriptionOpRef
+        const prevNote = prevRef ? `；原待确认订阅操作（${refTail(prevRef)}）未变更` : ''
+        throw new ToolError(`订阅操作单创建失败：${e.message}${prevNote}`)
+      }
+      throw e
+    }
+
+    // 修改请求：取消本会话旧的待确认操作单（幂等；已完成/已取消的单不受影响），
+    // 并基于实际结果返回旧单编号与真实状态、新单编号与真实状态（服务端读取，非模型推断）。
+    const prevRef = ctx.session.pendingSubscriptionOpRef
+    let previous = null
+    if (prevRef && prevRef !== op.ref_no) {
+      const cr = cancelSubscriptionOperation(db, demoUserId, prevRef)
+      const prevStatus = cr.op ? cr.op.status : cr.outcome
+      previous = { ref_no: prevRef, status: prevStatus, outcome: cr.outcome, cancelled: prevStatus === 'cancelled' }
+    }
+    ctx.session.pendingSubscriptionOpRef = op.ref_no
+    ctx.messageState.prepareSubscriptionOpDone = true
+    return { ...op, previous, notice: buildSubscriptionOpNotice(previous, op.ref_no, op.action) }
+  }
   throw new ToolError(`未知工具：${name}`)
 }
 
@@ -558,6 +690,7 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
       locked: false,
       pendingTransferRef: row.pending_transfer_ref,
       pendingCardOpRef: row.pending_card_op_ref,
+      pendingSubscriptionOpRef: row.pending_subscription_op_ref,
       createdAt: row.created_at,
       lastActiveAt: row.last_active_at,
     }
@@ -573,6 +706,7 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
       s.messages = []
       s.pendingTransferRef = null
       s.pendingCardOpRef = null
+      s.pendingSubscriptionOpRef = null
       s.lastActiveAt = Date.now()
       return s
     }
@@ -583,6 +717,7 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
     s.messages = []
     s.pendingTransferRef = null
     s.pendingCardOpRef = null
+    s.pendingSubscriptionOpRef = null
     s.lastActiveAt = Date.now()
     return s
   }
@@ -617,12 +752,13 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
     db.transaction(() => {
       db.prepare(
         `INSERT INTO chat_sessions
-           (id, user_id, messages_json, pending_transfer_ref, pending_card_op_ref, created_at, last_active_at)
-         VALUES (@id, @userId, @messagesJson, @pendingTransferRef, @pendingCardOpRef, @createdAt, @lastActiveAt)
+           (id, user_id, messages_json, pending_transfer_ref, pending_card_op_ref, pending_subscription_op_ref, created_at, last_active_at)
+         VALUES (@id, @userId, @messagesJson, @pendingTransferRef, @pendingCardOpRef, @pendingSubscriptionOpRef, @createdAt, @lastActiveAt)
          ON CONFLICT(id) DO UPDATE SET
            messages_json = excluded.messages_json,
            pending_transfer_ref = excluded.pending_transfer_ref,
            pending_card_op_ref = excluded.pending_card_op_ref,
+           pending_subscription_op_ref = excluded.pending_subscription_op_ref,
            last_active_at = excluded.last_active_at`,
       ).run({
         id: session.id,
@@ -630,6 +766,7 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
         messagesJson: JSON.stringify(session.messages),
         pendingTransferRef: session.pendingTransferRef,
         pendingCardOpRef: session.pendingCardOpRef,
+        pendingSubscriptionOpRef: session.pendingSubscriptionOpRef,
         createdAt: session.createdAt,
         lastActiveAt: now,
       })
@@ -691,6 +828,7 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
         locked: false,
         pendingTransferRef: null, // 本会话当前待确认转账单编号（用于修改时取消旧单）
         pendingCardOpRef: null, // 本会话当前待确认银行卡操作单编号（用于修改时取消旧单）
+        pendingSubscriptionOpRef: null, // 本会话当前待确认订阅操作单编号（用于修改时取消旧单）
         createdAt: Date.now(),
         lastActiveAt: Date.now(),
       }
@@ -707,7 +845,7 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, sess
       const history = trimHistory(session.messages)
       const messages = [buildSystemMessage(), ...history, { role: 'user', content: trimmed }]
 
-      const messageState = { prepareTransferDone: false, prepareCardOpDone: false }
+      const messageState = { prepareTransferDone: false, prepareCardOpDone: false, prepareSubscriptionOpDone: false }
       const { finalReply, toolRecords, incomplete, usage } = await runLoop(
         messages, db, demoUserId, chatFn, { session, messageState },
       )

@@ -5,8 +5,10 @@ import { formatMoney, formatCentsToYuan, formatShanghaiDateTime } from '../utils
 import { useDataRefresh } from '../composables/useDataRefresh.js'
 import { useTransferSignal } from '../composables/useTransferSignal.js'
 import { useCardOpSignal } from '../composables/useCardOpSignal.js'
+import { useSubscriptionOpSignal } from '../composables/useSubscriptionOpSignal.js'
 import TransferConfirmCard from './TransferConfirmCard.vue'
 import CardOperationConfirmCard from './CardOperationConfirmCard.vue'
+import SubscriptionOperationConfirmCard from './SubscriptionOperationConfirmCard.vue'
 import MarkdownContent from './MarkdownContent.vue'
 
 const examples = [
@@ -18,6 +20,7 @@ const examples = [
 const { refresh } = useDataRefresh()
 const { notifyChange } = useTransferSignal()
 const { notifyChange: notifyCardOpChange } = useCardOpSignal()
+const { notifyChange: notifySubscriptionOpChange } = useSubscriptionOpSignal()
 
 const opStatusText = {
   pending: '待确认',
@@ -34,11 +37,26 @@ const cardStatusText = { active: '正常', frozen: '冻结', cancelled: '已注�
 function cardStatus(s) {
   return cardStatusText[s] || s
 }
+const subStatusText = { active: '生效', paused: '暂停', cancelled: '已取消' }
+function subStatus(s) {
+  return subStatusText[s] || s
+}
+const subCycleText = { monthly: '按月', yearly: '按年' }
+function subCycle(c) {
+  return subCycleText[c] || c || '—'
+}
+const subActionText = { pause: '暂停', resume: '恢复', cancel: '取消' }
+function subAction(a) {
+  return subActionText[a] || a
+}
 function onTransferConfirmed() {
   refresh() // 确认后刷新账户 / 流水 / 月度统计
 }
 function onCardOpConfirmed() {
   refresh() // 冻结 / 解冻后刷新卡片列表等
+}
+function onSubscriptionOpConfirmed() {
+  refresh() // 暂停 / 恢复 / 取消后刷新订阅列表等
 }
 
 const messages = ref([])
@@ -140,6 +158,9 @@ async function send(text) {
       if (rec.name === 'prepare_card_operation' && rec.data && rec.data.previous && rec.data.previous.ref_no) {
         notifyCardOpChange(rec.data.previous.ref_no)
       }
+      if (rec.name === 'prepare_subscription_operation' && rec.data && rec.data.previous && rec.data.previous.ref_no) {
+        notifySubscriptionOpChange(rec.data.previous.ref_no)
+      }
     }
   } catch (e) {
     messages.value.push({
@@ -219,7 +240,7 @@ onMounted(loadCurrent)
       </p>
 
       <p v-if="!loading && !loadError && messages.length === 0" class="chat-empty">
-        我是融智 AI 助手，可以查询账户余额、账单统计、银行卡，也能帮你生成待确认转账单或银行卡冻结 / 解冻操作单。例如「我有哪些银行卡？」。
+        我是融智 AI 助手，可以查询账户余额、账单统计、银行卡与订阅代扣，也能帮你生成待确认转账单、银行卡冻结 / 解冻操作单或订阅暂停 / 恢复 / 取消操作单。例如「我有哪些订阅？」。
       </p>
 
       <div v-for="m in messages" :key="m.id" class="chat-row" :class="m.role">
@@ -327,6 +348,33 @@ onMounted(loadCurrent)
                     <span v-if="rec.data.masked_card_number" class="rc-note">{{ rec.data.masked_card_number }}（{{ rec.data.action === 'freeze' ? '冻结' : '解冻' }}）</span>
                   </div>
                 </template>
+
+                <template v-else-if="rec.name === 'get_subscriptions'">
+                  <div class="result-card subs">
+                    <span class="rc-label">我的订阅与代扣</span>
+                    <div v-if="rec.data && rec.data.length" class="rc-subs">
+                      <div v-for="s in rec.data" :key="s.id" class="rc-sub-row">
+                        <span>{{ s.merchant }}</span>
+                        <span class="rc-sub-meta">{{ formatCentsToYuan(s.amount_cents) }} 元 / {{ subCycle(s.billing_cycle) }}</span>
+                        <span class="rc-sub-status">{{ subStatus(s.status) }}</span>
+                      </div>
+                    </div>
+                    <span v-else class="rc-none">暂无订阅</span>
+                  </div>
+                </template>
+
+                <template v-else-if="rec.name === 'prepare_subscription_operation'">
+                  <p v-if="rec.data && rec.data.notice" class="transfer-notice">{{ rec.data.notice }}</p>
+                  <SubscriptionOperationConfirmCard :op="rec.data" @confirmed="onSubscriptionOpConfirmed" />
+                </template>
+
+                <template v-else-if="rec.name === 'get_subscription_operation_status'">
+                  <div class="result-card status">
+                    <span class="rc-label">订阅操作单 · {{ rec.data.ref_no }}</span>
+                    <span class="rc-value">{{ statusText(rec.data.status) }}</span>
+                    <span v-if="rec.data.merchant" class="rc-note">{{ rec.data.merchant }}（{{ subAction(rec.data.action) }}）</span>
+                  </div>
+                </template>
               </div>
 
               <!-- 工具执行记录（由后端生成） -->
@@ -369,7 +417,7 @@ onMounted(loadCurrent)
       <button v-for="q in examples" :key="q" class="chip" :disabled="sending" @click="send(q)">{{ q }}</button>
     </div>
 
-    <p class="chat-disclaimer">AI 助手可查询账户 / 账单 / 银行卡，并可生成待确认转账单与银行卡冻结 / 解冻操作单，但不执行扣款或直接改变卡片状态；冻结 / 解冻需你在确认卡上确认或强验证。数据均为模拟，仅供演示。</p>
+    <p class="chat-disclaimer">AI 助手可查询账户 / 账单 / 银行卡 / 订阅代扣，并可生成待确认转账单、银行卡冻结 / 解冻操作单与订阅暂停 / 恢复 / 取消操作单，但不执行扣款或直接改变任何状态；暂停 / 取消需你在确认卡上确认，解冻 / 恢复需交易密码 + 动态验证码强验证。数据均为模拟，仅供演示。</p>
   </section>
 </template>
 
@@ -480,7 +528,8 @@ onMounted(loadCurrent)
 }
 .result-card.monthly,
 .result-card.recipients,
-.result-card.status {
+.result-card.status,
+.result-card.subs {
   flex-direction: column;
   align-items: stretch;
 }
@@ -519,6 +568,26 @@ onMounted(loadCurrent)
 }
 .rc-card-status {
   color: var(--muted);
+}
+.rc-subs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.rc-sub-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.rc-sub-meta {
+  color: var(--muted);
+}
+.rc-sub-status {
+  color: var(--muted);
+  flex-shrink: 0;
 }
 .transfer-notice {
   margin: 0 0 8px;

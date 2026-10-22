@@ -1,6 +1,6 @@
 # API 接口文档
 
-融智 Agent 后端接口（只读查询 + 模拟转账 + 银行卡冻结/解冻）。当前为**单用户演示模式**：服务端固定演示用户「张三」
+融智 Agent 后端接口（只读查询 + 模拟转账 + 银行卡冻结/解冻 + 订阅暂停/恢复/取消）。当前为**单用户演示模式**：服务端固定演示用户「张三」
 （用户 id 由服务端解析），所有查询均按该用户限制数据范围，不接受客户端通过 `user_id` 切换用户。
 该模式尚未实现正式登录认证。
 
@@ -264,6 +264,9 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | get_cards | 无 | 查询本人银行卡列表（复用 `listCards`，含掩码卡号 / 卡类型 / 状态 / 日限额） |
 | prepare_card_operation | `card_id`、`action`（freeze/unfreeze） | 调用银行卡操作服务生成「银行卡操作单」（不改状态）；冻结需点击确认、解冻需强验证 |
 | get_card_operation_status | `ref_no`（字符串） | 按操作编号查询银行卡操作单当前状态（以数据库为准） |
+| get_subscriptions | 无 | 查询本人订阅与代扣列表（复用 `listSubscriptions`，含商户 / 金额 / 周期 / 下次扣费日期 / 状态） |
+| prepare_subscription_operation | `subscription_id`、`action`（pause/resume/cancel） | 调用订阅操作服务生成「订阅操作单」（不改状态）；暂停/取消需点击确认、恢复需强验证 |
+| get_subscription_operation_status | `ref_no`（字符串） | 按操作编号查询订阅操作单当前状态（以数据库为准） |
 
 - 转账流程：先用 `search_transfer_recipients` 确认收款人；信息齐全且收款人明确后调用 `prepare_transfer` 生成草稿。
   金额参数用 `amount_yuan` 字符串（如 `"100.00"`），服务端用字符串拆分精确转换为整数分（拒绝负数、零、
@@ -285,7 +288,12 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
   用户提到「挂失 / 销卡 / 补卡 / 调额」时明确说明不支持，询问是否改用「临时冻结」，不替用户决定。
 - **不开放任何执行 / 强验证工具**（如 `confirm_card_operation`、`verify_card_operation`）；聊天文字
   「确认」「我同意」不会冻结 / 解冻，只能提醒用户在界面确认卡上操作。
-- 未开放改余额、挂失、销卡、补卡、调额、取消订阅等写操作。未知工具、额外参数、非法 JSON、非法参数均被拒绝；
+- 订阅与代扣：查询用 `get_subscriptions`；暂停 / 恢复 / 取消用 `prepare_subscription_operation`（只生成操作单，不改状态）。
+  多项订阅时列出商户选项，不擅自选第一项；订阅模糊时先澄清。`prepare_subscription_operation` 的 `data` 含
+  `notice` 与 `previous`（服务端读真实状态，语义同转账改单）。已取消（cancelled）的订阅不可再操作。
+  **不开放任何执行 / 强验证工具**（如 `confirm_subscription_operation`、`verify_subscription_operation`）；
+  聊天文字「确认」不会暂停 / 取消 / 恢复，只能提醒用户在界面确认卡上操作。
+- 未开放改余额、挂失、销卡、补卡、调额等写操作。未知工具、额外参数、非法 JSON、非法参数均被拒绝；
   模型不得传 `user_id`、SQL、文件路径或 URL。相对月份（「这个月 / 上个月」）由服务端按当前上海日期换算。
 
 #### 错误码
@@ -457,6 +465,60 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 
 冻结：`pending` → `completed`（确认）/ `cancelled` / `expired` / `failed`（版本变化或状态已变）；
 解冻：`needs_verification` → `completed`（强验证）/ `cancelled` / `expired` / `failed`。除到期外不允许任意跳转。
+
+### 订阅操作接口
+
+订阅查询（只读）复用 `GET /api/subscriptions`。暂停 / 取消 / 恢复走「操作单」流程：创建操作单**不改变订阅状态**，
+用户在界面明确点击确认（暂停 / 取消）或交易密码 + 动态验证码强验证（恢复）后才执行。明确标注「模拟银行环境」，
+仅改变订阅状态 `active ↔ paused / cancelled`，不改变余额、历史流水、金额、周期或原扣费日期，不代表取消真实商户合同、不实际发起扣费。
+
+| 方法 | 路径 | 说明 |
+| ---- | ---- | ---- |
+| POST | `/api/subscription-operations` | 创建订阅操作单（不改变订阅状态） |
+| GET | `/api/subscription-operations/:refNo` | 查看操作单详情（含当前订阅状态） |
+| POST | `/api/subscription-operations/:refNo/confirm` | 确认并执行暂停 / 取消（需 `{ "confirm": true }`） |
+| POST | `/api/subscription-operations/:refNo/cancel` | 取消操作单（不改变订阅状态） |
+| POST | `/api/subscription-operations/:refNo/verify` | 强验证确认恢复（交易密码 + 动态验证码） |
+
+#### 创建订阅操作单
+
+请求体（仅允许以下字段，多余字段返回 400）：
+
+```json
+{ "subscription_id": 1, "action": "pause" }
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| subscription_id | integer | 是 | 订阅 id（来自 `GET /api/subscriptions`） |
+| action | string | 是 | `pause`（暂停）/ `resume`（恢复）/ `cancel`（取消） |
+
+- 暂停：仅 `active → paused`，风险等级 `yellow`、状态 `pending`（待确认）；
+- 取消：`active` 或 `paused → cancelled`，风险等级 `yellow`、状态 `pending`（待确认）；
+- 恢复：仅 `paused → active`，风险等级 `red`、状态 `needs_verification`（需强验证）；
+- 已取消（cancelled）订阅为终态，本轮不支持重新开通；已处于目标状态、未知状态一律拒绝（如实返回 400，不伪造成功）；
+- 服务端校验订阅归属与合法状态转换；风险级别由后端判定，客户端不能指定；创建不改变订阅状态，写入建单时订阅版本快照 `subscription_version`。
+
+#### 确认暂停 / 取消
+
+- 确认仅接受 `{ "confirm": true }`；从数据库重新读取订阅状态与版本，建单后订阅被改动
+  （含「生效→暂停→生效」回环）的旧单不可执行（返回 409 `stale` / `failed`），不覆盖新状态；重复确认幂等返回原回执。
+- 恢复单（`needs_verification`）不可通过普通确认接口执行（返回 409）。
+- 取消不改变订阅状态；已完成 / 已失效的单不可取消。
+
+#### 强验证恢复（红色单）
+
+请求体仅允许 `{ "password": "...", "totp": "..." }`；多余字段（如 `user_id`、`risk_level`、`verified`）返回 400。
+
+- 仅限恢复单（`needs_verification`）；交易密码 + TOTP 均正确后在**同一事务**内「消费时间步 + 更新订阅状态 + 审计」。
+- 防重放与失败锁定复用转账强验证的同一套：`totp_used_steps` 的 `UNIQUE(user_id, step)` 保证
+  「已用于转账 / 解冻的时间步不可再用于恢复，反之亦然」；`verification_failures` 以 `user_id` 为键，跨业务累计失败同样锁定 15 分钟。
+- 未绑定 / 缺密钥 / 解密失败 / 已锁定时恢复保持阻断。
+
+#### 状态流转
+
+暂停 / 取消：`pending` → `completed`（确认）/ `cancelled` / `expired` / `failed`（版本变化或状态已变）；
+恢复：`needs_verification` → `completed`（强验证）/ `cancelled` / `expired` / `failed`。除到期外不允许任意跳转。
 
 ## 错误处理
 

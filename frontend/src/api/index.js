@@ -180,3 +180,31 @@ export async function verifyCardOperation(refNo, { password, totp }) {
   const body = await postJson(`/api/card-operations/${refNo}/verify`, { password, totp })
   return body.data
 }
+
+// —— 订阅与代扣操作（查询 + 暂停 / 恢复 / 取消）——
+
+export async function createSubscriptionOperation({ subscription_id, action }) {
+  const body = await postJson('/api/subscription-operations', { subscription_id, action })
+  return body.data
+}
+
+export async function fetchSubscriptionOperation(refNo) {
+  const body = await request(`/api/subscription-operations/${refNo}`)
+  return body.data
+}
+
+export async function confirmSubscriptionOperation(refNo) {
+  const body = await postJson(`/api/subscription-operations/${refNo}/confirm`, { confirm: true })
+  return body.data
+}
+
+export async function cancelSubscriptionOperation(refNo) {
+  const body = await postJson(`/api/subscription-operations/${refNo}/cancel`, { cancel: true })
+  return body.data
+}
+
+// 强验证确认恢复（交易密码 + 动态验证码；凭据仅发往专用验证接口，不进入 AI 请求 / 聊天历史 / 本地存储）
+export async function verifySubscriptionOperation(refNo, { password, totp }) {
+  const body = await postJson(`/api/subscription-operations/${refNo}/verify`, { password, totp })
+  return body.data
+}

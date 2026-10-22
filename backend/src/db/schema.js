@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   billing_cycle     TEXT NOT NULL CHECK (billing_cycle IN ('monthly', 'yearly')),
   next_billing_date TEXT,
   status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'cancelled')),
+  version           INTEGER NOT NULL DEFAULT 1,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (user_id) REFERENCES users(id),
   FOREIGN KEY (account_id) REFERENCES accounts(id)
@@ -148,6 +149,33 @@ CREATE INDEX IF NOT EXISTS idx_card_operations_user_id ON card_operations(user_i
 CREATE INDEX IF NOT EXISTS idx_card_operations_status  ON card_operations(status);
 CREATE INDEX IF NOT EXISTS idx_card_operations_card_id ON card_operations(card_id);
 
+-- 订阅与代扣操作单：查询 / 暂停·取消（yellow，点击确认）/ 恢复（red，交易密码 + TOTP 强验证）。
+-- 保存订阅归属、动作、预期状态与建单时的订阅版本快照，确认时重新校验订阅状态与版本。
+CREATE TABLE IF NOT EXISTS subscription_operations (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref_no                TEXT NOT NULL UNIQUE,
+  user_id               INTEGER NOT NULL,
+  subscription_id       INTEGER NOT NULL,
+  merchant              TEXT NOT NULL,
+  amount_cents          INTEGER NOT NULL,
+  billing_cycle         TEXT NOT NULL,
+  action                TEXT NOT NULL CHECK (action IN ('pause', 'resume', 'cancel')),
+  from_status           TEXT NOT NULL,
+  to_status             TEXT NOT NULL,
+  subscription_version  INTEGER NOT NULL,
+  risk_level            TEXT NOT NULL CHECK (risk_level IN ('yellow', 'red')),
+  status                TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','needs_verification','completed','cancelled','expired','failed')),
+  created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at            TEXT NOT NULL,
+  confirmed_at          TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (subscription_id) REFERENCES subscriptions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscription_operations_user_id         ON subscription_operations(user_id);
+CREATE INDEX IF NOT EXISTS idx_subscription_operations_status          ON subscription_operations(status);
+CREATE INDEX IF NOT EXISTS idx_subscription_operations_subscription_id ON subscription_operations(subscription_id);
+
 -- 强验证：验证器绑定（交易密码哈希 + TOTP 密钥密文）
 CREATE TABLE IF NOT EXISTS verification_bindings (
   user_id          INTEGER PRIMARY KEY,
@@ -190,6 +218,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
   messages_json       TEXT NOT NULL DEFAULT '[]', -- 模型上下文（不含 system）
   pending_transfer_ref TEXT,                      -- 本会话当前待确认转账单编号（改单时取消旧单）
   pending_card_op_ref TEXT,                       -- 本会话当前待确认银行卡操作单编号
+  pending_subscription_op_ref TEXT,               -- 本会话当前待确认订阅操作单编号
   created_at          INTEGER NOT NULL,           -- 创建时间（epoch 毫秒）
   last_active_at      INTEGER NOT NULL,           -- 最近活跃时间（epoch 毫秒，用于 TTL）
   FOREIGN KEY (user_id) REFERENCES users(id)

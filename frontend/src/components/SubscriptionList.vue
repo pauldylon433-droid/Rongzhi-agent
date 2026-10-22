@@ -1,12 +1,25 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
-import { fetchSubscriptions } from '../api/index.js'
+import { ref, computed, onMounted, watch } from 'vue'
+import { fetchSubscriptions, createSubscriptionOperation } from '../api/index.js'
 import { useAsyncData } from '../composables/useAsyncData.js'
+import { useDataRefresh } from '../composables/useDataRefresh.js'
 import { formatCentsToYuan, formatShanghaiDate } from '../utils/format.js'
 import SectionState from './SectionState.vue'
+import SubscriptionOperationConfirmCard from './SubscriptionOperationConfirmCard.vue'
 
 const { data, loading, error, load } = useAsyncData(fetchSubscriptions)
+const { version } = useDataRefresh()
+
+const op = ref(null) // 当前订阅操作单初始视图（确认卡组件内部回读最新状态）
+const creating = ref(false)
+const opError = ref('')
+
 onMounted(load)
+
+// 任何一处完成暂停 / 恢复 / 取消后，订阅列表自动回读最新状态（保持当前筛选不变）
+watch(version, () => {
+  load()
+})
 
 const statusText = { active: '生效', paused: '暂停', cancelled: '已取消' }
 const cycleText = { monthly: '按月', yearly: '按年' }
@@ -34,9 +47,48 @@ const filteredSubs = computed(() => {
   return subStatusFilter.value === '' ? list : list.filter((s) => s.status === subStatusFilter.value)
 })
 
+// 当前上海日期（YYYY-MM-DD，用于判断原扣费日期是否已过）
+function shanghaiTodayStr() {
+  const d = new Date(Date.now() + 8 * 60 * 60 * 1000)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`
+}
+
+// 扣费日期文案：不编造日期；暂停 / 取消不提示「即将扣费」；生效但原扣费日期已过 → 待更新。
+function dateText(s) {
+  if (s.status === 'cancelled') return '已取消，不再扣费'
+  if (s.status === 'paused') return '已暂停，不自动扣费'
+  const d = s.next_billing_date ? formatShanghaiDate(s.next_billing_date) : ''
+  if (!d || d < shanghaiTodayStr()) return '扣费日期待更新'
+  return `下次扣费 ${d}`
+}
+
 const isEmptyAll = computed(() => !loading.value && !error.value && !(data.value && data.value.length))
 const isEmptyFilter = computed(() => !loading.value && !error.value && !isEmptyAll.value && filteredSubs.value.length === 0)
 const emptyText = computed(() => (isEmptyFilter.value ? '该状态下暂无订阅' : '暂无订阅'))
+
+async function onAction(sub, action) {
+  opError.value = ''
+  creating.value = true
+  try {
+    op.value = await createSubscriptionOperation({ subscription_id: sub.id, action })
+  } catch (e) {
+    opError.value = e && e.message ? e.message : '生成操作单失败'
+  } finally {
+    creating.value = false
+  }
+}
+
+function onDone() {
+  op.value = null
+  opError.value = ''
+  load() // 立即回读订阅列表，展示最新状态
+}
+
+function dismiss() {
+  op.value = null
+  opError.value = ''
+}
 </script>
 
 <template>
@@ -68,15 +120,43 @@ const emptyText = computed(() => (isEmptyFilter.value ? '该状态下暂无订�
           </span>
         </div>
         <div class="sub-side">
-          <span class="sub-date">
-            {{ s.status === 'cancelled' ? '已取消，不再扣费' : `下次扣费 ${formatShanghaiDate(s.next_billing_date)}` }}
-          </span>
+          <span class="sub-date">{{ dateText(s) }}</span>
           <span class="status-badge" :class="statusTone(s.status)">
             {{ statusText[s.status] || '未知状态' }}
           </span>
+          <div v-if="s.status !== 'cancelled'" class="sub-actions">
+            <button
+              v-if="s.status === 'active'"
+              class="sub-btn"
+              :disabled="creating"
+              @click="onAction(s, 'pause')"
+            >
+              暂停
+            </button>
+            <button
+              v-else-if="s.status === 'paused'"
+              class="sub-btn sub-btn-warn"
+              :disabled="creating"
+              @click="onAction(s, 'resume')"
+            >
+              恢复
+            </button>
+            <button
+              class="sub-btn sub-btn-ghost"
+              :disabled="creating"
+              @click="onAction(s, 'cancel')"
+            >
+              取消
+            </button>
+          </div>
         </div>
       </li>
     </ul>
+
+    <!-- 共享确认卡（确认 / 强验证规则与聊天入口一致） -->
+    <p v-if="opError" class="op-error">{{ opError }}</p>
+    <SubscriptionOperationConfirmCard v-if="op" :op="op" @confirmed="onDone" @cancelled="onDone" />
+    <button v-if="op" class="btn-ghost dismiss-btn" @click="dismiss">关闭</button>
   </section>
 </template>
 
@@ -141,6 +221,48 @@ const emptyText = computed(() => (isEmptyFilter.value ? '该状态下暂无订�
 .sub-date {
   font-size: 12px;
   color: var(--muted);
+}
+.sub-actions {
+  display: flex;
+  gap: 8px;
+}
+.sub-btn {
+  border: 1px solid var(--blue);
+  background: #fff;
+  color: var(--blue);
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.sub-btn:hover:not(:disabled) {
+  background: var(--blue-light);
+}
+.sub-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.sub-btn-warn {
+  border-color: #b45309;
+  color: #b45309;
+}
+.sub-btn-warn:hover:not(:disabled) {
+  background: #fef3c7;
+}
+.sub-btn-ghost {
+  border-color: #b91c1c;
+  color: #b91c1c;
+}
+.sub-btn-ghost:hover:not(:disabled) {
+  background: #fee2e2;
+}
+.op-error {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #b91c1c;
+}
+.dismiss-btn {
+  margin-top: 12px;
 }
 
 @media (max-width: 640px) {

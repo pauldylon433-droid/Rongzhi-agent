@@ -17,6 +17,10 @@ function hasColumn(db, table, column) {
   return rows.some((r) => r.name === column)
 }
 
+function hasTable(db, table) {
+  return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?`).get(table)
+}
+
 export function migrate(db) {
   db.transaction(() => {
     // 账户：开户日期（缺失时回填演示业务日期）
@@ -34,6 +38,16 @@ export function migrate(db) {
     // 银行卡：状态版本（乐观锁，冻结/解冻确认时校验建单后卡片是否被改动；旧库回填为 1）
     if (!hasColumn(db, 'cards', 'version')) {
       db.exec('ALTER TABLE cards ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+    }
+
+    // 订阅：状态版本（乐观锁，暂停/取消/恢复确认时校验建单后订阅是否被改动；旧库回填为 1）
+    if (hasTable(db, 'subscriptions') && !hasColumn(db, 'subscriptions', 'version')) {
+      db.exec('ALTER TABLE subscriptions ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+    }
+
+    // 订阅操作单：AI 助手会话「当前待确认订阅操作单」引用（旧库补列）
+    if (hasTable(db, 'chat_sessions') && !hasColumn(db, 'chat_sessions', 'pending_subscription_op_ref')) {
+      db.exec('ALTER TABLE chat_sessions ADD COLUMN pending_subscription_op_ref TEXT')
     }
 
     // 模拟转账：交易流水与转账单的关联字段（可空；非转账流水为 NULL）
