@@ -348,7 +348,8 @@ CREATE TABLE IF NOT EXISTS statements (
 
 CREATE INDEX IF NOT EXISTS idx_statements_credit_account_id ON statements(credit_account_id);
 
--- 还款冲抵明细：每笔还款只冲抵一个账单，repayment_ref 唯一，从数据库层防重复冲抵。
+-- 还款冲抵明细：一笔还款可冲抵多个账单（全部结清模式），因此 repayment_ref 不再唯一；
+-- 同一操作单对同一账单最多一条（由 repayment_allocations 的唯一约束与写入逻辑保证）。
 CREATE TABLE IF NOT EXISTS statement_payments (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id       INTEGER NOT NULL,
@@ -361,7 +362,22 @@ CREATE TABLE IF NOT EXISTS statement_payments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_statement_payments_statement_id ON statement_payments(statement_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_statement_payments_repayment_ref ON statement_payments(repayment_ref);
+CREATE INDEX IF NOT EXISTS idx_statement_payments_repayment_ref ON statement_payments(repayment_ref);
+
+-- 还款操作单的冲抵分配快照：建单时冻结「每个账单冲抵多少 + 当时的账单版本」，
+-- 确认时逐条复核（未出账账单可提前还款；出账后 paid_cents 保留，不重复计债）。
+CREATE TABLE IF NOT EXISTS repayment_allocations (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref_no            TEXT NOT NULL,                                -- 对应 repayment_operations.ref_no
+  statement_id      INTEGER NOT NULL,
+  amount_cents      INTEGER NOT NULL CHECK (amount_cents > 0),
+  statement_version INTEGER NOT NULL,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (statement_id) REFERENCES statements(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repayment_allocations_ref ON repayment_allocations(ref_no);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_repayment_allocations_ref_statement ON repayment_allocations(ref_no, statement_id);
 
 -- 信用卡还款操作单：全额还款（指定账单剩余应还），恒为红色强验证（交易密码 + TOTP），复用现有安全机制。
 -- 建单快照 statement_version + amount_cents，确认时重新核验账单版本与剩余应还，再原子扣款 + 冲抵 + 审计。
@@ -370,14 +386,15 @@ CREATE TABLE IF NOT EXISTS repayment_operations (
   ref_no              TEXT NOT NULL UNIQUE,
   user_id             INTEGER NOT NULL,
   session_id          TEXT,                                       -- 发起该还款单的助手会话（可空，仅溯源；独立页面建单为 NULL）
+  scope               TEXT NOT NULL DEFAULT 'statement' CHECK (scope IN ('statement', 'all_posted')),
   from_account_id     INTEGER NOT NULL,                           -- 还款账户（活期）
   from_account_name   TEXT NOT NULL,
   credit_account_id   INTEGER NOT NULL,                           -- 信用账户
   credit_account_name TEXT NOT NULL,
-  statement_id        INTEGER NOT NULL,                           -- 目标账单
+  statement_id        INTEGER NOT NULL,                           -- 主账单（指定账单模式=该账单；全部结清=首个分配账单）
   statement_month     TEXT NOT NULL,                              -- 账单期标签（YYYY-MM）
-  amount_cents        INTEGER NOT NULL CHECK (amount_cents > 0),  -- 全额 = 建单时该账单剩余应还
-  statement_version   INTEGER NOT NULL,                           -- 建单时账单版本快照
+  amount_cents        INTEGER NOT NULL CHECK (amount_cents > 0),  -- 本次还款合计（服务端计算）
+  statement_version   INTEGER NOT NULL,                           -- 主账单版本快照（全部结清以分配表逐条复核）
   risk_level          TEXT NOT NULL CHECK (risk_level IN ('red')),
   status              TEXT NOT NULL DEFAULT 'needs_verification' CHECK (status IN ('needs_verification','completed','cancelled','expired','failed')),
   created_at          TEXT NOT NULL DEFAULT (datetime('now')),

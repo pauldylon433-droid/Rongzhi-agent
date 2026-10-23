@@ -62,6 +62,8 @@ rongzhi-agent/
   不含任何执行 / 校验密码 / 校验验证码工具；回答经 markdown-it + DOMPurify 渲染。
 - **跨场景任务**：唯一一条链「分析某月支出 → 列出生效订阅 → 用户选择一项 → 生成暂停单 → 界面确认 → 核验 → 回执」，
   由服务端白名单节点图驱动，不执行模型生成的任意代码 / SQL / URL。
+- **信用卡还款**：支持「指定已出账账单全额」与「结清全部已入账欠款」（含未出账已入账消费，待入账占用不计入）；
+  金额由服务端计算，提前还款保留冲抵明细，出账后不重复计债；均需交易密码 + TOTP 强验证。
 - **强验证**：交易密码（scrypt）+ 手机验证器 TOTP（RFC 6238，AES-256-GCM 加密存储），跨业务防重放、失败锁定（5 次锁 15 分钟）。
 - **聊天持久化**：会话与消息落库，刷新 / 后端重启后可经只读接口恢复。
 
@@ -206,6 +208,7 @@ node scripts/verify-chat-persistence.js
 node scripts/verify-subscription-operations.js
 node scripts/verify-agent-tasks.js
 node scripts/verify-credit-repayment.js
+node scripts/verify-repayment-all-posted.js
 node scripts/verify-credit-routes.js
 node scripts/verify-assistant-repayment.js
 node scripts/verify-activity.js

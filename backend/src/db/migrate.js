@@ -104,6 +104,23 @@ export function migrate(db) {
       db.exec('ALTER TABLE chat_sessions ADD COLUMN pending_repayment_ref TEXT')
     }
 
+    // —— 还款操作单：还款模式（statement=指定账单全额 / all_posted=结清全部已入账欠款）——
+    if (hasTable(db, 'repayment_operations') && !hasColumn(db, 'repayment_operations', 'scope')) {
+      db.exec("ALTER TABLE repayment_operations ADD COLUMN scope TEXT NOT NULL DEFAULT 'statement'")
+    }
+
+    // —— 还款冲抵明细：允许一笔还款冲抵多张账单（先还已出账，再还未出账已入账）——
+    // 旧库的 repayment_ref 唯一索引改为普通索引；幂等（已是普通索引则跳过）。
+    if (hasTable(db, 'statement_payments')) {
+      const idx = db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_statement_payments_repayment_ref'")
+        .get()
+      if (idx && /UNIQUE/i.test(idx.sql || '')) {
+        db.exec('DROP INDEX idx_statement_payments_repayment_ref')
+        db.exec('CREATE INDEX idx_statement_payments_repayment_ref ON statement_payments(repayment_ref)')
+      }
+    }
+
     // 虚构收款人参考数据（仅当为空时写入，幂等）
     const rcCount = db.prepare('SELECT COUNT(*) AS c FROM transfer_recipients').get().c
     if (rcCount === 0) {

@@ -30,17 +30,28 @@ const verifyLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 10 })
 export function createRepaymentsRouter(db, demoUserId) {
   const router = Router()
 
-  // 创建还款操作单（还款准备：指定已出账账单 + 付款活期账户；不扣款、不冲抵）
+  // 创建还款操作单（还款准备，不扣款、不冲抵）：
+  // - scope='statement'：指定已出账账单全额；- scope='all_posted'：结清全部已入账欠款（含未出账已入账）。
+  // 金额一律由服务端计算；客户端不能提交金额。
   router.post('/', (req, res) => {
     const body = req.body || {}
-    const allowed = ['statement_id', 'from_account_id']
+    const allowed = ['statement_id', 'from_account_id', 'scope', 'credit_account_id']
     const extra = Object.keys(body).filter((k) => !allowed.includes(k))
     if (extra.length) return badRequest(res, `不允许提交字段：${extra.join('、')}`)
+
+    const scope = body.scope === undefined ? 'statement' : body.scope
+    if (scope !== 'statement' && scope !== 'all_posted') return badRequest(res, 'scope 仅支持 statement / all_posted')
+    if (scope === 'statement' && body.statement_id === undefined) return badRequest(res, '请提供账单编号（statement_id）')
+    if (scope === 'all_posted' && body.statement_id !== undefined) {
+      return badRequest(res, '全部结清模式不接受账单编号（statement_id）')
+    }
 
     try {
       const op = createRepaymentOperation(db, demoUserId, {
         statementId: body.statement_id,
         fromAccountId: body.from_account_id,
+        scope,
+        creditAccountId: body.credit_account_id,
       })
       ok(res, op)
     } catch (e) {

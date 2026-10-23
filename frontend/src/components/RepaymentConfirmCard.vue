@@ -31,6 +31,11 @@ const isNeedsVerification = computed(() => !!op.value && op.value.status === 'ne
 const isCompleted = computed(() => !!op.value && op.value.status === 'completed')
 const isTerminal = computed(() => !!op.value && ['completed', 'cancelled', 'expired', 'failed'].includes(op.value.status))
 
+// 还款模式：statement=指定账单全额；all_posted=结清全部已入账欠款（含未出账已入账）
+const isAllPosted = computed(() => !!op.value && op.value.scope === 'all_posted')
+const modeText = computed(() => (isAllPosted.value ? '结清全部已入账欠款' : `指定账单 ${op.value ? op.value.statement_month : ''}`))
+const allocations = computed(() => (op.value && Array.isArray(op.value.allocations) ? op.value.allocations : []))
+
 const opStatusText = {
   needs_verification: '需要强验证还款',
   completed: '还款成功',
@@ -39,11 +44,6 @@ const opStatusText = {
   failed: '已失效',
 }
 const opTitle = computed(() => (op.value ? opStatusText[op.value.status] || '还款单' : ''))
-
-// 账单状态文案（出账 / 逾期 / 已结清 / 未出账）
-function statementStatusText(s) {
-  return { open: '已出账待还', overdue: '已逾期未还', paid: '已结清', unissued: '未出账' }[s] || s || '—'
-}
 
 // 以数据库为准：挂载时回读最新状态，避免过期 / 取消 / 已完成卡片被当作新操作再次执行
 async function load() {
@@ -135,7 +135,7 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
       <dl class="detail-list">
         <div class="detail-row"><dt>付款账户</dt><dd>{{ op.from_account_name }}</dd></div>
         <div class="detail-row"><dt>信用卡</dt><dd>{{ op.credit_account_name }}</dd></div>
-        <div class="detail-row"><dt>账期</dt><dd>{{ op.statement_month }}</dd></div>
+        <div class="detail-row"><dt>还款模式</dt><dd>{{ modeText }}</dd></div>
         <div class="detail-row"><dt>还款金额</dt><dd>¥{{ formatCentsToYuan(op.amount_cents) }}</dd></div>
         <div v-if="op.confirmed_at" class="detail-row"><dt>确认时间</dt><dd>{{ formatShanghaiDateTime(op.confirmed_at) }}</dd></div>
       </dl>
@@ -153,13 +153,18 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
       <dl class="detail-list">
         <div class="detail-row"><dt>付款账户</dt><dd>{{ op.from_account_name }}</dd></div>
         <div class="detail-row"><dt>信用卡</dt><dd>{{ op.credit_account_name }}</dd></div>
-        <div class="detail-row"><dt>账期</dt><dd>{{ op.statement_month }}</dd></div>
+        <div class="detail-row"><dt>还款模式</dt><dd>{{ modeText }}</dd></div>
         <div class="detail-row">
-          <dt>剩余应还</dt>
-          <dd v-if="op.statement">{{ formatCentsToYuan(op.statement.remaining_due_cents) }} 元（{{ statementStatusText(op.statement.status) }}）</dd>
-          <dd v-else>¥{{ formatCentsToYuan(op.amount_cents) }}</dd>
+          <dt>还款构成</dt>
+          <dd class="alloc-list">
+            <span v-for="a in allocations" :key="a.statement_id" class="alloc-item">
+              {{ a.statement_month || '账单' }} · {{ a.issued ? '已出账' : '未出账已入账' }} ·
+              ¥{{ formatCentsToYuan(a.amount_cents) }}
+            </span>
+            <span v-if="!allocations.length">—</span>
+          </dd>
         </div>
-        <div class="detail-row"><dt>还款金额</dt><dd>¥{{ formatCentsToYuan(op.amount_cents) }}（全额）</dd></div>
+        <div class="detail-row"><dt>还款金额</dt><dd>¥{{ formatCentsToYuan(op.amount_cents) }}（合计，服务端计算）</dd></div>
         <div class="detail-row"><dt>操作编号</dt><dd class="mono">{{ op.ref_no }}</dd></div>
         <div class="detail-row"><dt>确认有效期</dt><dd>{{ formatShanghaiDateTime(op.expires_at) }}</dd></div>
       </dl>
@@ -294,6 +299,14 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
+}
+.alloc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.alloc-item {
+  font-variant-numeric: tabular-nums;
 }
 .red-note {
   margin: 10px 0 0;

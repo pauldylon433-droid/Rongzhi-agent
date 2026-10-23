@@ -9,9 +9,12 @@
 //   出账后才入账的旧交易（transaction_at 较早、posted_at 在后续月份）自然进入后续未出账账期，不重开已出账账单。
 // - 出账：issueStatements 在出账日（issued_on <= now）把未出账账单冻结（issued_at 置值），出账金额与消费明细自此固定；
 //   未出账消费不得显示为已出账应还。出账日=下月 1 日、到期日=下月 25 日（按 Asia/Shanghai 边界）。
-// - 还款：仅支持「指定已出账账单剩余应还」的全额还款，恒为红色强验证（交易密码 + TOTP），复用验证服务；
-//   确认时重新核验账单版本与剩余应还，金额不符则拒绝执行并解释、不自动换金额。还款不记为消费支出/收入
-//   （flow_kind='repayment'，analytics 排除并单列）。
+// - 还款：两种全额模式，恒为红色强验证（交易密码 + TOTP），复用验证服务：
+//   scope='statement' 指定已出账账单全额；scope='all_posted' 结清全部已入账欠款（已出账未还 + 未出账已入账消费，
+//   待入账占用不计入），按「已出账优先、旧账期优先」分配，未出账消费可提前还款并保留 paid_cents，出账后不重复计债。
+//   建单冻结每个账单的冲抵金额与版本（repayment_allocations），确认时逐条复核；金额不符则拒绝执行并解释、不自动换金额。
+//   一笔操作单可产生多条冲抵明细（statement_payments），付款流水仍按操作单编号唯一。
+//   还款不记为消费支出/收入（flow_kind='repayment'，analytics 排除并单列）。
 // - 冻结：信用卡冻结（cards.status='frozen'）期间禁止新增消费，但允许还款与已待入账流水正常入账。
 //   冻结 / 解冻本身复用现有 card-operations.js，不在本模块实现。
 // - 消费 / 入账 / 出账为内部模拟能力（供演示数据 / 验证脚本调用），不暴露为 HTTP 写接口或 AI 工具。
@@ -33,7 +36,7 @@ const STATEMENT_COLS = `
   period_start, period_end, issued_on, issued_at, due_on, new_charges_cents, paid_cents, version
 `
 const REPAYMENT_COLS = `
-  id, ref_no, user_id, session_id, from_account_id, from_account_name, credit_account_id, credit_account_name,
+  id, ref_no, user_id, session_id, scope, from_account_id, from_account_name, credit_account_id, credit_account_name,
   statement_id, statement_month, amount_cents, statement_version, risk_level, status,
   created_at, expires_at, confirmed_at
 `
@@ -170,6 +173,10 @@ export function listCreditAccounts(db, userId, now = new Date()) {
     const card = db
       .prepare('SELECT id, masked_card_number, card_type, status FROM cards WHERE account_id = ? AND user_id = ?')
       .get(ca.account_id, userId)
+    const statements = listStatements(db, userId, ca.id, now)
+    // 可还款金额（服务端计算）：已出账未还 + 未出账已入账消费；待入账占用不计入
+    const issuedUnpaid = statements.filter((s) => s.issued).reduce((sum, s) => sum + Math.max(0, s.remaining_due_cents), 0)
+    const unissuedPosted = statements.filter((s) => !s.issued).reduce((sum, s) => sum + Math.max(0, s.remaining_due_cents), 0)
     return {
       id: ca.id,
       account_id: ca.account_id,
@@ -183,7 +190,10 @@ export function listCreditAccounts(db, userId, now = new Date()) {
       posted_outstanding_cents: ca.posted_outstanding_cents,
       pending_occupied_cents: ca.pending_occupied_cents,
       available_credit_cents: ca.credit_limit_cents - ca.posted_outstanding_cents - ca.pending_occupied_cents,
-      statements: listStatements(db, userId, ca.id, now),
+      issued_unpaid_cents: issuedUnpaid,
+      unissued_posted_cents: unissuedPosted,
+      repayable_total_cents: issuedUnpaid + unissuedPosted,
+      statements,
     }
   })
 }
@@ -315,6 +325,7 @@ export function issueStatements(db, userId, creditAccountId, now = new Date()) {
 export function viewRepaymentOperation(db, row) {
   const v = {
     ref_no: row.ref_no,
+    scope: row.scope || 'statement',
     from_account_id: row.from_account_id,
     from_account_name: row.from_account_name,
     credit_account_id: row.credit_account_id,
@@ -328,6 +339,24 @@ export function viewRepaymentOperation(db, row) {
     expires_at: row.expires_at,
     confirmed_at: row.confirmed_at,
   }
+  const allocs = db
+    .prepare('SELECT statement_id, amount_cents, statement_version FROM repayment_allocations WHERE ref_no = ? ORDER BY id')
+    .all(row.ref_no)
+  // 旧操作单（迁移前）没有分配快照：退化为单账单一条
+  const rawAllocs = allocs.length
+    ? allocs
+    : row.statement_id
+      ? [{ statement_id: row.statement_id, amount_cents: row.amount_cents, statement_version: row.statement_version }]
+      : []
+  v.allocations = rawAllocs.map((a) => {
+    const s = db.prepare('SELECT statement_year, statement_month, issued_at FROM statements WHERE id = ?').get(a.statement_id)
+    return {
+      ...a,
+      statement_month: s ? `${String(s.statement_year).padStart(4, '0')}-${String(s.statement_month).padStart(2, '0')}` : null,
+      issued: s ? s.issued_at != null : null,
+    }
+  })
+  v.allocation_count = v.allocations.length
   const stmt = db.prepare(`SELECT ${STATEMENT_COLS} FROM statements WHERE id = ?`).get(row.statement_id)
   if (stmt) v.statement = statementView(db, stmt)
   return v
@@ -337,49 +366,97 @@ export function getRepaymentOpRow(db, refNo) {
   return db.prepare(`SELECT ${REPAYMENT_COLS} FROM repayment_operations WHERE ref_no = ?`).get(refNo)
 }
 
-// 创建还款操作单（不扣款、不冲抵）：仅支持「指定已出账账单剩余应还」的全额还款，恒为红色强验证。
-// 冻结期间允许还款：不校验信用账户 / 卡片状态，仅校验付款账户（活期、active、余额充足）。
-export function createRepaymentOperation(db, userId, { statementId, fromAccountId, sessionId = null }, now = new Date()) {
-  if (typeof statementId !== 'number' || !Number.isSafeInteger(statementId) || statementId <= 0) {
-    throw new CreditError('账单不合法', 'bad_statement')
-  }
+// 创建还款操作单（不扣款、不冲抵）。支持两种全额模式（服务端计算金额）：
+// - scope='statement'：指定已出账账单的全额还款（原有行为）；
+// - scope='all_posted'：结清全部已入账欠款（已出账未还 + 未出账已入账消费），
+//   按「已出账优先、旧账期优先」分配；待入账占用不计入。未出账账单允许提前还款，
+//   冲抵写入该账单的 paid_cents，出账后保留（new_charges 不变、剩余 = 消费 − 已还）。
+// 恒为红色强验证；冻结期间允许还款：不校验信用账户 / 卡片状态，仅校验付款账户（活期、active、余额充足）。
+export function createRepaymentOperation(db, userId, { statementId, fromAccountId, sessionId = null, scope = 'statement', creditAccountId }, now = new Date()) {
+  if (scope !== 'statement' && scope !== 'all_posted') throw new CreditError('还款模式不合法', 'bad_scope')
   if (typeof fromAccountId !== 'number' || !Number.isSafeInteger(fromAccountId) || fromAccountId <= 0) {
     throw new CreditError('付款账户不合法', 'bad_account')
   }
-  const stmt = db.prepare(`SELECT ${STATEMENT_COLS} FROM statements WHERE id = ? AND user_id = ?`).get(statementId, userId)
-  if (!stmt) throw new CreditError('未找到该账单', 'not_found')
-  if (stmt.issued_at == null) throw new CreditError('该账单尚未出账，暂不能还款（未出账消费不计入应还）', 'not_issued')
-  const remaining = stmt.new_charges_cents - stmt.paid_cents
-  if (remaining <= 0) throw new CreditError('该账单已结清，无需还款', 'already_paid')
-
   const fromAcct = db.prepare("SELECT * FROM accounts WHERE id = ? AND user_id = ? AND status = 'active'").get(fromAccountId, userId)
   if (!fromAcct) throw new CreditError('付款账户不存在或不可用', 'no_account')
   if (fromAcct.account_type !== 'deposit') throw new CreditError('还款账户须为活期账户', 'bad_account')
-  if (fromAcct.balance_cents < remaining) throw new CreditError('付款账户余额不足', 'insufficient_balance')
 
-  const ca = db
-    .prepare('SELECT ca.*, a.account_name FROM credit_accounts ca JOIN accounts a ON a.id = ca.account_id WHERE ca.id = ? AND ca.user_id = ?')
-    .get(stmt.credit_account_id, userId)
-  if (!ca) throw new CreditError('信用账户不存在', 'not_found')
+  let ca
+  let allocations = []
+  if (scope === 'statement') {
+    if (typeof statementId !== 'number' || !Number.isSafeInteger(statementId) || statementId <= 0) {
+      throw new CreditError('账单不合法', 'bad_statement')
+    }
+    const stmt = db.prepare(`SELECT ${STATEMENT_COLS} FROM statements WHERE id = ? AND user_id = ?`).get(statementId, userId)
+    if (!stmt) throw new CreditError('未找到该账单', 'not_found')
+    if (stmt.issued_at == null) throw new CreditError('该账单尚未出账，暂不能还款（未出账消费请使用「结清全部已入账欠款」）', 'not_issued')
+    const remaining = stmt.new_charges_cents - stmt.paid_cents
+    if (remaining <= 0) throw new CreditError('该账单已结清，无需还款', 'already_paid')
+    ca = db
+      .prepare('SELECT ca.*, a.account_name FROM credit_accounts ca JOIN accounts a ON a.id = ca.account_id WHERE ca.id = ? AND ca.user_id = ?')
+      .get(stmt.credit_account_id, userId)
+    if (!ca) throw new CreditError('信用账户不存在', 'not_found')
+    allocations = [{ statement: stmt, amount_cents: remaining }]
+  } else {
+    // 全部结清：确定信用账户（显式指定，或唯一账户；多个时要求先指定信用卡）
+    if (creditAccountId !== undefined && creditAccountId !== null) {
+      if (typeof creditAccountId !== 'number' || !Number.isSafeInteger(creditAccountId) || creditAccountId <= 0) {
+        throw new CreditError('信用账户不合法', 'bad_credit_account')
+      }
+      ca = db
+        .prepare('SELECT ca.*, a.account_name FROM credit_accounts ca JOIN accounts a ON a.id = ca.account_id WHERE ca.id = ? AND ca.user_id = ?')
+        .get(creditAccountId, userId)
+      if (!ca) throw new CreditError('信用账户不存在', 'not_found')
+    } else {
+      const list = db
+        .prepare('SELECT ca.*, a.account_name FROM credit_accounts ca JOIN accounts a ON a.id = ca.account_id WHERE ca.user_id = ? ORDER BY ca.id')
+        .all(userId)
+      if (list.length === 0) throw new CreditError('未找到信用账户', 'not_found')
+      if (list.length > 1) throw new CreditError('存在多个信用账户，请先指定信用卡', 'ambiguous_credit_account')
+      ca = list[0]
+    }
+    const stmts = db
+      .prepare(
+        `SELECT ${STATEMENT_COLS} FROM statements
+         WHERE user_id = ? AND credit_account_id = ? AND (new_charges_cents - paid_cents) > 0
+         ORDER BY CASE WHEN issued_at IS NULL THEN 1 ELSE 0 END, statement_year, statement_month, id`,
+      )
+      .all(userId, ca.id)
+    if (stmts.length === 0) throw new CreditError('暂无可还款项（无已入账欠款）', 'no_debt')
+    allocations = stmts.map((s) => ({ statement: s, amount_cents: s.new_charges_cents - s.paid_cents }))
+  }
 
+  const total = allocations.reduce((sum, a) => sum + a.amount_cents, 0)
+  if (total <= 0) throw new CreditError('暂无可还款项（无已入账欠款）', 'no_debt')
+  if (fromAcct.balance_cents < total) throw new CreditError('付款账户余额不足', 'insufficient_balance')
+
+  const primary = allocations[0].statement
   const refNo = randomUUID()
   const createdAt = now.toISOString()
   const expiresAt = new Date(now.getTime() + REPAYMENT_EXPIRY_MS).toISOString()
-  const statementMonth = `${String(stmt.statement_year).padStart(4, '0')}-${String(stmt.statement_month).padStart(2, '0')}`
+  const statementMonth = `${String(primary.statement_year).padStart(4, '0')}-${String(primary.statement_month).padStart(2, '0')}`
 
   const run = db.transaction(() => {
     const info = db
       .prepare(
         `INSERT INTO repayment_operations
-          (ref_no, user_id, session_id, from_account_id, from_account_name, credit_account_id, credit_account_name,
+          (ref_no, user_id, session_id, scope, from_account_id, from_account_name, credit_account_id, credit_account_name,
            statement_id, statement_month, amount_cents, statement_version, risk_level, status, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'red', 'needs_verification', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'red', 'needs_verification', ?, ?)`,
       )
-      .run(refNo, userId, typeof sessionId === 'string' && sessionId ? sessionId : null, fromAcct.id, fromAcct.account_name, ca.id, ca.account_name, stmt.id, statementMonth, remaining, stmt.version, createdAt, expiresAt)
+      .run(
+        refNo, userId, typeof sessionId === 'string' && sessionId ? sessionId : null, scope,
+        fromAcct.id, fromAcct.account_name, ca.id, ca.account_name,
+        primary.id, statementMonth, total, primary.version, createdAt, expiresAt,
+      )
+    const insAlloc = db.prepare(
+      'INSERT INTO repayment_allocations (ref_no, statement_id, amount_cents, statement_version) VALUES (?, ?, ?, ?)',
+    )
+    for (const a of allocations) insAlloc.run(refNo, a.statement.id, a.amount_cents, a.statement.version)
     db.prepare(
       `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
        VALUES (?, 'repayment', ?, 'create', ?, ?)`,
-    ).run(userId, refNo, 'needs_verification', JSON.stringify({ statement_id: stmt.id, amount_cents: remaining }))
+    ).run(userId, refNo, 'needs_verification', JSON.stringify({ scope, amount_cents: total, allocations: allocations.length }))
     return getById(db, info.lastInsertRowid)
   })
   return viewRepaymentOperation(db, run())
@@ -430,6 +507,7 @@ export function latestRepaymentForSession(db, userId, sessionId) {
   const v = viewRepaymentOperation(db, row)
   return {
     ref_no: row.ref_no,
+    scope: row.scope || 'statement',
     status: row.status,
     amount_cents: row.amount_cents,
     from_account_name: row.from_account_name,
@@ -437,6 +515,7 @@ export function latestRepaymentForSession(db, userId, sessionId) {
     statement_month: row.statement_month,
     confirmed_at: row.confirmed_at,
     statement: v.statement || null,
+    allocations: v.allocations,
   }
 }
 
@@ -444,28 +523,48 @@ export function latestRepaymentForSession(db, userId, sessionId) {
 // 前置：归属、到期、终态、以及红色验证码（verifyAndConfirmRepayment）均已校验通过。
 // 确认时重新核验：账单版本变化或剩余应还与建单时不一致 → 旧单失效（stale），需重建；不自动换金额。
 export function finalizeRepayment(db, userId, row, now) {
-  const stmt = db.prepare(`SELECT ${STATEMENT_COLS} FROM statements WHERE id = ? AND user_id = ?`).get(row.statement_id, userId)
-  if (!stmt) {
+  const scope = row.scope || 'statement'
+  const markFailed = (reason) => {
     db.prepare("UPDATE repayment_operations SET status = 'failed' WHERE id = ? AND status = 'needs_verification'").run(row.id)
-    return { outcome: 'failed', reason: '目标账单不存在', op: viewRepaymentOperation(db, getById(db, row.id)) }
+    return { outcome: 'failed', reason, op: viewRepaymentOperation(db, getById(db, row.id)) }
   }
-  if (stmt.issued_at == null) {
+  const markStale = (reason) => {
     db.prepare("UPDATE repayment_operations SET status = 'failed' WHERE id = ? AND status = 'needs_verification'").run(row.id)
-    return { outcome: 'failed', reason: '账单尚未出账，不能还款', op: viewRepaymentOperation(db, getById(db, row.id)) }
+    return { outcome: 'stale', reason, op: viewRepaymentOperation(db, getById(db, row.id)) }
   }
-  const remaining = stmt.new_charges_cents - stmt.paid_cents
-  if (stmt.version !== row.statement_version || remaining !== row.amount_cents || remaining <= 0) {
-    db.prepare("UPDATE repayment_operations SET status = 'failed' WHERE id = ? AND status = 'needs_verification'").run(row.id)
-    return {
-      outcome: 'stale',
-      reason: `账单金额已变化：建单时应还 ${row.amount_cents} 分，当前应还 ${remaining} 分，请重新发起还款`,
-      op: viewRepaymentOperation(db, getById(db, row.id)),
+
+  // —— 复核分配明细：指定账单模式按账单版本 + 剩余；全部结清模式逐条复核 ——
+  let allocations
+  if (scope === 'statement') {
+    const stmt = db.prepare(`SELECT ${STATEMENT_COLS} FROM statements WHERE id = ? AND user_id = ?`).get(row.statement_id, userId)
+    if (!stmt) return markFailed('目标账单不存在')
+    if (stmt.issued_at == null) return markFailed('账单尚未出账，不能还款')
+    const remaining = stmt.new_charges_cents - stmt.paid_cents
+    if (stmt.version !== row.statement_version || remaining !== row.amount_cents || remaining <= 0) {
+      return markStale(`账单金额已变化：建单时应还 ${row.amount_cents} 分，当前应还 ${remaining} 分，请重新发起还款`)
+    }
+    allocations = [{ statement_id: stmt.id, amount_cents: remaining }]
+  } else {
+    allocations = db
+      .prepare('SELECT statement_id, amount_cents, statement_version FROM repayment_allocations WHERE ref_no = ? ORDER BY id')
+      .all(row.ref_no)
+    if (!allocations.length) return markFailed('还款分配明细缺失')
+    const allocTotal = allocations.reduce((sum, a) => sum + a.amount_cents, 0)
+    if (allocTotal !== row.amount_cents) return markStale('还款金额已变化，请重新发起还款')
+    for (const a of allocations) {
+      const stmt = db.prepare(`SELECT ${STATEMENT_COLS} FROM statements WHERE id = ? AND user_id = ?`).get(a.statement_id, userId)
+      if (!stmt) return markFailed('目标账单不存在')
+      const remaining = stmt.new_charges_cents - stmt.paid_cents
+      if (stmt.version !== a.statement_version || remaining !== a.amount_cents || remaining <= 0) {
+        return markStale('账单金额已变化，请重新发起还款')
+      }
     }
   }
+
+  const total = allocations.reduce((sum, a) => sum + a.amount_cents, 0)
   const fromAcct = db.prepare("SELECT * FROM accounts WHERE id = ? AND user_id = ? AND status = 'active'").get(row.from_account_id, userId)
-  if (!fromAcct || fromAcct.account_type !== 'deposit' || fromAcct.balance_cents < row.amount_cents) {
-    db.prepare("UPDATE repayment_operations SET status = 'failed' WHERE id = ? AND status = 'needs_verification'").run(row.id)
-    return { outcome: 'failed', reason: '付款账户不可用或余额不足', op: viewRepaymentOperation(db, getById(db, row.id)) }
+  if (!fromAcct || fromAcct.account_type !== 'deposit' || fromAcct.balance_cents < total) {
+    return markFailed('付款账户不可用或余额不足')
   }
 
   // 原子认领（CAS）：仅 needs_verification → completed，防重复 / 并发执行
@@ -477,30 +576,34 @@ export function finalizeRepayment(db, userId, row, now) {
   // 扣减付款账户（活期）
   const deduct = db
     .prepare('UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ? AND balance_cents >= ?')
-    .run(row.amount_cents, row.from_account_id, row.amount_cents)
+    .run(total, row.from_account_id, total)
   if (deduct.changes !== 1) throw new Error('还款扣款失败（余额不足）')
 
-  // 还款流水（付款账户侧，flow_kind='repayment'，不计入收支/消费）
-  db.prepare(
-    `INSERT INTO transactions
-      (user_id, account_id, direction, amount_cents, category, merchant, description, transaction_at, status, flow_kind, repayment_ref)
-     VALUES (?, ?, 'expense', ?, '还款', NULL, '信用卡还款', ?, 'posted', 'repayment', ?)`,
-  ).run(userId, row.from_account_id, row.amount_cents, now.toISOString(), row.ref_no)
+  // 还款流水（付款账户侧，flow_kind='repayment'，不计入收支/消费；每单一条）
+  const txInfo = db
+    .prepare(
+      `INSERT INTO transactions
+        (user_id, account_id, direction, amount_cents, category, merchant, description, transaction_at, status, flow_kind, repayment_ref)
+       VALUES (?, ?, 'expense', ?, '还款', NULL, '信用卡还款', ?, 'posted', 'repayment', ?)`,
+    )
+    .run(userId, row.from_account_id, total, now.toISOString(), row.ref_no)
 
-  // 账单冲抵明细（repayment_ref 唯一，数据库层防重复冲抵）
-  db.prepare(
+  // 冲抵明细（一笔操作单可对应多条；同一账单最多一条由分配表唯一约束保证）+ 账单已冲抵 + 版本自增
+  const insPay = db.prepare(
     'INSERT INTO statement_payments (user_id, statement_id, repayment_ref, amount_cents, paid_at) VALUES (?, ?, ?, ?, ?)',
-  ).run(userId, row.statement_id, row.ref_no, row.amount_cents, now.toISOString())
-
-  // 账单已冲抵 + 版本自增
-  db.prepare('UPDATE statements SET paid_cents = paid_cents + ?, version = version + 1 WHERE id = ?').run(row.amount_cents, row.statement_id)
+  )
+  const updStmt = db.prepare('UPDATE statements SET paid_cents = paid_cents + ?, version = version + 1 WHERE id = ?')
+  for (const a of allocations) {
+    insPay.run(userId, a.statement_id, row.ref_no, a.amount_cents, now.toISOString())
+    updStmt.run(a.amount_cents, a.statement_id)
+  }
   // 信用账户已入账未还减少
-  db.prepare('UPDATE credit_accounts SET posted_outstanding_cents = posted_outstanding_cents - ? WHERE id = ? AND posted_outstanding_cents >= ?').run(row.amount_cents, row.credit_account_id, row.amount_cents)
+  db.prepare('UPDATE credit_accounts SET posted_outstanding_cents = posted_outstanding_cents - ? WHERE id = ? AND posted_outstanding_cents >= ?').run(total, row.credit_account_id, total)
 
   db.prepare(
     `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
      VALUES (?, 'repayment', ?, 'confirm', 'success', ?)`,
-  ).run(userId, row.ref_no, JSON.stringify({ statement_id: row.statement_id, amount_cents: row.amount_cents }))
+  ).run(userId, row.ref_no, JSON.stringify({ scope, amount_cents: total, allocations: allocations.length }))
 
   // 权威回执：清除发起该单的原始会话的「待确认」引用（仅当仍指向本单，不影响后续新单）。
   if (row.session_id) {
@@ -509,5 +612,5 @@ export function finalizeRepayment(db, userId, row, now) {
     ).run(row.session_id, row.ref_no)
   }
 
-  return { outcome: 'completed', op: viewRepaymentOperation(db, getById(db, row.id)) }
+  return { outcome: 'completed', op: viewRepaymentOperation(db, getById(db, row.id)), transaction_id: txInfo.lastInsertRowid }
 }

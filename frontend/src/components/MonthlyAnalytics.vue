@@ -83,7 +83,8 @@ const showAnalysis = computed(() => !!data.value && !loading.value && !error.val
 
 // 明确选中信用账户时隐藏整个「收入分析」模块（标题 / 分类表 / 饼图 / 空态一并隐藏，不留占位）。
 // 依据全局选择快照中的真实 account_type；「全部账户」或借记账户时保留。
-const showIncomeAnalysis = computed(() => selectedAccountType.value !== 'credit')
+const isCreditScope = computed(() => selectedAccountType.value === 'credit')
+const showIncomeAnalysis = computed(() => !isCreditScope.value)
 
 const monthLabel = computed(() => (data.value ? data.value.month : ''))
 const asOfText = computed(() => (data.value ? formatShanghaiDateTime(data.value.as_of) : ''))
@@ -112,7 +113,7 @@ function moneyWithSign(cents) {
     <!-- 顶部：月份选择 + 指标卡 + 待入账提示（保留） -->
     <section class="section">
       <div class="section-head">
-        <h2 class="section-title">月度账单分析</h2>
+        <h2 class="section-title">{{ isCreditScope ? '信用卡月度消费分析' : '月度账单分析' }}</h2>
         <div class="filter-toolbar">
           <AccountScopeSelect />
           <template v-if="!accountsLoading && !filterMessage">
@@ -138,37 +139,63 @@ function moneyWithSign(cents) {
 
       <div v-else-if="data" class="top-body">
         <div class="stat-grid">
-          <div class="stat-card">
-            <div class="stat-head">
-              <span class="stat-icon stat-icon-income"><AppIcon name="income" :size="16" /></span>
-              <span class="stat-label">已入账收入</span>
+          <template v-if="isCreditScope">
+            <!-- 信用账户：只展示消费口径，不展示收入 / 净收支 -->
+            <div class="stat-card">
+              <div class="stat-head">
+                <span class="stat-icon stat-icon-expense"><AppIcon name="expense" :size="16" /></span>
+                <span class="stat-label">已入账消费</span>
+              </div>
+              <span class="stat-value is-expense">{{ formatMoney(data.expense_cents, 'CNY') }}</span>
             </div>
-            <span class="stat-value is-income">{{ moneyWithSign(data.income_cents) }}</span>
-          </div>
-          <div class="stat-card">
-            <div class="stat-head">
-              <span class="stat-icon stat-icon-expense"><AppIcon name="expense" :size="16" /></span>
-              <span class="stat-label">已入账支出</span>
+            <div class="stat-card">
+              <div class="stat-head">
+                <span class="stat-icon stat-icon-posted"><AppIcon name="posted" :size="16" /></span>
+                <span class="stat-label">待入账消费</span>
+              </div>
+              <span class="stat-value">{{ formatMoney(data.pending.amount_cents, 'CNY') }}</span>
             </div>
-            <span class="stat-value is-expense">{{ moneyWithSign(-data.expense_cents) }}</span>
-          </div>
-          <div class="stat-card">
-            <div class="stat-head">
-              <span class="stat-icon stat-icon-net"><AppIcon name="balance" :size="16" /></span>
-              <span class="stat-label">净收支</span>
+            <div class="stat-card">
+              <div class="stat-head">
+                <span class="stat-icon stat-icon-posted"><AppIcon name="posted" :size="16" /></span>
+                <span class="stat-label">已入账消费笔数</span>
+              </div>
+              <span class="stat-value">{{ data.posted_count }} 笔</span>
             </div>
-            <span class="stat-value" :class="netTone">{{ moneyWithSign(data.net_cents) }}</span>
-          </div>
-          <div class="stat-card">
-            <div class="stat-head">
-              <span class="stat-icon stat-icon-posted"><AppIcon name="posted" :size="16" /></span>
-              <span class="stat-label">已入账笔数</span>
+          </template>
+          <template v-else>
+            <div class="stat-card">
+              <div class="stat-head">
+                <span class="stat-icon stat-icon-income"><AppIcon name="income" :size="16" /></span>
+                <span class="stat-label">已入账收入</span>
+              </div>
+              <span class="stat-value is-income">{{ moneyWithSign(data.income_cents) }}</span>
             </div>
-            <span class="stat-value">{{ data.posted_count }} 笔</span>
-          </div>
+            <div class="stat-card">
+              <div class="stat-head">
+                <span class="stat-icon stat-icon-expense"><AppIcon name="expense" :size="16" /></span>
+                <span class="stat-label">已入账支出</span>
+              </div>
+              <span class="stat-value is-expense">{{ moneyWithSign(-data.expense_cents) }}</span>
+            </div>
+            <div class="stat-card">
+              <div class="stat-head">
+                <span class="stat-icon stat-icon-net"><AppIcon name="balance" :size="16" /></span>
+                <span class="stat-label">净收支</span>
+              </div>
+              <span class="stat-value" :class="netTone">{{ moneyWithSign(data.net_cents) }}</span>
+            </div>
+            <div class="stat-card">
+              <div class="stat-head">
+                <span class="stat-icon stat-icon-posted"><AppIcon name="posted" :size="16" /></span>
+                <span class="stat-label">已入账笔数</span>
+              </div>
+              <span class="stat-value">{{ data.posted_count }} 笔</span>
+            </div>
+          </template>
         </div>
 
-        <p v-if="data.pending.count > 0" class="pending-note">
+        <p v-if="!isCreditScope && data.pending.count > 0" class="pending-note">
           另有 <strong>{{ data.pending.count }}</strong> 笔待入账，共
           <strong>{{ formatMoney(data.pending.amount_cents, 'CNY') }}</strong>（不计入上述已入账统计）
         </p>
@@ -178,7 +205,9 @@ function moneyWithSign(cents) {
         </p>
 
         <p class="caliber-note">
-          口径说明：本页按「交易发生时间 + 已入账」统计收支；信用卡账单按「入账时间」归账期，两口径因入账延迟可能不同。
+          {{ isCreditScope
+            ? '口径说明：本页按「消费发生时间 + 已入账」统计消费，不等于本期应还；信用卡还款账单按「入账时间」归账期，未出账消费可能已经入账，两口径因入账延迟可能不同。'
+            : '口径说明：本页按「交易发生时间 + 已入账」统计收支；信用卡账单按「入账时间」归账期，两口径因入账延迟可能不同。' }}
         </p>
       </div>
     </section>
@@ -230,10 +259,10 @@ function moneyWithSign(cents) {
       </section>
 
       <section class="ana-card">
-        <h3 class="ana-title">支出分析</h3>
+        <h3 class="ana-title">{{ isCreditScope ? '消费分析' : '支出分析' }}</h3>
         <div class="ana-layout">
           <div class="ana-col">
-            <h4 class="ana-subtitle">支出分类明细</h4>
+            <h4 class="ana-subtitle">{{ isCreditScope ? '消费分类明细' : '支出分类明细' }}</h4>
             <table v-if="expenseRows.length" class="data-table ana-table">
               <thead>
                 <tr>
@@ -258,15 +287,15 @@ function moneyWithSign(cents) {
                 </tr>
               </tbody>
             </table>
-            <p v-else class="state-empty">暂无已入账支出</p>
+            <p v-else class="state-empty">{{ isCreditScope ? '暂无已入账消费' : '暂无已入账支出' }}</p>
           </div>
           <div class="ana-col">
-            <h4 class="ana-subtitle">支出去向占比</h4>
+            <h4 class="ana-subtitle">{{ isCreditScope ? '消费占比' : '支出去向占比' }}</h4>
             <CategoryPieChart
               v-if="expenseRows.length"
               :slices="expenseRows"
               :total-cents="data.expense_cents"
-              center-label="已入账支出"
+              :center-label="isCreditScope ? '已入账消费' : '已入账支出'"
             />
             <p v-else class="state-empty">暂无已入账支出</p>
           </div>

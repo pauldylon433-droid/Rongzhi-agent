@@ -258,9 +258,14 @@ export async function fetchStatementDetail(statementId) {
   return body.data
 }
 
-// 创建还款操作单（还款准备：指定已出账账单 + 付款活期账户；不扣款、不冲抵）
-export async function createRepayment({ statement_id, from_account_id }) {
-  const body = await postJson('/api/repayments', { statement_id, from_account_id })
+// 创建还款操作单（还款准备，不扣款、不冲抵）。金额由服务端计算：
+// scope='statement' 指定已出账账单全额；scope='all_posted' 结清全部已入账欠款（含未出账已入账）。
+export async function createRepayment({ statement_id, from_account_id, scope, credit_account_id }) {
+  const payload = { from_account_id }
+  if (statement_id !== undefined && statement_id !== null) payload.statement_id = statement_id
+  if (scope) payload.scope = scope
+  if (credit_account_id !== undefined && credit_account_id !== null) payload.credit_account_id = credit_account_id
+  const body = await postJson('/api/repayments', payload)
   return body.data
 }
 

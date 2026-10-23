@@ -63,6 +63,20 @@ const op = ref(null) // 当前银行卡操作单初始视图（确认卡组件�
 const creating = ref(false)
 const opError = ref('')
 
+// 信用卡摘要入口：查看账单（滚动到详情）/ 还款（打开详情还款面板，不直接建单）
+const repaySignals = ref({})
+function scrollToDetail(card) {
+  const el = document.getElementById(`credit-detail-${card.id}`)
+  if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+function viewBill(card) {
+  scrollToDetail(card)
+}
+function openRepay(card) {
+  repaySignals.value = { ...repaySignals.value, [card.id]: (repaySignals.value[card.id] || 0) + 1 }
+  scrollToDetail(card)
+}
+
 onMounted(load)
 
 // 卡片列表变化后按需补充关联账户（仅在缺少余额字段时请求一次）
@@ -219,6 +233,8 @@ function dismiss() {
               已入账未还 {{ formatCentsToYuan(c.posted_outstanding_cents) }} 元
             </div>
             <div v-if="c.status !== 'cancelled'" class="bank-card-actions">
+              <button class="card-btn card-btn-select" @click="viewBill(c)">查看账单</button>
+              <button class="card-btn" @click="openRepay(c)">还款</button>
               <button
                 v-if="c.status === 'active'"
                 class="card-btn"
@@ -243,8 +259,8 @@ function dismiss() {
       <!-- 信用卡详情：额度明细 / 账单 / 还款，独立区域、不压缩摘要 -->
       <div v-if="creditCards.length" class="card-section credit-details">
         <h3 class="card-section-title">信用卡详情</h3>
-        <div v-for="c in creditCards" :key="c.id" class="credit-detail-block">
-          <CreditCardDetail :card="c" />
+        <div v-for="c in creditCards" :id="`credit-detail-${c.id}`" :key="c.id" class="credit-detail-block">
+          <CreditCardDetail :card="c" :repay-signal="repaySignals[c.id] || 0" />
         </div>
       </div>
     </template>
