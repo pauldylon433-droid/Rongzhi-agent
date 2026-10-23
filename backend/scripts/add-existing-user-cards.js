@@ -146,15 +146,48 @@ export function applyConsumption(db, userId, creditCaId, now = new Date()) {
   return { added: true, count: plan.length }
 }
 
+// 新增借记卡样例流水（仅 --with-debit-samples）：明确标识 + 幂等，只作用于新增账户。
+// 样例：模拟工资 +1500 元、模拟消费 -299 元 → 期末 = 期初 + 收支。
+export const DEBIT_SAMPLE_DESC = '验收样例(新增借记卡)'
+export const DEBIT_SAMPLES = [
+  { direction: 'income', amount_cents: 150000, category: '收入', merchant: '薪资发放' },
+  { direction: 'expense', amount_cents: 29900, category: '餐饮', merchant: '星巴克' },
+]
+
+export function applyDebitSamples(db, userId, accountId, now = new Date()) {
+  const existing = db
+    .prepare('SELECT COUNT(*) c FROM transactions WHERE user_id = ? AND account_id = ? AND description LIKE ?')
+    .get(userId, accountId, `%${DEBIT_SAMPLE_DESC}%`).c
+  if (existing > 0) return { added: false, reason: '已存在新增借记卡样例流水，跳过（幂等）' }
+  const rows = DEBIT_SAMPLES.map((s, i) => ({
+    ...s,
+    description: `${DEBIT_SAMPLE_DESC}·${s.direction === 'income' ? '模拟工资' : '模拟消费'}`,
+    at: new Date(now.getTime() - (DEBIT_SAMPLES.length - i) * 3600 * 1000).toISOString(),
+  }))
+  const delta = rows.reduce((sum, r) => sum + (r.direction === 'income' ? r.amount_cents : -r.amount_cents), 0)
+  db.transaction(() => {
+    for (const r of rows) {
+      db.prepare(
+        `INSERT INTO transactions (user_id, account_id, direction, amount_cents, category, merchant, description, transaction_at, status, flow_kind)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'posted', 'external')`,
+      ).run(userId, accountId, r.direction, r.amount_cents, r.category, r.merchant, r.description, r.at)
+    }
+    db.prepare('UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ? AND user_id = ?').run(delta, accountId, userId)
+  })()
+  const balance = db.prepare('SELECT balance_cents b FROM accounts WHERE id = ?').get(accountId).b
+  return { added: true, count: rows.length, delta_cents: delta, balance_cents: balance }
+}
+
 // —— CLI ——
 function parseArgs(argv) {
-  const a = { db: null, userId: null, apply: false, withConsumption: false }
+  const a = { db: null, userId: null, apply: false, withConsumption: false, withDebitSamples: false }
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i]
     if (x === '--db') a.db = argv[++i]
     else if (x === '--user-id') a.userId = Number(argv[++i])
     else if (x === '--apply') a.apply = true
     else if (x === '--with-consumption') a.withConsumption = true
+    else if (x === '--with-debit-samples') a.withDebitSamples = true
     else if (x === '--preview') a.apply = false
     else if (x === '--help' || x === '-h') a.help = true
   }
@@ -163,10 +196,11 @@ function parseArgs(argv) {
 
 const HELP = `为现有用户增量接入「第二张借记卡 + 信用卡」（多卡接入）
 用法：
-  node scripts/add-existing-user-cards.js --db <绝对路径> --user-id <id> [--preview|--apply] [--with-consumption]
-  --preview          默认：只打印计划，不写入
-  --apply            显式写入（只 INSERT 新账户/卡片，不改已有数据）
-  --with-consumption 仅与 --apply 连用：额外写入样例消费（不连用则不写任何消费/欠款）
+  node scripts/add-existing-user-cards.js --db <绝对路径> --user-id <id> [--preview|--apply] [--with-debit-samples] [--with-consumption]
+  --preview            默认：只打印计划，不写入
+  --apply              显式写入（只 INSERT 新账户/卡片，不改已有数据）
+  --with-debit-samples 仅与 --apply 连用：给新增借记账户写入带明确标识的模拟样例（幂等）
+  --with-consumption   仅与 --apply 连用：给新增信用账户写入样例消费（不连用则不写任何消费/欠款）
 `
 
 function fmtCents(c) { return `¥${(c / 100).toFixed(2)}` }
@@ -191,6 +225,8 @@ function main() {
   console.log(`\n计划（模拟数据，仅供演示）：`)
   console.log(`  - 新增借记卡 ${MARKER.debitCardMasked}（账户「${MARKER.debitAccountName}」，初始余额 ${fmtCents(MARKER.debitOpeningCents)}）${plan.hasDebitCard ? '  [已存在，跳过]' : ''}`)
   console.log(`  - 新增信用卡 ${MARKER.creditCardMasked}（账户「${MARKER.creditAccountName}」，额度 ${fmtCents(MARKER.creditLimitCents)}）${plan.hasCreditCard ? '  [已存在，跳过]' : ''}`)
+  const debitDelta = DEBIT_SAMPLES.reduce((s, r) => s + (r.direction === 'income' ? r.amount_cents : -r.amount_cents), 0)
+  console.log(`  - 借记卡样例：${args.withDebitSamples ? `是（模拟工资 ${fmtCents(150000)} + 模拟消费 ${fmtCents(29900)}，期末 ${fmtCents(MARKER.debitOpeningCents + debitDelta)}）` : '否'}`)
   console.log(`  - 样例消费：${args.withConsumption ? '是（仅信用账户，产生已出账/未出账/待入账示例）' : '否（仅加卡，不灌入消费或欠款）'}${plan.hasConsumption ? '  [已存在，跳过]' : ''}`)
   console.log(`\n原账户余额 / 历史交易 / 会话 / 操作单 / 验证绑定：一律不改动。`)
 
@@ -200,23 +236,21 @@ function main() {
     process.exit(0)
   }
 
-  if (args.withConsumption && !plan.hasDebitCard && !plan.hasCreditCard && plan.hasConsumption) {
-    // 已全部存在，无操作
-    console.log(`\n（幂等）目标数据均已存在，未重复创建。`)
-    db.close()
-    process.exit(0)
-  }
-
   const res = applyBaseCards(db, userId)
   let cons = null
   if (args.withConsumption) {
     cons = applyConsumption(db, userId, res.creditCaId)
+  }
+  let debitSamples = null
+  if (args.withDebitSamples) {
+    debitSamples = applyDebitSamples(db, userId, res.debitAccountId)
   }
 
   const after = snapshot(db, userId)
   console.log(`\n执行结果：`)
   console.log(`  - 借记卡：${res.addedDebit ? '已新增' : '已存在（跳过）'}（account_id=${res.debitAccountId}）`)
   console.log(`  - 信用卡：${res.addedCredit ? '已新增' : '已存在（跳过）'}（account_id=${res.creditAccountId}，credit_account_id=${res.creditCaId}）`)
+  if (debitSamples) console.log(`  - 借记卡样例：${debitSamples.added ? `已新增 ${debitSamples.count} 笔，期末余额 ${debitSamples.balance_cents}` : debitSamples.reason}`)
   if (cons) console.log(`  - 样例消费：${cons.added ? `已新增 ${cons.count} 笔` : cons.reason}`)
   console.log(`\n新增后：账户 ${after.accounts.length} 个 / 卡片 ${after.cards.length} 张 / 流水 ${after.tx.c} 笔`)
   console.log(`原账户余额逐条保留：${before.accounts.map((a) => `${a.account_name}=${a.balance_cents}`).join('，')}`)
