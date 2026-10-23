@@ -243,6 +243,7 @@ node scripts/drill-deploy-copy.js               # 开发库一致性副本演练
 node scripts/setup-isolated-env.js              # 生成独立验收库 + 绑定测试专用强验证器（打印隔离后端启动命令）
 node scripts/verify-add-existing-user-cards.js  # 现有用户增量加卡：开发库副本上验证原数据保留 + 幂等
 node scripts/add-existing-user-cards.js --db <路径> --user-id 1 --preview   # 增量加卡预览（默认只读）
+node scripts/enrich-demo-accounts.js --db <路径> --user-id 1 --debit-account-id 2 --credit-account-id 3 --preview  # 新增账户演示流水（默认只读、幂等）
 node scripts/acceptance-totp.js                 # 隔离验收环境：本机生成当前 6 位测试动态码
 ```
 
