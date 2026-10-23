@@ -268,16 +268,19 @@ for (const p of [DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm']) {
   const cnt = msgCount(capDb, sessionId)
   check('9.1 单会话可见消息不超过上限（101 轮 → 202 条截断为 200）', cnt === 200, String(cnt))
 
-  // 保留期：插入一条 8 天前的旧会话 + 消息，恢复时被懒清理
+  // 不按闲置时长清理：插入一条 8 天前的旧会话 + 消息，读取 / 列表 / 打开后仍保留
   const oldId = '00000000-0000-0000-0000-000000000001'
   const cutoff = Date.now() - 8 * 24 * 60 * 60 * 1000
-  capDb.prepare("INSERT INTO chat_sessions (id, user_id, messages_json, created_at, last_active_at) VALUES (?, ?, '[]', ?, ?)").run(oldId, cu1, cutoff, cutoff)
+  capDb.prepare("INSERT INTO chat_sessions (id, user_id, messages_json, created_at, last_active_at) VALUES (?, ?, ?, ?, ?)").run(oldId, cu1, JSON.stringify([{ role: 'user', content: '老消息' }]), cutoff, cutoff)
   capDb.prepare("INSERT INTO chat_messages (session_id, user_id, seq, role, text, created_at) VALUES (?, ?, 1, 'user', '老消息', ?)").run(oldId, cu1, cutoff)
   const a2 = createAssistant({ db: capDb, demoUserId: cu1, chatFn: mock })
-  a2.getCurrent() // 触发懒清理
+  a2.getCurrent()
+  a2.listConversations()
+  const opened = a2.getConversation(oldId)
   const oldRow = capDb.prepare('SELECT id FROM chat_sessions WHERE id = ?').get(oldId)
   const oldMsgs = capDb.prepare('SELECT COUNT(*) AS c FROM chat_messages WHERE session_id = ?').get(oldId).c
-  check('9.2 超过保留期（7 天）的会话与其消息被清理', !oldRow && oldMsgs === 0)
+  check('9.2 超过 7 天未活跃的会话不被清理（列表 / 打开仍可读取）',
+    !!oldRow && oldMsgs === 1 && opened && opened.messages.length === 1 && opened.messages[0].text === '老消息')
   capDb.close()
   for (const p of [CAP_DB_PATH, CAP_DB_PATH + '-wal', CAP_DB_PATH + '-shm']) {
     try { rmSync(p, { force: true }) } catch {}

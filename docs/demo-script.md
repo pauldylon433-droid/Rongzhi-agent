@@ -7,7 +7,9 @@
 
 1. 干净源码目录：`cd backend && npm ci && npm run db:init`；
    可选多卡与样例：`node scripts/add-existing-user-cards.js --db data/rongzhi.db --user-id 1 --apply --with-debit-samples --with-consumption`。
-2. 启动后端（独立端口）：`PORT=4300 DB_PATH=<演示库绝对路径> node src/index.js`；前端 `npx vite --port 5280` 并代理到 4300。
+2. 启动后端（独立端口，Windows PowerShell）：
+   `$env:PORT='4300'; $env:DB_PATH='<演示库绝对路径>'; node src\index.js`；
+   前端 `npx vite --port 5280` 并代理到 4300（或在 `frontend` 目录设置 `$env:ISOLATED_BACKEND='http://localhost:4300'` 使用隔离配置）。
 3. 打开前端，确认三张卡：借记 1234、借记 5678、信用卡 0003。
 4. 强验证：首次使用按 `node scripts/bind-verification.js` 绑定（生成该环境独立主密钥与 TOTP，不复用开发环境）。
 

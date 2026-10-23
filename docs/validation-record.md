@@ -15,7 +15,18 @@
 
 ## 二、最终自动验证（2026-10-23 收尾轮实际执行）
 
-- **后端**：`backend/scripts/verify-*.js` 共 **36 个脚本全部通过**（exit=0）。
+- **后端**：`backend/scripts/verify-*.js` 共 **35 个脚本全部通过**（exit=0）。
+  （此前报告写“36 个”属计数口误；源码包实际为 35 个 `verify-*.js`，以本清单为准。）
+  实际脚本清单（按文件名）：
+  `verify-account-filter`、`verify-activity`、`verify-add-existing-user-cards`、`verify-agent-tasks`、
+  `verify-analytics`、`verify-api`、`verify-assistant`、`verify-assistant-repayment`、
+  `verify-assistant-session`、`verify-assistant-transfer`、`verify-bind-interaction`、
+  `verify-business-info-binding`、`verify-card-operations`、`verify-chat-history`、`verify-chat-persistence`、
+  `verify-completion-sync`、`verify-credential-guard`、`verify-credit-repayment`、`verify-credit-routes`、
+  `verify-db`、`verify-demo-seed`、`verify-fix`、`verify-list-recipients`、`verify-migrate`、
+  `verify-multi-account`、`verify-repayment-all-posted`、`verify-running-balance`、`verify-security-boundaries`、
+  `verify-strong-verification`、`verify-subscription-operations`、`verify-subscription-source-change`、
+  `verify-transfer-receipt`、`verify-transfer-receipt-edge`、`verify-transfers`、`verify-verify-message-uniform`。
   覆盖：数据库 / 迁移 / 种子 / API / 分析 / 转账 / 强验证 / 银行卡 / 订阅 / 跨场景任务 / 聊天持久化 /
   信用卡账单与还款（含全部结清与提前还款）/ 多账户范围 / 逐笔结余 / 安全边界 / 凭据保护 / 演示数据 / 增量加卡。
 - **前端**：`frontend/scripts/verify-*.mjs` 共 **6 个脚本全部通过**（markdown 净化、业务事件、最新覆盖、活动、任务区选择、卡片余额兼容）。
@@ -39,7 +50,7 @@
 
 | 维度 | 已有证据 | 验证类型 |
 | ---- | ---- | ---- |
-| 任务完成率 40% | 五场景 + 多账户/信用卡 + 提前还款 + 订阅来源 + 历史续聊；36 个后端脚本、6 个前端脚本、构建 | 自动化 + 人工 |
+| 任务完成率 40% | 五场景 + 多账户/信用卡 + 提前还款 + 订阅来源 + 历史续聊；35 个后端脚本、6 个前端脚本、构建 | 自动化 + 人工 |
 | 安全合规 30% | 操作单 + 版本 CAS + 强验证（密码/TOTP/防重放/锁定/限流）、归属校验、AI 工具白名单、凭据入口拦截、注入字段序列化、备份与主密钥对应 | 自动化（mock）+ 人工话术 |
 | 创新与交互 30% | 自然语言工具调用与结构化结果卡、多卡上下文、账户范围联动、逐笔结余 / 可用额度、确认与强验证交互 | 自动化 + 浏览器人工验收 |
 
@@ -53,7 +64,23 @@
   并恢复会话指针；在开发日志中记录。此后所有实机验证均先确认不会触达真实模型。
 - **结论**：本项目交付轮未调用模型，但**不是全程零调用**。
 
-## 六、未验证事项
+## 六、2026-10-23 修复轮补充（基于 6c63b53 复核）
+
+- **聊天历史**：移除「按闲置 7 天自动删除会话」逻辑；新增 `verify-chat-no-retention.js`（19 项，独立临时库 + mock）：
+  A/B 用户 8 / 30 天未活跃会话在读取当前、列表、新建、打开后内容不变；仅显式导航更新指针；
+  重建实例仍可读取；后续聊天包含保留窗口内既有内容；纯列表 / 打开 0 次模型调用；8 轮裁剪与工具配对完整。
+  `verify-chat-persistence.js` 中旧的「7 天清理」断言同步改为「不清理」。
+- **转账风险升级**：确认时越过 ¥1000 的升级在同一事务、同一状态 CAS 中同时写 `status='needs_verification'` 与
+  `risk_level='red'`；新增 `verify-transfer-risk-upgrade.js`（25 项）：两张 600 元单升级、GET / 助手工具读 red、
+  强验证只扣一次且保持 red、重复确认幂等、1000 黄色 / 1000.01 红色、两个付款账户合并累计、上海跨日重置、
+  审计仅业务元数据。
+- **卡片余额脚本**：`verify-card-balance.mjs` 拆为纯逻辑 + 可选 HTTP 集成（`--base` / `VERIFY_BASE_URL`）；
+  未指定时明确显示「未执行」，指定后连接失败记 FAIL；新增 `verify-card-balance-http.mjs` 用独立临时本地服务
+  验证旧 / 新接口夹具与负向用例，不依赖已停止的隔离环境。
+- **已知数据瑕疵（记录，未修复）**：新增借记账户样例中有一笔历史瞬时负结余 −¥41.02；属模拟生成器缺陷，
+  最终余额正常，不影响业务逻辑。本轮不改开发库与生成器；后续整改须单独验证生成器。
+
+## 七、未验证事项
 
 - 真实模型对 Prompt 注入话术的系统性抵抗能力（只做了人工话术与程序边界验证）。
 - 全新物理电脑 / 其他操作系统（本轮只做了“本机独立目录干净源码复现”，见交付报告）。

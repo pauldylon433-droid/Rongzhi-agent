@@ -3,7 +3,9 @@
 import { randomUUID } from 'node:crypto'
 import { shanghaiNowParts, shanghaiDayRange } from '../lib/shanghai.js'
 
-export const DAILY_TRANSFER_LIMIT_CENTS = 100000 // 日累计成功转账上限：¥1000
+// 日累计转账强验证分级阈值（¥1000）：当日已成功转账 + 本次金额不超过该值为黄色界面确认，
+// 超过则升级为红色强验证（交易密码 + TOTP）。这是风险分级阈值，不是业务金额上限，规则不变。
+export const DAILY_TRANSFER_LIMIT_CENTS = 100000
 export const TRANSFER_EXPIRY_MS = 5 * 60 * 1000     // 待确认有效期：5 分钟
 export const MAX_REMARK_LEN = 200
 
@@ -252,10 +254,25 @@ export function confirmTransfer(db, userId, refNo, now = new Date()) {
     if (row.status === 'completed') return { outcome: 'completed', op: viewTransfer(db, row) }
     if (row.status !== 'pending') return { outcome: row.status, op: viewTransfer(db, row) }
 
-    // 创建后可能又有转账成功，确认时重新判断当日累计（仍过线则转红，进入强验证）
+    // 创建后可能又有转账成功，确认时重新判断当日累计（仍过线则转红，进入强验证）。
+    // 状态与风险等级在同一事务、同一 CAS 条件（status='pending'）下一起写入，
+    // 返回视图 / 后续 GET / 助手状态查询 / 最终回执均读取同一份权威字段。
     const todayCum = todayCompletedTransferCents(db, userId, now)
     if (todayCum + row.amount_cents > DAILY_TRANSFER_LIMIT_CENTS) {
-      db.prepare("UPDATE transfer_operations SET status = 'needs_verification' WHERE id = ? AND status = 'pending'").run(row.id)
+      const upgrade = db
+        .prepare("UPDATE transfer_operations SET status = 'needs_verification', risk_level = 'red' WHERE id = ? AND status = 'pending'")
+        .run(row.id)
+      if (upgrade.changes === 1) {
+        // 仅记录业务元数据（金额 / 当日累计 / 阈值），不含任何凭据或验证码。
+        db.prepare(
+          `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
+           VALUES (?, 'transfer', ?, 'risk_upgrade', 'needs_verification', ?)`,
+        ).run(userId, row.ref_no, JSON.stringify({
+          amount_cents: row.amount_cents,
+          today_completed_cents: todayCum,
+          limit_cents: DAILY_TRANSFER_LIMIT_CENTS,
+        }))
+      }
       return { outcome: 'needs_verification', op: viewTransfer(db, getById(db, row.id)) }
     }
 

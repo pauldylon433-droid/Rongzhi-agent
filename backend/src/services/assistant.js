@@ -36,7 +36,6 @@ export const MAX_TURNS = 8 // 会话保留最近 8 轮对话
 export const MAX_USER_MESSAGE_LEN = 2000 // 消息长度上限（字符）
 const REPLY_MAX_TOKENS = 1024 // 助手回复额度
 const CHAT_MAX_MESSAGES_PER_SESSION = 200 // 单会话可见消息上限（约 100 轮，防无限增长）
-const CHAT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000 // 会话保留期：7 天（懒清理，过期即删）
 
 // 工具白名单（模型可见的 function schema）
 const TOOL_DEFS = [
@@ -1205,18 +1204,8 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions }) {
     return s
   }
 
-  // 懒清理：删除超过保留期的会话与其可见消息（不影响任何业务数据；先在 getCurrent 与新建会话时触发）
-  function purgeExpiredSessions() {
-    const cutoff = Date.now() - CHAT_RETENTION_MS
-    const ids = db.prepare('SELECT id FROM chat_sessions WHERE last_active_at < ?').all(cutoff).map((r) => r.id)
-    if (ids.length === 0) return
-    db.transaction(() => {
-      for (const id of ids) {
-        db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id)
-        db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(id)
-      }
-    })()
-  }
+  // 不按闲置时长删除会话：历史列表与打开均不清理历史；
+  // 仅保留单会话可见消息 200 条上限与模型上下文最近 8 轮窗口（见 MAX_TURNS / CHAT_MAX_MESSAGES_PER_SESSION）。
 
   // 当前会话指针（单用户演示：服务端「当前对话」，刷新据此恢复）
   function setCurrentSession(sessionId) {
@@ -1331,7 +1320,6 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions }) {
     const pointerAtStart = currentSessionId() // 记录请求开始时当前会话指针，用于持久化时判断是否仍为当前
     let session = getSession(sessionId)
     if (!session) {
-      purgeExpiredSessions() // 新建会话时顺带清理超期会话，控制保留规模
       session = {
         id: randomUUID(),
         userId: demoUserId,
@@ -1431,18 +1419,16 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions }) {
     return { sessionId, messages: readVisibleMessages(sessionId) }
   }
 
-  // 读取当前对话（只读恢复）：不调用模型、不重发消息、不修改任何数据。
+  // 读取当前对话（只读恢复）：不调用模型、不重发消息、不修改任何数据（也不清理历史）。
   function getCurrent() {
-    purgeExpiredSessions()
     const state = db.prepare('SELECT current_session_id FROM chat_state WHERE user_id = ?').get(demoUserId)
     const sessionId = state && state.current_session_id ? state.current_session_id : null
     if (!sessionId) return { sessionId: null, messages: [] }
     return conversationView(sessionId)
   }
 
-  // 会话历史列表（只读）：按最近活跃倒序返回当前用户全部会话，标题取首条用户消息。
+  // 会话历史列表（只读）：按最近活跃倒序返回当前用户全部会话，标题取首条用户消息；不清理历史。
   function listConversations() {
-    purgeExpiredSessions()
     const rows = db
       .prepare('SELECT id, last_active_at FROM chat_sessions WHERE user_id = ? ORDER BY last_active_at DESC, created_at DESC')
       .all(demoUserId)

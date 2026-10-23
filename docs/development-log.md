@@ -1195,7 +1195,7 @@ Microsoft Authenticator）扫码，验证器名「融智 Agent」、账户为演
    `verify-subscription-operations`(84) / `verify-agent-tasks`(70)。
 4. 前端 `npm ci`：79 packages，0 漏洞；`node scripts/verify-markdown.mjs` 32/32 通过；`npm run build` 通过（69 模块，
    dist js 262.66 kB）。
-5. 后端启动冒烟：`PORT=3999` + 副本已初始化库 `node src/index.js` → `GET /api/health` 200、`GET /api/accounts` 200，
+5. 后端启动冒烟：PowerShell `$env:PORT='3999'` + 副本已初始化库 `node src\index.js` → `GET /api/health` 200、`GET /api/accounts` 200，
    演示用户「张三」；进程与临时库已清理，未触碰 3000 / 5174 与开发库。
 
 ### 四、验证中确认的关键事实
@@ -2531,7 +2531,7 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 
 ### 三、服务与验收
 
-- 3000 受控停止旧进程（PID 12120）后以新代码启动：`PORT=3000 DB_PATH=<绝对路径> DEEPSEEK_MODEL=deepseek-flash`，
+- 3000 受控停止旧进程（PID 12120）后以新代码启动（PowerShell）：`$env:PORT='3000'; $env:DB_PATH='<绝对路径>'; $env:DEEPSEEK_MODEL='deepseek-flash'`，
   仅一个实例；使用开发库自己的 `.verification-key`，未使用隔离测试密钥 / 端点。
 - 5174 前端未重启（Vite HMR 已加载新代码），代理到 3000 返回 3 张卡。
 - 只读核对全部通过（19 项数据断言 + API 断言）：原账户余额 / 流水 / 订阅 / 操作单 / 会话 / 任务 / 绑定与基线一致；
@@ -2787,7 +2787,7 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 
 ### 二、最终自动验证（实际执行）
 
-- 后端 `verify-*.js` **36 个脚本全部通过**；前端 `verify-*.mjs` **6 个脚本全部通过**；`npm run build` 通过。
+- 后端 `verify-*.js` **35 个脚本全部通过**（此前报告误写为 36，已按源码包实际脚本名更正）；前端 `verify-*.mjs` **6 个脚本全部通过**；`npm run build` 通过。
 - 修正 3 个与既有实现漂移的测试（非业务缺陷）：
   - `verify-add-existing-user-cards.js` 改为使用独立种子临时库（开发库已含多卡，旧“加卡前不存在”前提不再成立）；
   - `verify-transfer-receipt*.js` 改为解析新的单行 JSON 权威回执（字段断言，而非旧自由文本）；
@@ -2820,3 +2820,46 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 ### 五、范围
 
 本轮未新增业务功能、未修改页面、未改动开发库数据、未调用模型、未推送 Git；3000 / 5174 保持可用。
+
+---
+
+## 第五十三阶段：源码复核缺陷修复（聊天保留 / 转账风险升级 / 文档与脚本）
+
+### 一、聊天历史不再按闲置时长删除
+
+- `assistant.js` 移除 `CHAT_RETENTION_MS`、`purgeExpiredSessions` 及其在新建会话、`GET current`、历史列表中的调用；
+  读取 / 列表 / 新建 / 打开旧会话均不删除历史。
+- 保留模型上下文最近 **8 轮** 与单会话可见消息 **200 条** 上限（README / 安全设计已明确说明“不提供无限记忆”）。
+- 新增 `scripts/verify-chat-no-retention.js`（19 项，独立临时库 + mock）：A/B 用户 8 / 30 天未活跃会话内容不变、
+  只有显式导航更新指针、重建实例可读、后续聊天包含窗口内既有内容、纯列表 / 打开 0 次模型调用、
+  8 轮裁剪与工具配对完整。`verify-chat-persistence.js` 的旧“7 天清理”断言同步改为“不清理”。
+
+### 二、转账确认时风险升级写入 red
+
+- `confirmTransfer` 越过 ¥1000 时在同一事务、同一 `status='pending'` CAS 更新中同时写
+  `status='needs_verification'` 与 `risk_level='red'`，并写入 `risk_upgrade` 审计（仅金额 / 当日累计 / 阈值）。
+- 返回视图 / GET / 助手 `get_transfer_status` / 最终回执读取同一份权威字段；1000 元阈值规则不变，
+  注释由“上限”改为“强验证分级阈值”。
+- 新增 `scripts/verify-transfer-risk-upgrade.js`（25 项）：两张 600 元单升级、GET 与工具读 red、
+  强验证只扣一次且保持 red、重复确认幂等、1000 黄色 / 1000.01 红色、双付款账户合并累计、上海跨日重置。
+
+### 三、文档与验证脚本同步
+
+- 脚本计数更正：源码包实际 **35 个** `verify-*.js`（此前报告误写 36），清单见 `docs/validation-record.md`。
+- README：分类占比为本地 **SVG 环形图**；补充聊天保留 / 模型窗口、生成器瑕疵（−¥41.02，仅记录未修复）、
+  独立目录绑定方法、隔离前端 `ISOLATED_BACKEND`；文档中的 Bash 赋值改为 Windows PowerShell。
+- `security-design.md`：工具白名单按实际 **17 个** 列出；补充无代码执行沙箱、受限模板 DAG、
+  事务回滚与已完成业务撤销的区别、页面按账户统计与 AI 月度工具全账户的差异、模型默认 `deepseek-flash`。
+- `config.js` 默认模型与 `.env.example` 统一为 `deepseek-flash`（部署原为进程覆盖；未读取 / 修改真实 `.env`）。
+- `verify-card-balance.mjs` 拆分为纯逻辑 + 可选 HTTP 集成（未指定明确显示未执行；连接失败记 FAIL）；
+  新增 `verify-card-balance-http.mjs`，用独立临时本地服务验证原 HTTP 检查与负向用例，不依赖已停止的隔离环境。
+
+### 四、验证与部署
+
+- 定向回归（实际执行，全部 exit=0）：`verify-transfers`、`verify-strong-verification`、`verify-chat-history`、
+  `verify-chat-persistence`、`verify-assistant-session`、`verify-assistant`、`verify-transfer-receipt`、
+  `verify-transfer-receipt-edge`、`verify-security-boundaries`，以及新增的 `verify-chat-no-retention`、
+  `verify-transfer-risk-upgrade`、前端 `verify-card-balance` / `verify-card-balance-http`。
+- 前端应用源码未改，本轮未重新执行 `npm run build`（构建证据沿用上一轮）。
+- 3000 受控重启为单实例（新 PID 44820），使用 `deepseek-flash`；5174 未动；隔离环境保持停止。
+- 未调用模型；未在开发库执行交易 / 还款 / 冻结 / 订阅操作；未推送 Git。

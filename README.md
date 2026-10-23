@@ -31,8 +31,8 @@
 | 助手文本渲染 | markdown-it + DOMPurify（严格白名单净化） |
 | 大模型 | DeepSeek（可选，仅自然语言助手使用） |
 
-> 图表库（ECharts 等）**未使用**：月度账单分析以「统计卡片 + 分类表格」呈现，不依赖图表库，
-> 亦非部署前置条件，请勿将其列为缺项。
+> 图表库（ECharts 等）**未使用**：月度账单分析以「统计卡片 + 分类表格 + 本地 SVG 环形图」呈现
+> （分类占比由 `CategoryPieChart.vue` 用原生 SVG 绘制），不依赖第三方图表库，亦非部署前置条件，请勿将其列为缺项。
 
 ## 目录结构
 
@@ -72,7 +72,9 @@ rongzhi-agent/
 - **信用卡还款**：支持「指定已出账账单全额」与「结清全部已入账欠款」（含未出账已入账消费，待入账占用不计入）；
   金额由服务端计算，提前还款保留冲抵明细，出账后不重复计债；均需交易密码 + TOTP 强验证。
 - **强验证**：交易密码（scrypt）+ 手机验证器 TOTP（RFC 6238，AES-256-GCM 加密存储），跨业务防重放、失败锁定（5 次锁 15 分钟）。
-- **聊天持久化**：会话与消息落库，刷新 / 后端重启后可经只读接口恢复。
+- **聊天持久化**：会话与消息落库，刷新 / 后端重启后可经只读接口恢复；**不按闲置时长自动删除**。
+  为避免模型请求无限增长，模型上下文仅保留最近 **8 轮**，单会话可见消息最多 **200 条**（更早消息不进入模型，
+  但仍保存在数据库中可查看）。本项目**不提供无限记忆**，也不为保存无限上下文扩大模型请求成本。
 
 ## 模拟边界与未实现项
 
@@ -89,6 +91,9 @@ rongzhi-agent/
   模型输入采用 JSON 序列化与长度限制，并拦截明确标注的凭据消息，但**不构成完整的 Prompt 注入防御**；
   真实模型抗注入行为未经系统验证。
 - **公网部署 / 合规**：仅限本地演示；未做公网部署、TLS、等保 / 合规认证，不声称「完整银行系统」。
+- **演示数据生成器缺陷（记录，未修复）**：新增借记账户的模拟样例中存在一笔历史瞬时负结余 **−¥41.02**
+  （最终余额正常、不影响业务逻辑）。属模拟生成器的数据瑕疵；为避免扩大范围，本轮未修改生成器或开发库，
+  后续如整改须单独验证生成器，不得伪造透支规则或用原卡流水充数。
 - **浏览器可视验收**：开发环境为命令行，前端交互未做浏览器自动化验收（已做构建 + Node 级验证 + 只读接口检查，
   页面流程由用户人工验收，见 `docs/validation-record.md`）。
 
@@ -126,7 +131,7 @@ Copy-Item .env.example .env
 # 编辑 backend/.env，填入真实密钥：
 #   DEEPSEEK_API_KEY=你的真实密钥
 #   DEEPSEEK_BASE_URL=https://api.deepseek.com
-#   DEEPSEEK_MODEL=deepseek-v4-pro
+#   DEEPSEEK_MODEL=deepseek-flash
 ```
 
 > `.env`、`.verification-key`、数据库文件与备份目录均已加入 `.gitignore`，不会进入 Git 或源码包。
@@ -169,6 +174,11 @@ node scripts/bind-verification.js
 （名称「融智 Agent」）→ 输入当前 6 位动态码。成功后绑定启用；已绑定拒绝覆盖，不提供快捷重置。
 绑定过程会创建 / 复用加密主密钥 `backend/data/.verification-key`（不入 Git，见「备份与恢复」）。
 
+**独立目录 / 新环境首次绑定**：在目标源码目录内执行上面的命令即可——它会为该目录的
+`backend/data/rongzhi.db` 生成**独立**的 `.verification-key` 并绑定验证器，不复用开发环境的主密钥或绑定。
+该密钥与数据库必须成套备份；换环境后如需重新绑定，须由用户本人再次运行脚本（本项目不自动重建绑定）。
+自动化测试中的强验证使用独立临时库与临时密钥，不触碰 `.verification-key`。
+
 ### 7. 启动后端（端口 3000）
 
 ```powershell
@@ -207,6 +217,7 @@ node scripts/verify-analytics.js
 node scripts/verify-migrate.js
 node scripts/verify-fix.js
 node scripts/verify-transfers.js
+node scripts/verify-transfer-risk-upgrade.js
 node scripts/verify-multi-account.js
 node scripts/verify-running-balance.js
 node scripts/verify-assistant.js
@@ -219,6 +230,7 @@ node scripts/verify-verify-message-uniform.js
 node scripts/verify-bind-interaction.js
 node scripts/verify-card-operations.js
 node scripts/verify-chat-persistence.js
+node scripts/verify-chat-no-retention.js
 node scripts/verify-subscription-operations.js
 node scripts/verify-subscription-source-change.js
 node scripts/verify-agent-tasks.js
@@ -233,6 +245,7 @@ node scripts/verify-demo-seed.js
 cd ../frontend
 node scripts/verify-markdown.mjs
 node scripts/verify-card-balance.mjs
+node scripts/verify-card-balance-http.mjs
 node scripts/verify-business-events.mjs
 node scripts/verify-activity.mjs
 npm run build
@@ -270,6 +283,24 @@ node scripts/acceptance-totp.js                 # 隔离验收环境：本机生
 
 > 隔离前端用 `frontend/vite.config.isolated.js`（端口 5180，`/api` 代理到隔离后端，页面带红色隔离横幅）。
 > 上述脚本均与开发库 / 3000 / 5174 完全分离，详见 `docs/development-log.md`「第四十二阶段」。
+>
+> **隔离环境启动（Windows PowerShell；示例端口 4100 / 5180，按实际空闲端口调整）**：
+>
+> ```powershell
+> cd C:\Users\HUAWEI123\Desktop\rongzhi-agent\backend
+> $env:PORT='4100'
+> $env:DB_PATH='<setup-isolated-env.js 打印的隔离库绝对路径>'
+> $env:VERIFICATION_KEY='<setup-isolated-env.js 打印的测试密钥>'
+> $env:DEEPSEEK_MODEL='deepseek-flash'
+> node src\index.js
+>
+> # 另一个 PowerShell 窗口
+> cd C:\Users\HUAWEI123\Desktop\rongzhi-agent\frontend
+> $env:ISOLATED_BACKEND='http://localhost:4100'
+> npx vite --config vite.config.isolated.js --port 5180 --strictPort
+> ```
+>
+> `ISOLATED_BACKEND` 仅在启动隔离前端时设置，用于指定 `/api` 代理目标；不设置时使用配置文件内的默认地址。
 >
 > **多卡接入（现有用户）**：`add-existing-user-cards.js` 为「已有张三」的库增量新增第二张借记卡 + 信用卡
 > （只 INSERT，不改原账户余额 / 历史 / 会话 / 操作单 / 验证绑定），默认 `--preview` 只预览、`--apply` 才写入，

@@ -104,14 +104,16 @@
 
 ## 七、AI 助手安全边界
 
-- AI 助手工具白名单共 12 个：`get_accounts`、`get_monthly_analytics`、`search_transfer_recipients`、
-  `prepare_transfer`、`get_transfer_status`，银行卡相关的 `get_cards`、`prepare_card_operation`、
-  `get_card_operation_status`，订阅相关的 `get_subscriptions`、`prepare_subscription_operation`、
-  `get_subscription_operation_status`，以及跨场景任务相关的 `start_subscription_review`。其中
-  `prepare_transfer` / `prepare_card_operation` /
-  `prepare_subscription_operation` 只能生成「待确认单」（写入 transfer_operations / card_operations /
-  subscription_operations 草稿），**绝不扣款、绝不改卡片或订阅状态**；执行必须由用户在界面
-  点击确认（冻结 / 暂停 / 取消）或强验证（解冻 / 恢复），调用现有确认 / 验证接口执行。
+- AI 助手工具白名单共 **17 个**（与源码 `TOOL_DEFS` 一致）：
+  - 账户 / 分析：`get_accounts`、`get_monthly_analytics`
+  - 转账：`search_transfer_recipients`、`list_transfer_recipients`、`prepare_transfer`、`get_transfer_status`
+  - 银行卡：`get_cards`、`prepare_card_operation`、`get_card_operation_status`
+  - 订阅 / 跨场景：`get_subscriptions`、`prepare_subscription_operation`、`get_subscription_operation_status`、
+    `start_subscription_review`
+  - 信用卡：`get_credit_accounts`、`get_statement`、`prepare_repayment`、`get_repayment_status`
+  其中 `prepare_transfer` / `prepare_card_operation` / `prepare_subscription_operation` / `prepare_repayment`
+  只能生成「待确认单」，**绝不扣款、绝不改卡片 / 订阅 / 扣款来源**；执行必须由用户在界面
+  点击确认或强验证后，调用现有确认 / 验证接口完成。
 - **不开放任何扣款 / 执行 / 强验证工具**（如 `confirm_transfer`、`confirm_card_operation`、`verify_card_operation`、
   `confirm_subscription_operation`、`verify_subscription_operation`）；模型请求确认、改余额、改卡片 / 订阅状态、写库等
   一律被拒。「确认」「我同意」「跳过验证」等聊天文字不会触发扣款、冻结 / 解冻或订阅暂停 / 恢复 / 取消。
@@ -130,6 +132,30 @@
 - 订阅操作同样：多个订阅匹配或指向不明确时先澄清，不擅自选第一项；已取消订阅不可再操作，恢复需强验证，
   暂停 / 取消为普通确认。用户仅回复「确认」等文字不触发订阅状态变更，须在确认卡上明确操作。
 - 模型不能通过工具写库、传 `user_id`、SQL、文件路径、URL；未知工具 / 额外参数 / 非法参数均被拒。
+
+### 聊天历史保留与模型上下文
+
+- **不按闲置时长删除**：会话与消息不会因 7 天（或其它闲置时长）未活跃而被清理；
+  `GET /api/assistant/current`、历史列表、新建会话、打开旧会话都不删除历史。
+- **模型上下文有上限**：仅保留最近 **8 轮**（按轮裁剪，工具调用与结果配对完整保留）；
+  单会话可见消息最多 **200 条**（超出时删除最旧的可见消息）。更早消息不进入模型，但仍保存在数据库中可查看。
+- **不提供无限记忆**：不以扩大模型上下文的方式换取“记住更多”，也不承诺无限上下文。
+
+### 能力边界与已知限制（如实说明）
+
+- **无代码执行沙箱**：模型不执行任何代码、SQL、URL 或文件操作；工具是服务端固定白名单函数，
+  参数经类型 / 枚举 / 归属校验。这里的“AI 边界”是工具面与执行面的限制，不是通用代码沙箱。
+- **受限模板 DAG**：跨场景仅「订阅审查」一条固定 7 节点模板，由服务端构建与校验；
+  不是通用工作流引擎，也不执行模型生成的步骤。
+- **事务回滚 ≠ 撤销已完成业务**：确认过程中的异常会使同一事务整体回滚（不产生半完成状态）；
+  但已完成的操作（扣款 / 入账 / 冲抵）是业务事实，系统不提供“回滚已完成操作”的能力；
+  取消只适用于尚未执行的 pending / needs_verification 单据，属于状态变更，不是撤销已发生的资金变动。
+- **统计口径差异**：页面月度分析按当前所选账户过滤；AI 的 `get_monthly_analytics` 当前返回**全账户**合计，
+  不接收账户参数。两者不能混用，本轮不新增工具能力。
+- **模型配置**：源码默认模型为 `deepseek-flash`（与 `.env.example` 一致）；运行中可由环境变量覆盖。
+  部署时曾以进程覆盖为 `deepseek-flash`（源码原默认 `deepseek-v4-pro`），本次已统一为 flash，避免误用高费用模型。
+- **无系统级模型对抗保证**：提示约束、输入 JSON 序列化与“明确标注凭据”的入口拦截属于纵深防御，
+  不等于完整 Prompt 注入防御；真实模型的对抗行为未经系统验证。
 
 ### 跨场景任务安全边界（订阅审查单链）
 
