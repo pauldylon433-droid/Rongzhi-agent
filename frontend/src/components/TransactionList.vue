@@ -10,7 +10,18 @@ import CategoryBadge from './CategoryBadge.vue'
 import AccountScopeSelect from './AccountScopeSelect.vue'
 
 // 全局账户范围（含「全部账户」）驱动流水过滤；与银行卡页选卡共用同一状态
-const { selectedAccountId } = useCardSelection()
+const { selectedAccountId, selectedAccountType } = useCardSelection()
+
+// 结余列口径：具体借记账户 = 结余；具体信用账户 = 交易后可用额度；全部账户 = 两者并列
+const balanceHeader = computed(() => {
+  if (selectedAccountType.value === 'credit') return '交易后可用额度（元）'
+  if (selectedAccountType.value === 'deposit') return '结余（元）'
+  return '结余／可用额度（元）'
+})
+const showBalanceLegend = computed(
+  () => !selectedAccountType.value && rows.value.some((r) => r.balance_kind === 'credit' && r.balance_state === 'value'),
+)
+const hasUntraceable = computed(() => rows.value.some((r) => r.balance_state === 'untraceable'))
 
 const PAGE_SIZE = 10
 
@@ -172,41 +183,55 @@ watch(selectedAccountId, () => {
           <button class="btn-ghost" @click="load">重试</button>
         </div>
         <p v-else-if="rows.length === 0" class="state-empty">当前筛选条件下暂无交易记录</p>
-        <div v-else class="tx-table-wrap">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>交易描述</th>
-                <th>分类</th>
-                <th>状态</th>
-                <th class="num">金额</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="t in rows" :key="t.id">
-                <td class="tx-time">{{ formatShanghaiDateTime(t.transaction_at) }}</td>
-                <td>
-                  <div class="tx-desc-cell">
-                    <span class="tx-merchant">
-                      <span v-if="t.flow_kind === 'repayment'" class="repay-tag">还款</span>{{ t.merchant || '—' }}
+        <template v-else>
+          <p v-if="showBalanceLegend" class="balance-note">现金行为借记账户结余；标「额度」的行为信用卡交易后可用额度。</p>
+          <p v-if="hasUntraceable" class="balance-note">部分历史交易的结余暂不可追溯，已显示「—」。</p>
+          <div class="tx-table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>交易描述</th>
+                  <th>分类</th>
+                  <th>状态</th>
+                  <th class="num">金额</th>
+                  <th class="num">{{ balanceHeader }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="t in rows" :key="t.id">
+                  <td class="tx-time">{{ formatShanghaiDateTime(t.transaction_at) }}</td>
+                  <td>
+                    <div class="tx-desc-cell">
+                      <span class="tx-merchant">
+                        <span v-if="t.flow_kind === 'repayment'" class="repay-tag">还款</span>{{ t.merchant || '—' }}
+                      </span>
+                      <span v-if="t.description" class="tx-sub">{{ t.description }}</span>
+                    </div>
+                  </td>
+                  <td><span class="cat-inline"><CategoryBadge :category="t.category" /><span>{{ t.category }}</span></span></td>
+                  <td>
+                    <span class="status-badge" :class="statusTone(t.status)">
+                      {{ statusText[t.status] || '未知状态' }}
                     </span>
-                    <span v-if="t.description" class="tx-sub">{{ t.description }}</span>
-                  </div>
-                </td>
-                <td><span class="cat-inline"><CategoryBadge :category="t.category" /><span>{{ t.category }}</span></span></td>
-                <td>
-                  <span class="status-badge" :class="statusTone(t.status)">
-                    {{ statusText[t.status] || '未知状态' }}
-                  </span>
-                </td>
-                <td class="num tx-amount" :class="t.direction === 'income' ? 'is-income' : 'is-expense'">
-                  {{ amountPrefix(t.direction) }}{{ formatCentsToYuan(t.amount_cents) }}
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+                  </td>
+                  <td class="num tx-amount" :class="t.direction === 'income' ? 'is-income' : 'is-expense'">
+                    {{ amountPrefix(t.direction) }}{{ formatCentsToYuan(t.amount_cents) }}
+                  </td>
+                  <td class="num tx-balance">
+                    <template v-if="t.balance_state === 'value'">
+                      {{ formatCentsToYuan(t.balance_after_cents) }}<span
+                        v-if="t.balance_kind === 'credit' && !selectedAccountType"
+                        class="balance-tag"
+                      >额度</span>
+                    </template>
+                    <template v-else>—</template>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -276,6 +301,26 @@ watch(selectedAccountId, () => {
 .tx-amount {
   font-weight: 600;
   white-space: nowrap;
+}
+.tx-balance {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.balance-tag {
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #ede9fe;
+  color: #6d28d9;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+.balance-note {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--muted);
 }
 .pager {
   display: flex;

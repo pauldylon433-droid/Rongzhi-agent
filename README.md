@@ -192,6 +192,7 @@ node scripts/verify-migrate.js
 node scripts/verify-fix.js
 node scripts/verify-transfers.js
 node scripts/verify-multi-account.js
+node scripts/verify-running-balance.js
 node scripts/verify-assistant.js
 node scripts/verify-assistant-session.js
 node scripts/verify-assistant-transfer.js

@@ -152,10 +152,11 @@ function dismiss() {
     />
 
     <template v-if="!loading && !error && data && data.length">
-      <!-- 借记卡 -->
-      <div v-if="debitCards.length" class="card-section">
-        <h3 class="card-section-title">借记卡</h3>
+      <!-- 借记卡 + 信用卡摘要：同一响应式网格，桌面足够宽时并排 -->
+      <div class="card-section">
+        <h3 class="card-section-title">银行卡</h3>
         <div class="card-grid">
+          <!-- 借记卡 -->
           <div v-for="c in debitCards" :key="c.id" class="bank-card">
             <div class="bank-card-head">
               <span class="bank-card-type">{{ cardTypeLabel(c.card_type) }}</span>
@@ -200,14 +201,9 @@ function dismiss() {
               </button>
             </div>
           </div>
-        </div>
-      </div>
 
-      <!-- 信用卡 -->
-      <div v-if="creditCards.length" class="card-section">
-        <h3 class="card-section-title">信用卡</h3>
-        <div v-for="c in creditCards" :key="c.id" class="credit-card-block">
-          <div class="bank-card is-credit">
+          <!-- 信用卡摘要（与借记卡同尺寸；详情在下方独立区域） -->
+          <div v-for="c in creditCards" :key="c.id" class="bank-card is-credit">
             <div class="bank-card-head">
               <span class="bank-card-type">{{ cardTypeLabel(c.card_type) }}</span>
               <span class="status-badge" :class="statusTone(c.status)">{{ statusText[c.status] || '未知状态' }}</span>
@@ -241,8 +237,13 @@ function dismiss() {
               </button>
             </div>
           </div>
+        </div>
+      </div>
 
-          <!-- 信用额度 / 账单 / 还款详情（不含「存款余额」） -->
+      <!-- 信用卡详情：额度明细 / 账单 / 还款，独立区域、不压缩摘要 -->
+      <div v-if="creditCards.length" class="card-section credit-details">
+        <h3 class="card-section-title">信用卡详情</h3>
+        <div v-for="c in creditCards" :key="c.id" class="credit-detail-block">
           <CreditCardDetail :card="c" />
         </div>
       </div>
@@ -298,7 +299,9 @@ function dismiss() {
 }
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  /* 单卡约 280–320px；桌面足够宽时三张并排，窄屏自动换行 */
+  grid-template-columns: repeat(auto-fit, minmax(280px, 320px));
+  justify-content: start;
   gap: 16px;
 }
 .bank-card {
@@ -308,6 +311,7 @@ function dismiss() {
   color: #fff;
   display: flex;
   flex-direction: column;
+  height: 100%;
 }
 .bank-card.is-credit {
   background: linear-gradient(135deg, #1e1b4b 0%, #4c1d95 100%);
@@ -359,7 +363,8 @@ function dismiss() {
   color: #fca5a5;
 }
 .bank-card-actions {
-  margin-top: 14px;
+  margin-top: auto; /* 同排卡片按钮底部对齐 */
+  padding-top: 14px;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
@@ -397,13 +402,13 @@ function dismiss() {
   background: #16a34a;
   border-color: #16a34a;
 }
-.credit-card-block {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.credit-details {
+  margin-top: 4px;
+}
+.credit-detail-block {
   margin-bottom: 20px;
 }
-.credit-card-block:last-child {
+.credit-detail-block:last-child {
   margin-bottom: 0;
 }
 .op-error {
