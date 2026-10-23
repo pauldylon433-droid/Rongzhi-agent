@@ -13,7 +13,7 @@ import CategoryPieChart from './CategoryPieChart.vue'
 import AccountScopeSelect from './AccountScopeSelect.vue'
 
 // 全局账户范围（含「全部账户」）驱动月度分析；与交易流水、银行卡页共用同一状态
-const { selectedAccountId } = useCardSelection()
+const { selectedAccountId, selectedAccountType } = useCardSelection()
 
 // 月份筛选范围（开户月份 → 当前月份），与交易流水复用同一套生成逻辑。
 // 本区域只分析具体月份，不提供「全部月份」。
@@ -80,6 +80,10 @@ const isEmpty = computed(() => {
 
 // 已加载成功且非空，才展示两张分析卡（避免月份切换加载中仍显示上一月份旧数据）
 const showAnalysis = computed(() => !!data.value && !loading.value && !error.value && !isEmpty.value)
+
+// 明确选中信用账户时隐藏整个「收入分析」模块（标题 / 分类表 / 饼图 / 空态一并隐藏，不留占位）。
+// 依据全局选择快照中的真实 account_type；「全部账户」或借记账户时保留。
+const showIncomeAnalysis = computed(() => selectedAccountType.value !== 'credit')
 
 const monthLabel = computed(() => (data.value ? data.value.month : ''))
 const asOfText = computed(() => (data.value ? formatShanghaiDateTime(data.value.as_of) : ''))
@@ -181,7 +185,7 @@ function moneyWithSign(cents) {
 
     <!-- 收入 / 支出各自独立卡片，与顶部卡片并列，不嵌套 -->
     <template v-if="showAnalysis">
-      <section class="ana-card">
+      <section v-if="showIncomeAnalysis" class="ana-card">
         <h3 class="ana-title">收入分析</h3>
         <div class="ana-layout">
           <div class="ana-col">
