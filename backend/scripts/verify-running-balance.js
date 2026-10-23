@@ -87,8 +87,8 @@ addTx(u2, O, 'income', 100000, iso('2026-10-04T02:00:00Z'))
 const C = insAccount(u1, '人民币信用卡', 'credit', 0)
 const caId = db.prepare('INSERT INTO credit_accounts (user_id, account_id, credit_limit_cents) VALUES (?, ?, 500000)').run(u1, C).lastInsertRowid
 const cCard = insCard(u1, C, '6259 **** **** 0001', '信用卡')
-function charge(cents, atIso, postedIso = null) {
-  const r = createCreditConsumption(db, u1, { cardId: cCard, amountCents: cents, category: '购物', merchant: '测试商户', transactionAt: atIso })
+function charge(cents, atIso, postedIso = null, cardId = cCard) {
+  const r = createCreditConsumption(db, u1, { cardId, amountCents: cents, category: '购物', merchant: '测试商户', transactionAt: atIso })
   if (postedIso) postCreditConsumption(db, u1, r.transaction_id, { postedAt: new Date(postedIso) })
   return r.transaction_id
 }
@@ -102,6 +102,19 @@ finalizeRepayment(db, u1, repayRow, new Date(iso('2026-10-08T02:00:00Z')))
 const c3 = charge(40000, iso('2026-10-10T05:00:00Z'), iso('2026-10-11T02:00:00Z'))
 const c4 = charge(10000, iso('2026-10-12T05:00:00Z'))
 const repayTx = db.prepare('SELECT id, transaction_at FROM transactions WHERE repayment_ref = ?').get(repayOp.ref_no)
+
+// 信用账户 C2：两笔不同消费在同一时刻发生 → 跨行同时刻，真实先后不可证明
+const C2 = insAccount(u1, '同时刻信用账户', 'credit', 0)
+const ca2 = db.prepare('INSERT INTO credit_accounts (user_id, account_id, credit_limit_cents) VALUES (?, ?, 100000)').run(u1, C2).lastInsertRowid
+const c2Card = insCard(u1, C2, '6259 **** **** 0002', '信用卡')
+const sameA = charge(10000, iso('2026-10-12T06:00:00Z'), null, c2Card)
+const sameB = charge(20000, iso('2026-10-12T06:00:00Z'), null, c2Card)
+
+// 信用账户 C3：同一行「发生 + 入账」同刻（发生必然早于入账，不算歧义）→ 仍可追溯
+const C3 = insAccount(u1, '同刻入账信用账户', 'credit', 0)
+const ca3 = db.prepare('INSERT INTO credit_accounts (user_id, account_id, credit_limit_cents) VALUES (?, ?, 100000)').run(u1, C3).lastInsertRowid
+const c3Card = insCard(u1, C3, '6259 **** **** 0003', '信用卡')
+const samePost = charge(10000, iso('2026-10-13T06:00:00Z'), iso('2026-10-13T06:00:00Z'), c3Card)
 
 // 不可追溯账户：余额与账务不一致
 const X = insAccount(u1, '不可追溯账户', 'deposit', 100000)
@@ -183,6 +196,21 @@ console.log('—— 信用账户：交易后可用额度 ——')
   // 信用账户历史交易后的额度不得等于当前可用额度（除非恰好如此）
   const m2 = byId(get({ accountId: C }).rows)
   check('历史交易后额度不等于当前可用额度', m2.get(c1).balance_after_cents !== 450000)
+}
+
+console.log('—— 同一时刻的证明边界 ——')
+{
+  const m = byId(get({ accountId: C2 }).rows)
+  check('跨行同时刻消费：不可追溯（顺序无证据，不冒充精确值）',
+    m.get(sameA).balance_state === 'untraceable' && m.get(sameB).balance_state === 'untraceable' &&
+    m.get(sameA).balance_after_cents === null && m.get(sameB).balance_after_cents === null)
+  const ca2Row = db.prepare('SELECT posted_outstanding_cents o, pending_occupied_cents p FROM credit_accounts WHERE id = ?').get(ca2)
+  check('其终态仍可校验（状态和与信用账户一致）', ca2Row.o === 0 && ca2Row.p === 30000, JSON.stringify(ca2Row))
+
+  const m3 = byId(get({ accountId: C3 }).rows)
+  check('同一行「发生+入账」同刻：可追溯（入账必然晚于发生）',
+    m3.get(samePost).balance_state === 'value' && m3.get(samePost).balance_after_cents === 90000,
+    String(m3.get(samePost).balance_after_cents))
 }
 
 console.log('—— 全部账户视图：逐笔按所属账户，不跨账户累计 ——')

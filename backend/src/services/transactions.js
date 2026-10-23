@@ -15,6 +15,9 @@ const COLUMNS = `
 //   交易后可用额度 = 信用额度 − 已入账未还 − 待入账占用（截至该事件）。
 //   消费的入账时刻使用 posted_at（与出账/还款口径一致），未入账消费在发生时刻占额。
 //   重放终态必须与 credit_accounts 的当前已入账未还 / 待入账占用一致，否则整账户不可追溯。
+//   注意：「发生 → 入账 → 还款」只是**相同时间戳下的事件排序约定**，不是业务保证——
+//   数据库没有记录事件序号，同一毫秒内跨行事件的真实先后无法从数据中证明。
+//   因此检测到同一时刻跨行事件时，该时刻及其之后的显示值一律视为不可追溯（不冒充精确快照）。
 // - 每个账户独立计算，绝不跨账户累计。数据库原始数据不改写。
 
 function signedCents(direction, cents) {
@@ -97,23 +100,41 @@ function creditBalanceInfo(db, userId, accountId) {
     if (!Number.isFinite(t)) return null
     events.push({ t, rank: 2, id: p.id, type: 'repay', amount: p.amount_cents })
   }
-  // 同一时刻：发生(0) → 入账(1) → 还款(2)，再按 id 稳定排序
+  // 同一时刻：发生(0) → 入账(1) → 还款(2)，再按 id 稳定排序（仅用于重放终态校验的确定性遍历）
   events.sort((a, b) => a.t - b.t || a.rank - b.rank || a.id - b.id)
+
+  // 同一时刻跨行事件：数据库未保存事件序号，真实先后不可证明 → 从该时刻起的显示值不可追溯。
+  // 同一行自身的「发生 / 入账」同刻不算歧义（入账必然晚于发生）。
+  let earliestAmbiguous = Infinity
+  for (let i = 0; i < events.length;) {
+    let j = i
+    const ids = new Set()
+    while (j < events.length && events[j].t === events[i].t) {
+      ids.add(events[j].id)
+      j += 1
+    }
+    if (ids.size > 1) earliestAmbiguous = Math.min(earliestAmbiguous, events[i].t)
+    i = j
+  }
 
   let posted = 0
   let pending = 0
   const map = new Map()
   const available = () => ca.credit_limit_cents - posted - pending
+  const record = (ev, value) => {
+    if (ev.t >= earliestAmbiguous) return // 无法证明顺序：不给精确值
+    map.set(ev.row.id, value)
+  }
   for (const ev of events) {
     if (ev.type === 'create') {
       pending += ev.amount
       if (pending < 0) return null
-      if (ev.row.status === 'pending') map.set(ev.row.id, available())
+      if (ev.row.status === 'pending') record(ev, available())
     } else if (ev.type === 'post') {
       pending -= ev.amount
       posted += ev.amount
       if (pending < 0) return null
-      if (ev.row.status === 'posted') map.set(ev.row.id, available())
+      if (ev.row.status === 'posted') record(ev, available())
     } else {
       posted -= ev.amount
       if (posted < 0) return null
