@@ -66,6 +66,10 @@
 
 ## 六、2026-10-23 修复轮补充（基于 6c63b53 复核）
 
+> 本轮新增 2 个后端脚本（`verify-chat-no-retention`、`verify-transfer-risk-upgrade`）与 1 个前端脚本
+> （`verify-card-balance-http`）。当前源码共 **37 个** `backend/scripts/verify-*.js`、**7 个**
+> `frontend/scripts/verify-*.mjs`；第二节的 35 个是修复轮之前执行时的清单。
+
 - **聊天历史**：移除「按闲置 7 天自动删除会话」逻辑；新增 `verify-chat-no-retention.js`（19 项，独立临时库 + mock）：
   A/B 用户 8 / 30 天未活跃会话在读取当前、列表、新建、打开后内容不变；仅显式导航更新指针；
   重建实例仍可读取；后续聊天包含保留窗口内既有内容；纯列表 / 打开 0 次模型调用；8 轮裁剪与工具配对完整。
