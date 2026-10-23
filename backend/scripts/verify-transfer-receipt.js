@@ -50,6 +50,11 @@ function receiptBlock(sys) {
   const idx = sys.indexOf('[权威回执·最近转账]')
   return idx === -1 ? '' : sys.slice(idx)
 }
+// 权威回执业务数据为单行 JSON（标准序列化），解析后断言字段
+function receiptData(block) {
+  const line = block.split('\n').find((l) => l.startsWith('{"ref_tail"'))
+  try { return line ? JSON.parse(line) : null } catch { return null }
+}
 
 for (const p of [DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm']) {
   try { rmSync(p, { force: true }) } catch {}
@@ -96,7 +101,8 @@ let refNo
   const aQ = createAssistant({ db, demoUserId, chatFn: mockQ })
   await aQ.chat({ message: '那笔转账怎么样了', sessionId })
   const block = receiptBlock(systemContent(mockQ, 0))
-  check('1.5 建单后（下一请求）注入权威状态为待确认', /状态：待确认（尚未扣款）/.test(block), block.slice(0, 80))
+  const d1 = receiptData(block)
+  check('1.5 建单后（下一请求）注入权威状态为待确认', !!d1 && d1.status === 'pending' && /待确认/.test(d1.status_text || ''), d1 ? d1.status : block.slice(0, 80))
 }
 
 // ---------- 2. 确认成功：扣款一次、流水一次、状态一致 ----------
@@ -121,8 +127,9 @@ let refNo
   const r = await assistant.chat({ message: '查一下我的余额', sessionId })
   const block = receiptBlock(systemContent(mock, 0))
   check('3.1 注入权威回执', block !== '')
-  check('3.2 状态为已完成（已扣款）', /已完成（已扣款）/.test(block))
-  check('3.3 含流水编号与确认时间', /流水编号 \d+/.test(block) && /确认时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(block), block.slice(0, 120))
+  const d3 = receiptData(block)
+  check('3.2 状态为已完成（已扣款）', !!d3 && d3.status === 'completed' && /已完成/.test(d3.status_text || ''))
+  check('3.3 含流水编号与确认时间', !!d3 && d3.transaction_id != null && /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(d3.confirmed_at || ''), d3 && JSON.stringify({ id: d3.transaction_id, at: d3.confirmed_at }))
   check('3.4 回执块不含「尚未确认/待确认」旧状态', !/尚未确认/.test(block) && !/待确认（尚未扣款）/.test(block))
   check('3.5 模型回复不引入旧待确认结论', r.reply === '你的余额是 40,963.38 元。', r.reply)
 }

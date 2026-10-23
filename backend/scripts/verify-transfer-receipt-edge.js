@@ -41,6 +41,11 @@ function receiptBlock(sys) {
   const idx = sys.indexOf('[权威回执·最近转账]')
   return idx === -1 ? '' : sys.slice(idx)
 }
+// 权威回执业务数据为单行 JSON（标准序列化），解析后断言字段
+function receiptData(block) {
+  const line = block.split('\n').find((l) => l.startsWith('{"ref_tail"'))
+  try { return line ? JSON.parse(line) : null } catch { return null }
+}
 
 for (const p of [DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm']) {
   try { rmSync(p, { force: true }) } catch {}
@@ -86,7 +91,8 @@ console.log('—— 边界一：历史单（无 session_id）只读兼容 ——
 
   check('1.1 历史单经 pending_transfer_ref 回退注入权威回执', block !== '', block.slice(0, 60))
   check('1.2 读取到真实状态 completed', /已完成（已扣款）/.test(block))
-  check('1.3 含真实流水编号', /流水编号 \d+/.test(block), block.match(/流水编号 \d+/)?.[0])
+  const d1 = receiptData(block)
+  check('1.3 含真实流水编号', !!d1 && d1.transaction_id != null, d1 && String(d1.transaction_id))
   check('1.4 不按姓名/金额猜测（回执即真实单）', block.includes(refTail(legacyRef)), block.slice(0, 40))
 
   // 只读性：不回填 session_id、不重放转账、不新增流水
@@ -146,8 +152,9 @@ console.log('—— 边界二：请求与确认交错 ——')
   const sys = captured[0].content
   const block = receiptBlock(sys)
   check('2.1 交错中确认成功（数据库 completed）', conf.outcome === 'completed', conf.outcome)
-  check('2.2 请求开始时的快照为待确认', /待确认（尚未扣款）/.test(block))
-  check('2.3 快照明确标注「截至查询时点」而非裸「状态：」', /截至查询时点状态：待确认（尚未扣款）/.test(block), block.match(/截至查询时点状态：[^，]+/)?.[0])
+  const d2 = receiptData(block)
+  check('2.2 请求开始时的快照为待确认', !!d2 && /待确认（尚未扣款）/.test(d2.status_text || ''))
+  check('2.3 快照为查询时点数据块（含查询时间与状态文案）', !!d2 && d2.status_text === '待确认（尚未扣款）' && /查询时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(block), d2 && d2.status_text)
   check('2.4 快照保留正确查询时间', /查询时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(block))
   check('2.5 系统提示要求不得断言「尚未扣款」', /不要断言「尚未扣款」/.test(sys))
   check('2.6 系统提示要求不得再次引导确认', /不要再次引导确认/.test(sys))

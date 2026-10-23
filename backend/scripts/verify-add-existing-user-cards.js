@@ -1,19 +1,19 @@
-// 验证：为「现有用户」增量接入第二张借记卡 + 信用卡，在开发库一致性副本上证明：
+// 验证：为「现有用户」增量接入第二张借记卡 + 信用卡，在独立种子库上证明：
 //   1) 原账户余额 / 历史交易 / 会话 / 操作单 / 验证绑定逐条保留（只 INSERT，不 UPDATE/DELETE 已有数据）；
 //   2) 基础加卡与样例消费分离（加卡不灌消费/欠款）；
 //   3) 重复执行幂等（不重复创建账户 / 卡片 / 消费 / 账单）。
 //
-// 全程只读开发库（backup API 一致性快照），全部写操作发生在临时副本上；不修改开发库、不调用收费模型。
+// 使用独立临时种子库（initDatabase seed:true），不依赖开发库当前是否已加过多卡；
+// 全部写操作发生在临时库上，不修改开发库、不调用收费模型。
 // 用法：node scripts/verify-add-existing-user-cards.js
-import { openDatabase, DEFAULT_DB_PATH } from '../src/db/connection.js'
 import { initDatabase } from '../src/db/index.js'
 import { applyBaseCards, applyConsumption, resolveUser, snapshot, buildPlan, MARKER } from './add-existing-user-cards.js'
-import { rmSync, mkdirSync, existsSync } from 'node:fs'
+import { rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const WORK = join(tmpdir(), 'rongzhi-add-cards-drill')
-const COPY = join(WORK, 'copy.db')
+const COPY = join(WORK, 'seed.db')
 
 let failures = 0
 function check(name, cond, detail = '') {
@@ -23,17 +23,13 @@ function check(name, cond, detail = '') {
 }
 function wipe(p) { for (const x of [p, p + '-wal', p + '-shm']) { try { rmSync(x, { force: true }) } catch {} } }
 
-// 1. 一致性副本（backup API，非文件复制）
+// 1. 独立临时种子库（1 用户 / 1 活期账户 / 1 借记卡）
 mkdirSync(WORK, { recursive: true })
 for (const p of [COPY, COPY + '-wal', COPY + '-shm']) wipe(p)
-check('开发库存在', existsSync(DEFAULT_DB_PATH), DEFAULT_DB_PATH)
-const src = openDatabase(DEFAULT_DB_PATH)
-await src.backup(COPY)
-src.close()
-check('一致性副本已生成（backup API）', existsSync(COPY), COPY)
+const { db } = initDatabase({ dbPath: COPY, seed: true })
+check('独立种子库已生成', true, COPY)
 
-// 2. 迁移副本（真实启动路径，幂等）
-const { db } = initDatabase({ dbPath: COPY, seed: false })
+// 2. 按 id 核验目标用户
 const userId = 1
 const user = resolveUser(db, userId)
 check('按 id 核验目标用户', user.id === userId && user.name === '张三', `id=${user.id} name=${user.name}`)

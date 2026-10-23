@@ -85,7 +85,13 @@ if (legacy) {
   // 部署后 3000 也可能已是新接口：两种契约都接受，只断言解析结果与关联账户一致
   const hasBalance = legacy.cards.filter((c) => c.account_type !== 'credit').every((c) => isFiniteCents(c.balance_cents))
   check('3000 接口契约可识别（旧：无余额字段 / 新：含余额字段）', true, hasBalance ? 'new' : 'legacy')
-  check('3000 借记卡 1234 解析为账户余额 4046338', legacy.cards.some((c) => c.masked_card_number.includes('1234') && resolveDebitBalance(c, accountsIndex(legacy.accounts)).cents === 4046338))
+  // 不写死余额（用户实际还款会改变余额）：按 account_id 对照账户接口的真实余额
+  const legacyAcc = accountsIndex(legacy.accounts)
+  check('3000 借记卡 1234 解析为关联账户余额', legacy.cards.some((c) => {
+    if (!c.masked_card_number.includes('1234')) return false
+    const acc = legacyAcc.get(c.account_id)
+    return !!acc && resolveDebitBalance(c, legacyAcc).cents === acc.balance_cents
+  }))
 }
 if (modern) {
   check('4177 新接口含 balance_cents（沿用明确契约）', modern.cards.filter((c) => c.account_type !== 'credit').every((c) => isFiniteCents(c.balance_cents)))
