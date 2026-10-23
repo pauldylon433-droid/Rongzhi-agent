@@ -42,15 +42,19 @@ const verifyLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 10 })
 export function createSubscriptionOperationsRouter(db, demoUserId) {
   const router = Router()
 
-  // 创建订阅操作单（暂停 / 取消 / 恢复，不改变订阅状态）
+  // 创建订阅操作单（暂停 / 取消 / 恢复 / 更换扣款账户，不改变订阅状态）
   router.post('/', (req, res) => {
     const body = req.body || {}
-    const allowed = ['subscription_id', 'action']
+    const allowed = ['subscription_id', 'action', 'to_account_id']
     const extra = Object.keys(body).filter((k) => !allowed.includes(k))
     if (extra.length) return badRequest(res, `不允许提交字段：${extra.join('、')}`)
 
     try {
-      const op = createSubscriptionOperation(db, demoUserId, { subscriptionId: body.subscription_id, action: body.action })
+      const op = createSubscriptionOperation(db, demoUserId, {
+        subscriptionId: body.subscription_id,
+        action: body.action,
+        toAccountId: body.to_account_id,
+      })
       ok(res, op)
     } catch (e) {
       if (e instanceof SubscriptionOpError) return badRequest(res, e.message)
@@ -113,7 +117,8 @@ export function createSubscriptionOperationsRouter(db, demoUserId) {
       )
       if (r.outcome === 'not_found') return res.status(404).json({ success: false, message: '操作单不存在' })
       if (r.outcome === 'completed') return ok(res, r.op)
-      return res.status(409).json({ success: false, message: VERIFY_MSG[r.outcome] || '操作单当前状态不可验证', data: r.op })
+      const msg = r.reason ? r.reason : VERIFY_MSG[r.outcome] || '操作单当前状态不可验证'
+      return res.status(409).json({ success: false, message: msg, data: r.op })
     } catch (e) {
       if (e instanceof VerificationError) {
         const status = {

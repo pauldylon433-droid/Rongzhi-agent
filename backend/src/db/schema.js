@@ -155,8 +155,9 @@ CREATE INDEX IF NOT EXISTS idx_card_operations_user_id ON card_operations(user_i
 CREATE INDEX IF NOT EXISTS idx_card_operations_status  ON card_operations(status);
 CREATE INDEX IF NOT EXISTS idx_card_operations_card_id ON card_operations(card_id);
 
--- 订阅与代扣操作单：查询 / 暂停·取消（yellow，点击确认）/ 恢复（red，交易密码 + TOTP 强验证）。
--- 保存订阅归属、动作、预期状态与建单时的订阅版本快照，确认时重新校验订阅状态与版本。
+-- 订阅与代扣操作单：查询 / 暂停·取消（yellow，点击确认）/ 恢复、更换扣款账户（red，交易密码 + TOTP 强验证）。
+-- 保存订阅归属、动作、预期状态与建单时的订阅版本快照，确认时重新校验订阅状态与版本；
+-- 更换扣款账户额外冻结原/新扣款账户与卡片快照（from_* / to_*）。
 CREATE TABLE IF NOT EXISTS subscription_operations (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   ref_no                TEXT NOT NULL UNIQUE,
@@ -165,17 +166,27 @@ CREATE TABLE IF NOT EXISTS subscription_operations (
   merchant              TEXT NOT NULL,
   amount_cents          INTEGER NOT NULL,
   billing_cycle         TEXT NOT NULL,
-  action                TEXT NOT NULL CHECK (action IN ('pause', 'resume', 'cancel')),
+  action                TEXT NOT NULL CHECK (action IN ('pause', 'resume', 'cancel', 'change_source')),
   from_status           TEXT NOT NULL,
   to_status             TEXT NOT NULL,
   subscription_version  INTEGER NOT NULL,
+  from_account_id       INTEGER,
+  from_account_name     TEXT,
+  from_account_type     TEXT,
+  from_masked_card      TEXT,
+  to_account_id         INTEGER,
+  to_account_name       TEXT,
+  to_account_type       TEXT,
+  to_masked_card        TEXT,
   risk_level            TEXT NOT NULL CHECK (risk_level IN ('yellow', 'red')),
   status                TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','needs_verification','completed','cancelled','expired','failed')),
   created_at            TEXT NOT NULL DEFAULT (datetime('now')),
   expires_at            TEXT NOT NULL,
   confirmed_at          TEXT,
   FOREIGN KEY (user_id) REFERENCES users(id),
-  FOREIGN KEY (subscription_id) REFERENCES subscriptions(id)
+  FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
+  FOREIGN KEY (from_account_id) REFERENCES accounts(id),
+  FOREIGN KEY (to_account_id) REFERENCES accounts(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_subscription_operations_user_id         ON subscription_operations(user_id);

@@ -206,8 +206,11 @@ export async function verifyCardOperation(refNo, { password, totp }) {
 
 // —— 订阅与代扣操作（查询 + 暂停 / 恢复 / 取消）——
 
-export async function createSubscriptionOperation({ subscription_id, action }) {
-  const body = await postJson('/api/subscription-operations', { subscription_id, action })
+// action: pause / resume / cancel / change_source（更换扣款账户需 to_account_id）
+export async function createSubscriptionOperation({ subscription_id, action, to_account_id }) {
+  const payload = { subscription_id, action }
+  if (to_account_id !== undefined && to_account_id !== null) payload.to_account_id = to_account_id
+  const body = await postJson('/api/subscription-operations', payload)
   return body.data
 }
 

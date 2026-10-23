@@ -43,7 +43,7 @@ export function activityStatusTone(row) {
   return 'is-muted'
 }
 
-const SUB_ACTION_TEXT = { pause: '暂停', resume: '恢复', cancel: '取消' }
+const SUB_ACTION_TEXT = { pause: '暂停', resume: '恢复', cancel: '取消', change_source: '更换扣款账户' }
 const CARD_ACTION_TEXT = { freeze: '冻结', unfreeze: '解冻' }
 const CYCLE_TEXT = { monthly: '按月', yearly: '按年' }
 

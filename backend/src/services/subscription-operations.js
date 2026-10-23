@@ -10,8 +10,41 @@ export const SUB_OP_EXPIRY_MS = 5 * 60 * 1000 // 操作单确认有效期：5 �
 
 const OPERATION_COLS = `
   id, ref_no, user_id, subscription_id, merchant, amount_cents, billing_cycle, action,
-  from_status, to_status, subscription_version, risk_level, status, created_at, expires_at, confirmed_at
+  from_status, to_status, subscription_version,
+  from_account_id, from_account_name, from_account_type, from_masked_card,
+  to_account_id, to_account_name, to_account_type, to_masked_card,
+  risk_level, status, created_at, expires_at, confirmed_at
 `
+
+// 扣款来源快照：账户 + 该账户下的非注销银行卡（本演示一个账户最多一张卡，按 id 稳定取第一张；不做名称猜测）。
+export function subscriptionSource(db, userId, accountId) {
+  if (!accountId) return null
+  const account = db
+    .prepare('SELECT id, account_name, account_type, currency, status, balance_cents FROM accounts WHERE id = ? AND user_id = ?')
+    .get(accountId, userId)
+  if (!account) return null
+  const card = db
+    .prepare("SELECT id, masked_card_number, card_type, status FROM cards WHERE account_id = ? AND user_id = ? AND status != 'cancelled' ORDER BY id LIMIT 1")
+    .get(accountId, userId)
+  return { account, card: card || null }
+}
+
+// 可作扣款来源的校验：账户 active、币种匹配、且恰好一张 active 卡
+function assertSourceUsable(db, userId, accountId, currency) {
+  const snap = subscriptionSource(db, userId, accountId)
+  if (!snap) throw new SubscriptionOpError('扣款账户不存在或不属于当前用户', 'not_found')
+  if (snap.account.status !== 'active') throw new SubscriptionOpError('该扣款账户状态不可用', 'account_inactive')
+  if (currency && snap.account.currency !== currency) throw new SubscriptionOpError('扣款账户币种与订阅不匹配', 'currency_mismatch')
+  const cards = db
+    .prepare('SELECT id, masked_card_number, card_type, status FROM cards WHERE account_id = ? AND user_id = ? AND status != \'cancelled\' ORDER BY id')
+    .all(accountId, userId)
+  const active = cards.filter((c) => c.status === 'active')
+  if (active.length === 0) {
+    throw new SubscriptionOpError(cards.length ? '该账户的银行卡已冻结或不可用，不能作为扣款来源' : '该账户没有可用的银行卡，不能作为扣款来源', 'card_unavailable')
+  }
+  if (active.length > 1) throw new SubscriptionOpError('该账户存在多张可用银行卡，无法确定扣款卡，请先处理', 'ambiguous_card')
+  return { snap: { ...snap, card: active[0] } }
+}
 
 // 创建期校验失败（→ HTTP 400）
 export class SubscriptionOpError extends Error {
@@ -26,11 +59,29 @@ function getById(db, id) {
   return db.prepare(`SELECT ${OPERATION_COLS} FROM subscription_operations WHERE id = ?`).get(id)
 }
 
-// 订阅当前状态（供前端展示最新订阅状态；不含版本等内部字段）
+// 订阅当前状态 + 扣款来源（供前端 / 助手展示最新绑定；不含版本等内部字段）
 function subscriptionStatus(db, subscriptionId) {
-  return db
-    .prepare('SELECT id, merchant, amount_cents, billing_cycle, next_billing_date, status FROM subscriptions WHERE id = ?')
+  const sub = db
+    .prepare('SELECT id, user_id, account_id, merchant, amount_cents, billing_cycle, next_billing_date, status FROM subscriptions WHERE id = ?')
     .get(subscriptionId)
+  if (!sub) return null
+  const snap = subscriptionSource(db, sub.user_id, sub.account_id)
+  return {
+    id: sub.id,
+    account_id: sub.account_id,
+    account_name: snap ? snap.account.account_name : null,
+    account_type: snap ? snap.account.account_type : null,
+    currency: snap ? snap.account.currency : null,
+    account_status: snap ? snap.account.status : null,
+    masked_card_number: snap && snap.card ? snap.card.masked_card_number : null,
+    card_type: snap && snap.card ? snap.card.card_type : null,
+    card_status: snap && snap.card ? snap.card.status : null,
+    merchant: sub.merchant,
+    amount_cents: sub.amount_cents,
+    billing_cycle: sub.billing_cycle,
+    next_billing_date: sub.next_billing_date,
+    status: sub.status,
+  }
 }
 
 function toView(db, row) {
@@ -43,6 +94,14 @@ function toView(db, row) {
     action: row.action,
     from_status: row.from_status,
     to_status: row.to_status,
+    from_account_id: row.from_account_id ?? null,
+    from_account_name: row.from_account_name ?? null,
+    from_account_type: row.from_account_type ?? null,
+    from_masked_card: row.from_masked_card ?? null,
+    to_account_id: row.to_account_id ?? null,
+    to_account_name: row.to_account_name ?? null,
+    to_account_type: row.to_account_type ?? null,
+    to_masked_card: row.to_masked_card ?? null,
     risk_level: row.risk_level,
     status: row.status,
     created_at: row.created_at,
@@ -71,6 +130,52 @@ export function finalizeSubscriptionOperation(db, userId, row, now, expectedStat
   if (!sub) {
     db.prepare(`UPDATE subscription_operations SET status = 'failed' WHERE id = ? AND status = ?`).run(row.id, expectedStatus)
     return { outcome: 'failed', op: viewSubscriptionOperation(db, getById(db, row.id)) }
+  }
+
+  // —— 更换扣款账户：复核原绑定 / 版本 / 新来源可用性，仅更新 account_id，不改变订阅状态 ——
+  if (row.action === 'change_source') {
+    const fail = (reason) => {
+      db.prepare(`UPDATE subscription_operations SET status = 'failed' WHERE id = ? AND status = ?`).run(row.id, expectedStatus)
+      return { outcome: 'failed', reason, op: viewSubscriptionOperation(db, getById(db, row.id)) }
+    }
+    if (sub.status === 'cancelled') return fail('订阅已取消，不能更换扣款账户')
+    if (sub.version !== row.subscription_version || sub.account_id !== row.from_account_id) {
+      return fail('订阅状态或原扣款账户已变化，该操作单已失效，请重新发起')
+    }
+    if (row.to_account_id === sub.account_id) return fail('新扣款账户与当前来源相同')
+    const fromCur = db.prepare('SELECT currency FROM accounts WHERE id = ?').get(row.from_account_id)?.currency || 'CNY'
+    try {
+      assertSourceUsable(db, userId, row.to_account_id, fromCur)
+    } catch (e) {
+      if (e instanceof SubscriptionOpError) return fail(e.message)
+      throw e
+    }
+
+    const claim = db
+      .prepare(`UPDATE subscription_operations SET status = 'completed', confirmed_at = ? WHERE id = ? AND status = ?`)
+      .run(now.toISOString(), row.id, expectedStatus)
+    if (claim.changes !== 1) return { outcome: 'completed', op: viewSubscriptionOperation(db, getById(db, row.id)) }
+
+    const upd = db
+      .prepare('UPDATE subscriptions SET account_id = ?, version = version + 1 WHERE id = ? AND version = ?')
+      .run(row.to_account_id, row.subscription_id, row.subscription_version)
+    if (upd.changes !== 1) throw new Error('订阅已变化，更换扣款账户失败')
+
+    db.prepare(
+      `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
+       VALUES (?, 'subscription_operation', ?, 'confirm', 'success', ?)`,
+    ).run(
+      userId,
+      row.ref_no,
+      JSON.stringify({
+        action: 'change_source',
+        subscription_id: row.subscription_id,
+        from_account_id: row.from_account_id,
+        to_account_id: row.to_account_id,
+      }),
+    )
+    db.prepare('UPDATE chat_sessions SET pending_subscription_op_ref = NULL WHERE pending_subscription_op_ref = ?').run(row.ref_no)
+    return { outcome: 'completed', op: viewSubscriptionOperation(db, getById(db, row.id)) }
   }
 
   // 建单后订阅状态 / 版本已变化（含「生效→暂停→生效」回环）：旧单不能覆盖新状态
@@ -114,11 +219,13 @@ export function finalizeSubscriptionOperation(db, userId, row, now, expectedStat
   return { outcome: 'completed', op: viewSubscriptionOperation(db, getById(db, row.id)) }
 }
 
-// 创建订阅操作单（不改变订阅状态）。action：pause（暂停）/ resume（恢复）/ cancel（取消）。
-// 服务端校验订阅归属与合法状态转换；风险级别由后端判定；cancelled 为终态不可再操作，未知状态拒绝。
-export function createSubscriptionOperation(db, userId, { subscriptionId, action }, now = new Date()) {
-  if (action !== 'pause' && action !== 'resume' && action !== 'cancel') {
-    throw new SubscriptionOpError('不支持的订阅操作（仅支持 pause / resume / cancel）', 'bad_action')
+// 创建订阅操作单（不改变订阅状态）。action：pause（暂停）/ resume（恢复）/ cancel（取消）/
+// change_source（更换扣款账户，需 toAccountId）。服务端校验订阅归属与合法状态转换；
+// 风险级别由后端判定；cancelled 为终态不可再操作，未知状态拒绝。
+// 更换扣款账户不改变订阅状态、不扣款、不产生收支流水；仅冻结原/新来源快照与订阅版本。
+export function createSubscriptionOperation(db, userId, { subscriptionId, action, toAccountId }, now = new Date()) {
+  if (!['pause', 'resume', 'cancel', 'change_source'].includes(action)) {
+    throw new SubscriptionOpError('不支持的订阅操作（仅支持 pause / resume / cancel / change_source）', 'bad_action')
   }
   if (typeof subscriptionId !== 'number' || !Number.isSafeInteger(subscriptionId) || subscriptionId <= 0) {
     throw new SubscriptionOpError('订阅不合法', 'bad_subscription')
@@ -130,7 +237,28 @@ export function createSubscriptionOperation(db, userId, { subscriptionId, action
 
   let fromStatus
   let toStatus
-  if (action === 'cancel') {
+  let fromSnap = null
+  let toSnap = null
+  if (action === 'change_source') {
+    if (sub.status === 'cancelled') {
+      throw new SubscriptionOpError('该订阅已取消，不能更换扣款账户或重新开通', 'cancelled')
+    }
+    if (sub.status !== 'active' && sub.status !== 'paused') {
+      throw new SubscriptionOpError('该订阅当前状态不支持更换扣款账户', 'bad_state')
+    }
+    if (typeof toAccountId !== 'number' || !Number.isSafeInteger(toAccountId) || toAccountId <= 0) {
+      throw new SubscriptionOpError('新扣款账户不合法', 'bad_account')
+    }
+    if (toAccountId === sub.account_id) {
+      throw new SubscriptionOpError('新扣款账户与当前扣款账户相同，无需更换', 'same_source')
+    }
+    fromSnap = subscriptionSource(db, userId, sub.account_id)
+    const currency = fromSnap ? fromSnap.account.currency : 'CNY'
+    const checked = assertSourceUsable(db, userId, toAccountId, currency)
+    toSnap = checked.snap
+    fromStatus = sub.status
+    toStatus = sub.status // 更换来源不改变订阅状态
+  } else if (action === 'cancel') {
     // 取消：active 或 paused → cancelled（黄色确认）；cancelled 为终态，未知状态拒绝
     if (sub.status === 'cancelled') {
       throw new SubscriptionOpError('该订阅已取消，不能再次取消', 'already_cancelled')
@@ -158,8 +286,9 @@ export function createSubscriptionOperation(db, userId, { subscriptionId, action
     }
   }
 
-  const riskLevel = action === 'resume' ? 'red' : 'yellow'
-  const status = action === 'resume' ? 'needs_verification' : 'pending'
+  const isRed = action === 'resume' || action === 'change_source'
+  const riskLevel = isRed ? 'red' : 'yellow'
+  const status = isRed ? 'needs_verification' : 'pending'
   const refNo = randomUUID()
   const createdAt = now.toISOString()
   const expiresAt = new Date(now.getTime() + SUB_OP_EXPIRY_MS).toISOString()
@@ -169,17 +298,32 @@ export function createSubscriptionOperation(db, userId, { subscriptionId, action
       .prepare(
         `INSERT INTO subscription_operations
           (ref_no, user_id, subscription_id, merchant, amount_cents, billing_cycle, action,
-           from_status, to_status, subscription_version, risk_level, status, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           from_status, to_status, subscription_version,
+           from_account_id, from_account_name, from_account_type, from_masked_card,
+           to_account_id, to_account_name, to_account_type, to_masked_card,
+           risk_level, status, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         refNo, userId, sub.id, sub.merchant, sub.amount_cents, sub.billing_cycle, action,
-        fromStatus, toStatus, sub.version, riskLevel, status, createdAt, expiresAt,
+        fromStatus, toStatus, sub.version,
+        fromSnap ? fromSnap.account.id : null,
+        fromSnap ? fromSnap.account.account_name : null,
+        fromSnap ? fromSnap.account.account_type : null,
+        fromSnap && fromSnap.card ? fromSnap.card.masked_card_number : null,
+        toSnap ? toSnap.account.id : null,
+        toSnap ? toSnap.account.account_name : null,
+        toSnap ? toSnap.account.account_type : null,
+        toSnap && toSnap.card ? toSnap.card.masked_card_number : null,
+        riskLevel, status, createdAt, expiresAt,
       )
     db.prepare(
       `INSERT INTO audit_logs (user_id, operation_type, operation_ref, action, result, detail)
        VALUES (?, 'subscription_operation', ?, 'create', ?, ?)`,
-    ).run(userId, refNo, status, JSON.stringify({ action, subscription_id: sub.id }))
+    ).run(
+      userId, refNo, status,
+      JSON.stringify({ action, subscription_id: sub.id, ...(toSnap ? { to_account_id: toSnap.account.id } : {}) }),
+    )
     return getById(db, info.lastInsertRowid)
   })
   return toView(db, run())

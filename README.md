@@ -57,7 +57,8 @@ rongzhi-agent/
 - **查询范围**：交易流水与月度账单提供「全部账户 / 具体账户」可见筛选（信用账户明确标识），
   当前范围始终显示在标题旁；流水总数、分页与月度收支 / 分类 / 待入账 / 还款金额使用同一账户范围。
 - **银行卡管理**：临时冻结（黄色确认）、解冻（红色强验证）；仅改卡片状态，不改余额 / 流水 / 订阅 / 日限额。
-- **订阅与代扣管理**：暂停、取消（黄色确认）、恢复（红色强验证）；仅改订阅状态，不触发真实扣款。
+- **订阅与代扣管理**：暂停、取消（黄色确认）、恢复与更换扣款账户（红色强验证）；更换仅更新未来模拟扣款的来源
+  （本人借记 / 信用卡、币种一致、状态正常），不扣款、不改变订阅状态与历史流水；不触发真实扣款。
 - **AI 助手**：自然语言 → 模型工具调用 → 真实查询 → 结构化结果卡；工具白名单仅含查询与「准备操作单」，
   不含任何执行 / 校验密码 / 校验验证码工具；回答经 markdown-it + DOMPurify 渲染。
 - **跨场景任务**：唯一一条链「分析某月支出 → 列出生效订阅 → 用户选择一项 → 生成暂停单 → 界面确认 → 核验 → 回执」，
@@ -206,6 +207,7 @@ node scripts/verify-bind-interaction.js
 node scripts/verify-card-operations.js
 node scripts/verify-chat-persistence.js
 node scripts/verify-subscription-operations.js
+node scripts/verify-subscription-source-change.js
 node scripts/verify-agent-tasks.js
 node scripts/verify-credit-repayment.js
 node scripts/verify-repayment-all-posted.js

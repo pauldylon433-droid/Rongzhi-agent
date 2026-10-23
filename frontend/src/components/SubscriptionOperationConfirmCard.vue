@@ -31,6 +31,7 @@ const vLoading = ref(false)
 const { notifyChange, isChanged, version } = useSubscriptionOpSignal()
 
 const isResume = computed(() => !!op.value && op.value.action === 'resume')
+const isSourceChange = computed(() => !!op.value && op.value.action === 'change_source')
 const isPending = computed(() => !!op.value && op.value.status === 'pending')
 const isRedPending = computed(() => !!op.value && op.value.status === 'needs_verification')
 const isRed = computed(() => !!op.value && op.value.risk_level === 'red')
@@ -41,13 +42,19 @@ const showRisk = computed(
 
 const actionText = computed(() => {
   if (!op.value) return ''
-  return { pause: '暂停', resume: '恢复', cancel: '取消' }[op.value.action] || op.value.action
+  return { pause: '暂停', resume: '恢复', cancel: '取消', change_source: '更换扣款账户' }[op.value.action] || op.value.action
 })
 const cycleText = { monthly: '按月', yearly: '按年' }
 function cycleLabel(cycle) {
   return cycleText[cycle] || cycle || '—'
 }
 const subStatusText = { active: '生效', paused: '暂停', cancelled: '已取消' }
+function sourceLabel(name, type, masked) {
+  if (!name) return '未设置'
+  const t = type === 'credit' ? '信用卡' : type === 'deposit' ? '借记卡' : '银行卡'
+  return masked ? `${name}（${t} ${masked}）` : `${name}（无可用银行卡）`
+}
+const verifyActionText = computed(() => (isSourceChange.value ? '更换扣款账户' : '恢复'))
 
 const opTitle = computed(() => {
   if (!op.value) return '订阅操作'
@@ -55,9 +62,9 @@ const opTitle = computed(() => {
     case 'pending':
       return op.value.action === 'cancel' ? '待确认取消' : '待确认暂停'
     case 'needs_verification':
-      return '需要强验证恢复'
+      return isSourceChange.value ? '需要强验证更换扣款账户' : '需要强验证恢复'
     case 'completed':
-      return `${actionText.value}成功`
+      return isSourceChange.value ? '扣款账户已更换' : `${actionText.value}成功`
     case 'cancelled':
       return '已取消'
     case 'expired':
@@ -176,6 +183,10 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
       <p class="receipt-ref">操作编号：{{ op.ref_no }}</p>
       <dl class="detail-list">
         <div class="detail-row"><dt>订阅</dt><dd>{{ op.merchant }}</dd></div>
+        <template v-if="isSourceChange">
+          <div class="detail-row"><dt>原扣款账户</dt><dd>{{ sourceLabel(op.from_account_name, op.from_account_type, op.from_masked_card) }}</dd></div>
+          <div class="detail-row"><dt>新扣款账户</dt><dd>{{ sourceLabel(op.to_account_name, op.to_account_type, op.to_masked_card) }}</dd></div>
+        </template>
         <div v-if="op.subscription" class="detail-row">
           <dt>当前状态</dt><dd>{{ subStatusText[op.subscription.status] || '未知状态' }}</dd>
         </div>
@@ -199,16 +210,24 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
           <dt>每期金额</dt><dd>{{ formatCentsToYuan(op.amount_cents) }} 元 / {{ cycleLabel(op.billing_cycle) }}</dd>
         </div>
         <div class="detail-row"><dt>操作</dt><dd>{{ actionText }}</dd></div>
+        <template v-if="isSourceChange">
+          <div class="detail-row"><dt>原扣款账户</dt><dd>{{ sourceLabel(op.from_account_name, op.from_account_type, op.from_masked_card) }}</dd></div>
+          <div class="detail-row"><dt>新扣款账户</dt><dd>{{ sourceLabel(op.to_account_name, op.to_account_type, op.to_masked_card) }}</dd></div>
+        </template>
         <div class="detail-row"><dt>操作编号</dt><dd class="mono">{{ op.ref_no }}</dd></div>
         <div class="detail-row"><dt>确认有效期</dt><dd>{{ formatShanghaiDateTime(op.expires_at) }}</dd></div>
       </dl>
 
-      <!-- 红色待验证单（恢复）：强验证表单（交易密码 + 动态验证码） -->
+      <!-- 红色待验证单（恢复 / 更换扣款账户）：强验证表单（交易密码 + 动态验证码） -->
       <div v-if="isRedPending" class="verify-section">
-        <p class="red-note">恢复需用交易密码与手机验证器动态码二次确认，验证通过后恢复该订阅自动扣费。</p>
+        <p class="red-note">
+          {{ isSourceChange
+            ? '更换扣款账户需用交易密码与手机验证器动态码二次确认。验证通过后仅更新未来扣款来源，不改变订阅状态、不发起扣款。'
+            : '恢复需用交易密码与手机验证器动态码二次确认，验证通过后恢复该订阅自动扣费。' }}
+        </p>
 
         <p v-if="vLoading" class="verify-hint">正在读取验证器状态…</p>
-        <p v-else-if="!vStatus || vStatus.bound === false" class="verify-blocked">尚未绑定验证器，无法执行强验证恢复。</p>
+        <p v-else-if="!vStatus || vStatus.bound === false" class="verify-blocked">尚未绑定验证器，无法执行强验证{{ verifyActionText }}。</p>
         <p v-else-if="vStatus.locked" class="verify-blocked">
           强验证已锁定，{{ formatShanghaiDateTime(vStatus.locked_until) }} 后可重试。
         </p>
@@ -239,7 +258,7 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
           <p v-if="opError" class="form-error">{{ opError }}</p>
           <div class="card-actions">
             <button class="btn" :disabled="verifying || cancelling || !password || !totpCode" @click="onVerify">
-              {{ verifying ? '验证中…' : '验证并确认恢复' }}
+              {{ verifying ? '验证中…' : `验证并确认${verifyActionText}` }}
             </button>
             <button class="btn-ghost" :disabled="verifying || cancelling" @click="onCancel">
               {{ cancelling ? '取消中…' : '取消本次操作' }}

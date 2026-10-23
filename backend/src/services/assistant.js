@@ -169,7 +169,7 @@ const TOOL_DEFS = [
     function: {
       name: 'get_subscriptions',
       description:
-        '查询当前用户的订阅与代扣列表，返回订阅 id、商户、每期金额（分）、扣费周期、下次扣费日期、状态（active 生效 / paused 暂停 / cancelled 已取消）等。多个匹配时不要自行挑选，应列给用户选择。',
+        '查询当前用户的订阅与代扣列表，返回订阅 id、商户、每期金额（分）、扣费周期、下次扣费日期、状态（active 生效 / paused 暂停 / cancelled 已取消），以及当前扣款来源（account_id、account_name、account_type、masked_card_number、card_type、card_status；缺失时为空表示未设置）。多个匹配时不要自行挑选，应列给用户选择。',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
     },
   },
@@ -178,12 +178,13 @@ const TOOL_DEFS = [
     function: {
       name: 'prepare_subscription_operation',
       description:
-        '在订阅明确后，为某项订阅创建「订阅操作单」（暂停 pause / 恢复 resume / 取消 cancel），不立即改变订阅状态。返回操作编号、状态、风险等级与订阅信息。暂停 / 取消需用户点击确认；恢复需交易密码 + 动态验证码强验证。已取消（cancelled）的订阅不可再操作。单条用户消息最多调用一次。',
+        '在订阅明确后，为某项订阅创建「订阅操作单」：暂停 pause / 恢复 resume / 取消 cancel / 更换扣款账户 change_source，不立即改变订阅状态、不扣款。返回操作编号、状态、风险等级、订阅信息与原/新扣款来源。暂停 / 取消需用户点击确认；恢复与更换扣款账户需交易密码 + 动态验证码强验证。已取消（cancelled）的订阅不可再操作。更换扣款账户需传 to_account_id（来自 get_cards 的 account_id）；不改变订阅状态。单条用户消息最多调用一次。',
       parameters: {
         type: 'object',
         properties: {
           subscription_id: { type: 'integer', description: '订阅 id（来自 get_subscriptions 返回的 id）' },
-          action: { type: 'string', description: '操作类型：pause（暂停）/ resume（恢复）/ cancel（取消）' },
+          action: { type: 'string', enum: ['pause', 'resume', 'cancel', 'change_source'], description: '操作类型' },
+          to_account_id: { type: 'integer', description: 'action=change_source 时必填：新扣款账户 id（来自 get_cards / 订阅列表的 account_id）' },
         },
         required: ['subscription_id', 'action'],
         additionalProperties: false,
@@ -330,7 +331,7 @@ function buildSystemMessage(transferContext = '', repaymentContext = '') {
       `7. 「这个月/本月/上个月/上上月」等相对月份，以当前上海日期为准换算为 YYYY-MM；无法确定具体月份时，先向用户澄清，不要随意猜测。\n` +
       `8. 银行卡操作：查询用 get_cards；冻结 / 解冻先用 get_cards 确认卡片（含掩码卡号与卡种），卡片明确后调用 prepare_card_operation 生成「银行卡操作单」。你只能生成操作单，不能直接冻结 / 解冻：冻结需用户在界面点击确认，解冻需交易密码 + 动态验证码强验证。多张卡片时列出掩码选项让用户选择，不能擅自选第一张。\n` +
       `9. 用户提到「挂失 / 销卡 / 补卡 / 调额」等正式卡片业务时，明确说明本阶段不支持，并询问是否改用「临时冻结」，不要替用户决定。\n` +
-      `10. 订阅与代扣：查询用 get_subscriptions；暂停 / 恢复 / 取消先用 get_subscriptions 确认订阅（含商户与状态），订阅明确后调用 prepare_subscription_operation 生成「订阅操作单」。你只能生成操作单，不能直接暂停 / 取消 / 恢复：暂停与取消需用户在界面点击确认，恢复需交易密码 + 动态验证码强验证。已取消（cancelled）的订阅不可再操作。多项订阅时列出选项让用户选择，不能擅自选第一项。查询操作状态用 get_subscription_operation_status，以数据库返回为准。\n` +
+      `10. 订阅与代扣：查询用 get_subscriptions（返回当前扣款账户名、卡种与脱敏尾号，缺失表示未设置扣款账户）；暂停 / 恢复 / 取消 / 更换扣款账户先用 get_subscriptions 确认订阅（含商户与状态），订阅明确后调用 prepare_subscription_operation 生成「订阅操作单」。你只能生成操作单，不能直接暂停 / 取消 / 恢复 / 更换：暂停与取消需用户在界面点击确认，恢复与更换扣款账户需交易密码 + 动态验证码强验证。已取消（cancelled）的订阅不可再操作，也不能通过更换扣款账户重新开通。更换扣款账户须传 to_account_id，且来源必须属于本人、币种一致、账户与卡片状态正常；商户或目标卡不明确时先澄清，不得静默选第一张卡，也不因页面选中某张卡而自动执行；更换只更新未来扣款的来源，不改变订阅状态、不扣款、不修改历史。多项订阅时列出选项让用户选择，不能擅自选第一项。查询操作状态用 get_subscription_operation_status，以数据库返回为准。\n` +
       `11. 跨场景任务：仅支持一条任务链——「分析某月支出 → 列出生效订阅 → 用户选择后暂停一项」。用户提出该组合需求时，先确定月份（「这个月/本月/上月」按当前上海日期换算为 YYYY-MM），再调用 start_subscription_review 传入 month 启动任务；任务启动后订阅选择与确认都由用户在任务卡上完成，你不能替用户选择、不能声称已暂停、不能声称某订阅「长期未使用」（你没有使用频率数据），也不能把不同扣费周期的金额直接相加成月度费用。除这一条任务链外的任何跨场景组合（如「分析后自动取消订阅」「多任务并行」「按月分析并解冻银行卡」等）本阶段不支持，明确告知用户尚未支持。\n` +
       `12. 用简体中文回答，简洁准确；金额请标注单位（元）。\n` +
       `13. 关于转账是否完成 / 是否扣款 / 能否继续确认：若上方有「权威回执·最近转账」，以该回执的「截至查询时点状态」为准（或调用 get_transfer_status 再次核对）。该回执是查询时点的快照而非实时状态；若用户表示刚完成确认而快照仍为待确认，应说明「截至查询时点该转账仍为待确认」并复核最新状态，不要断言「尚未扣款」，也不要再次引导用户确认。不得根据历史对话里「已生成待确认转账单」等旧文本推断，不得编造「刚刚才确认」「尚未确认」等时间线。\n` +
@@ -608,8 +609,11 @@ function buildCardOpNotice(previous, newRefNo, action) {
 // 根据旧订阅操作单取消的真实结果与新旧编号，生成确定性状态说明（状态由服务端读取，不由模型推断）。
 function buildSubscriptionOpNotice(previous, newRefNo, action) {
   const newT = refTail(newRefNo)
-  const actText = { pause: '暂停', resume: '恢复', cancel: '取消' }[action] || action
-  if (!previous) return `已生成${actText}订阅操作单（${newT}），请在界面确认。`
+  const actText = { pause: '暂停', resume: '恢复', cancel: '取消', change_source: '更换扣款账户' }[action] || action
+  const needsVerify = action === 'resume' || action === 'change_source'
+  if (!previous) {
+    return `已生成${actText}订阅操作单（${newT}），请在界面${needsVerify ? '用交易密码与动态验证码验证确认' : '确认'}。`
+  }
   const old = refTail(previous.ref_no)
   switch (previous.status) {
     case 'cancelled':
@@ -858,7 +862,7 @@ function executeTool(db, demoUserId, name, args, ctx) {
     if (ctx.messageState.prepareSubscriptionOpDone) {
       throw new ToolError('本条消息已生成订阅操作单，请先确认或取消后再发起新操作')
     }
-    const extra = Object.keys(args).filter((k) => !['subscription_id', 'action'].includes(k))
+    const extra = Object.keys(args).filter((k) => !['subscription_id', 'action', 'to_account_id'].includes(k))
     if (extra.length) {
       throw new ToolError(`prepare_subscription_operation 不接受额外参数：${extra.join('、')}`)
     }
@@ -869,8 +873,14 @@ function executeTool(db, demoUserId, name, args, ctx) {
       throw new ToolError('subscription_id 必须为正整数')
     }
     const action = args.action
-    if (action !== 'pause' && action !== 'resume' && action !== 'cancel') {
-      throw new ToolError('action 必须是 pause、resume 或 cancel')
+    if (!['pause', 'resume', 'cancel', 'change_source'].includes(action)) {
+      throw new ToolError('action 必须是 pause、resume、cancel 或 change_source')
+    }
+    if (action === 'change_source' && args.to_account_id === undefined) {
+      throw new ToolError('更换扣款账户需要 to_account_id（新扣款账户 id）')
+    }
+    if (action === 'change_source' && (typeof args.to_account_id !== 'number' || !Number.isSafeInteger(args.to_account_id) || args.to_account_id <= 0)) {
+      throw new ToolError('to_account_id 必须为正整数')
     }
     const sub = db.prepare('SELECT id FROM subscriptions WHERE id = ? AND user_id = ?').get(subscriptionId, demoUserId)
     if (!sub) {
@@ -879,7 +889,7 @@ function executeTool(db, demoUserId, name, args, ctx) {
 
     let op
     try {
-      op = createSubscriptionOperation(db, demoUserId, { subscriptionId, action })
+      op = createSubscriptionOperation(db, demoUserId, { subscriptionId, action, toAccountId: args.to_account_id })
     } catch (e) {
       if (e instanceof SubscriptionOpError) {
         // 创建失败：旧待确认操作单未被取消，如实说明两件事（创建失败 + 原操作单未变更）

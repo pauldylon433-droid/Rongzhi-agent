@@ -38,7 +38,7 @@ const TASK_STATUS_TEXT = {
   failed: '失败', paused: '已暂停', cancelled: '已取消', manual: '手动处理',
 }
 const CYCLE_TEXT = { monthly: '按月', yearly: '按年' }
-const SUB_ACTION = { pause: '暂停', resume: '恢复', cancel: '取消' }
+const SUB_ACTION = { pause: '暂停', resume: '恢复', cancel: '取消', change_source: '更换扣款账户' }
 
 const events = computed(() => deriveBusinessEvents(messages.value))
 const current = computed(() => events.value[events.value.length - 1] || null)

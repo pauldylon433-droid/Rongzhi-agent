@@ -121,6 +121,68 @@ export function migrate(db) {
       }
     }
 
+    // —— 订阅操作单：新增「更换扣款账户」动作与来源快照 ——
+    // 旧表的 action CHECK 不含 change_source，需重建表（数据原样保留，幂等：已含 change_source 则跳过）。
+    if (hasTable(db, 'subscription_operations')) {
+      const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscription_operations'").get()?.sql || ''
+      if (!/change_source/.test(sql)) {
+        db.exec(`
+          CREATE TABLE subscription_operations_new (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref_no                TEXT NOT NULL UNIQUE,
+            user_id               INTEGER NOT NULL,
+            subscription_id       INTEGER NOT NULL,
+            merchant              TEXT NOT NULL,
+            amount_cents          INTEGER NOT NULL,
+            billing_cycle         TEXT NOT NULL,
+            action                TEXT NOT NULL CHECK (action IN ('pause', 'resume', 'cancel', 'change_source')),
+            from_status           TEXT NOT NULL,
+            to_status             TEXT NOT NULL,
+            subscription_version  INTEGER NOT NULL,
+            from_account_id       INTEGER,
+            from_account_name     TEXT,
+            from_account_type     TEXT,
+            from_masked_card      TEXT,
+            to_account_id         INTEGER,
+            to_account_name       TEXT,
+            to_account_type       TEXT,
+            to_masked_card        TEXT,
+            risk_level            TEXT NOT NULL CHECK (risk_level IN ('yellow', 'red')),
+            status                TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','needs_verification','completed','cancelled','expired','failed')),
+            created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at            TEXT NOT NULL,
+            confirmed_at          TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
+            FOREIGN KEY (from_account_id) REFERENCES accounts(id),
+            FOREIGN KEY (to_account_id) REFERENCES accounts(id)
+          );
+          INSERT INTO subscription_operations_new
+            (id, ref_no, user_id, subscription_id, merchant, amount_cents, billing_cycle, action,
+             from_status, to_status, subscription_version, risk_level, status, created_at, expires_at, confirmed_at)
+          SELECT id, ref_no, user_id, subscription_id, merchant, amount_cents, billing_cycle, action,
+             from_status, to_status, subscription_version, risk_level, status, created_at, expires_at, confirmed_at
+          FROM subscription_operations;
+          DROP TABLE subscription_operations;
+          ALTER TABLE subscription_operations_new RENAME TO subscription_operations;
+          CREATE INDEX IF NOT EXISTS idx_subscription_operations_user_id ON subscription_operations(user_id);
+          CREATE INDEX IF NOT EXISTS idx_subscription_operations_status ON subscription_operations(status);
+          CREATE INDEX IF NOT EXISTS idx_subscription_operations_subscription_id ON subscription_operations(subscription_id);
+        `)
+      } else {
+        const extraCols = [
+          ['from_account_id', 'INTEGER'], ['from_account_name', 'TEXT'], ['from_account_type', 'TEXT'],
+          ['from_masked_card', 'TEXT'], ['to_account_id', 'INTEGER'], ['to_account_name', 'TEXT'],
+          ['to_account_type', 'TEXT'], ['to_masked_card', 'TEXT'],
+        ]
+        for (const [col, type] of extraCols) {
+          if (!hasColumn(db, 'subscription_operations', col)) {
+            db.exec(`ALTER TABLE subscription_operations ADD COLUMN ${col} ${type}`)
+          }
+        }
+      }
+    }
+
     // 虚构收款人参考数据（仅当为空时写入，幂等）
     const rcCount = db.prepare('SELECT COUNT(*) AS c FROM transfer_recipients').get().c
     if (rcCount === 0) {

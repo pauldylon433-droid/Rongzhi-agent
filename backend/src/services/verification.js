@@ -248,7 +248,7 @@ export function verifyAndConfirmCardUnfreeze(db, userId, refNo, { password, totp
   return r
 }
 
-// 强验证确认恢复订阅：密码 + TOTP 均正确 → 消费时间步 + 更新订阅状态（同一事务）。
+// 强验证确认恢复订阅 / 更换扣款账户：密码 + TOTP 均正确 → 消费时间步 + 执行动作（同一事务）。
 // 与转账 / 解冻强验证复用同一套密码哈希、TOTP、失败锁定与用户级锁定状态；
 // 同一用户「已用于转账 / 解冻的时间步」不可再用于恢复订阅，反之亦然（totp_used_steps 的 UNIQUE(user_id, step)）。
 // 跨业务累计失败同样触发用户级锁定（verification_failures 以 user_id 为键）。
@@ -272,8 +272,11 @@ export function verifyAndConfirmSubscriptionResume(db, userId, refNo, { password
       // 已完成 / 已取消 / 已过期 / 已失效 / 待确认（暂停/取消）的单不可通过验证（重新）执行
       return { outcome: row.status, op: viewSubscriptionOperation(db, row) }
     }
-    // 强验证接口仅执行恢复（resume）；暂停 / 取消（pending）单不可走该接口
-    if (row.action !== 'resume') return { outcome: row.status, op: viewSubscriptionOperation(db, row) }
+    // 强验证接口执行红色动作：恢复（resume）/ 更换扣款账户（change_source）；
+    // 暂停 / 取消（pending）单不可走该接口
+    if (row.action !== 'resume' && row.action !== 'change_source') {
+      return { outcome: row.status, op: viewSubscriptionOperation(db, row) }
+    }
 
     // 消费该时间步（防重放：跨单、跨业务、并发、重启后均不可复用同一时间步）
     try {
