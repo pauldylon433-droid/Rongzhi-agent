@@ -52,7 +52,10 @@ rongzhi-agent/
 
 - **只读查询**：账户概览、交易流水（月份 + 入账状态筛选 + 分页）、银行卡（卡种筛选）、订阅（状态筛选）、月度账单分析。
 - **智能转账**：手动入口与自然语言入口共用同一套「操作单 + 版本 CAS + 同事务审计」；当日累计 ≤ ¥1000 为黄色（界面确认），
-  超过为红色（交易密码 + TOTP 强验证）；防重复、防篡改、余额守卫。
+  超过为红色（交易密码 + TOTP 强验证）；防重复、防篡改、余额守卫。手动转账**必须显式选择付款账户**
+  （展示借记卡 / 账户名 / 脱敏尾号 / 可用余额；信用卡不可对外付款），建单后付款账户冻结，界面切卡不影响原单。
+- **查询范围**：交易流水与月度账单提供「全部账户 / 具体账户」可见筛选（信用账户明确标识），
+  当前范围始终显示在标题旁；流水总数、分页与月度收支 / 分类 / 待入账 / 还款金额使用同一账户范围。
 - **银行卡管理**：临时冻结（黄色确认）、解冻（红色强验证）；仅改卡片状态，不改余额 / 流水 / 订阅 / 日限额。
 - **订阅与代扣管理**：暂停、取消（黄色确认）、恢复（红色强验证）；仅改订阅状态，不触发真实扣款。
 - **AI 助手**：自然语言 → 模型工具调用 → 真实查询 → 结构化结果卡；工具白名单仅含查询与「准备操作单」，
@@ -188,22 +191,69 @@ node scripts/verify-analytics.js
 node scripts/verify-migrate.js
 node scripts/verify-fix.js
 node scripts/verify-transfers.js
+node scripts/verify-multi-account.js
 node scripts/verify-assistant.js
 node scripts/verify-assistant-session.js
 node scripts/verify-assistant-transfer.js
 node scripts/verify-strong-verification.js
+node scripts/verify-security-boundaries.js
+node scripts/verify-credential-guard.js
+node scripts/verify-verify-message-uniform.js
 node scripts/verify-bind-interaction.js
 node scripts/verify-card-operations.js
 node scripts/verify-chat-persistence.js
 node scripts/verify-subscription-operations.js
 node scripts/verify-agent-tasks.js
+node scripts/verify-credit-repayment.js
+node scripts/verify-credit-routes.js
+node scripts/verify-assistant-repayment.js
+node scripts/verify-activity.js
+node scripts/verify-account-filter.js
+node scripts/verify-demo-seed.js
 
 cd ../frontend
 node scripts/verify-markdown.mjs
+node scripts/verify-card-balance.mjs
+node scripts/verify-business-events.mjs
+node scripts/verify-activity.mjs
 npm run build
 ```
 
 > 上述脚本均使用 mock 模型与独立临时库，可重复执行、不修改开发库业务数据。
+
+**可选演示数据（信用卡 · 多银行卡，默认关闭、不触碰开发库）**：如需在隔离演示库生成
+「2 借记卡 + 1 信用卡」可控样本，可显式运行：
+
+```powershell
+cd backend
+node scripts/seed-demo.js             # 在隔离演示库 data/demo.db 生成（幂等）
+node scripts/seed-demo.js --preview   # 预览将写入的内容（不落盘）
+node scripts/seed-demo.js --check     # 只读校验演示库一致性
+```
+
+该脚本默认与开发库（`data/rongzhi.db`）分离；`--db` 显式指向开发库须加 `--allow-dev-db`，
+部署到开发库前请先 `node scripts/backup-db.js` 一致性备份并用 `--preview` 检查。
+
+**部署前验收辅助脚本（不修改开发库、不影响运行中服务）**：
+
+```powershell
+cd backend
+node scripts/drill-deploy-copy.js               # 开发库一致性副本演练：backup API 迁移 + 数据保留 + seed 幂等 + 完整性
+node scripts/setup-isolated-env.js              # 生成独立验收库 + 绑定测试专用强验证器（打印隔离后端启动命令）
+node scripts/verify-add-existing-user-cards.js  # 现有用户增量加卡：开发库副本上验证原数据保留 + 幂等
+node scripts/add-existing-user-cards.js --db <路径> --user-id 1 --preview   # 增量加卡预览（默认只读）
+node scripts/acceptance-totp.js                 # 隔离验收环境：本机生成当前 6 位测试动态码
+```
+
+> `acceptance-totp.js` 只对隔离验收库（测试主密钥加密的绑定）输出动态码，对真实库（`.verification-key` 加密）直接拒绝。
+> 隔离环境的交易密码为 `acceptance-demo-pass`（仅测试用，不进入正式配置）。
+
+> 隔离前端用 `frontend/vite.config.isolated.js`（端口 5180，`/api` 代理到隔离后端，页面带红色隔离横幅）。
+> 上述脚本均与开发库 / 3000 / 5174 完全分离，详见 `docs/development-log.md`「第四十二阶段」。
+>
+> **多卡接入（现有用户）**：`add-existing-user-cards.js` 为「已有张三」的库增量新增第二张借记卡 + 信用卡
+> （只 INSERT，不改原账户余额 / 历史 / 会话 / 操作单 / 验证绑定），默认 `--preview` 只预览、`--apply` 才写入，
+> `--with-consumption` 单独可选加样例消费。与 `seed-demo.js`（仅空库）职责分离，不能互相替代。
 
 ## 无 AI 密钥时的功能范围
 
@@ -217,6 +267,67 @@ npm run build
 - **真实模型调用（手动可选，不混入默认自动测试）**：
   - `cd backend; npm run ai:check` —— 连接检查（最小对话，不发送银行数据）。
   - `node scripts/smoke-assistant-live.js`、`node scripts/smoke-assistant-transfer-live.js` —— 真实 DeepSeek 冒烟。
+
+## 正式部署与回退（信用卡功能上线）
+
+以下为 **Windows PowerShell** 命令（不要用 Bash 的 `VAR=值` 赋值语法）。工作目录 `C:\Users\HUAWEI123\Desktop\rongzhi-agent\backend`，
+开发库绝对路径 `C:\Users\HUAWEI123\Desktop\rongzhi-agent\backend\data\rongzhi.db`。
+
+### 部署顺序（演练在前，迁移在后）
+
+```powershell
+cd C:\Users\HUAWEI123\Desktop\rongzhi-agent\backend
+
+# ① 部署前：一致性副本演练（在【实际迁移之前】做，证明迁移保留旧数据 + 幂等）
+node scripts\drill-deploy-copy.js
+
+# ② 一致性备份（SQLite Online Backup API → 独立快照文件；不是复制运行库的 -wal/-shm）
+node scripts\backup-db.js
+#   输出：data\backups\rongzhi.pre-transfer-<时间戳>.db（自包含快照，已合并 WAL）
+
+# ③ 受控重启后端 → initDatabase 自动幂等迁移（18→22 表，补列回填，不改旧数据）
+#   先停止旧 3000 进程（Ctrl+C 或 taskkill /PID <pid> /F），再启动：
+npm start
+
+# ④ 迁移后：检查【真实目标库】结构 / 完整性 / 原数据保留（不可只用副本演练代替）
+node -e "const D=require('better-sqlite3');const db=new D('data/rongzhi.db');console.log('表数',db.prepare(\"SELECT COUNT(*) c FROM sqlite_master WHERE type='table'\").get().c);console.log('账户',db.prepare('SELECT COUNT(*) c FROM accounts').get().c);console.log('流水',db.prepare('SELECT COUNT(*) c FROM transactions').get().c);console.log('integrity',JSON.stringify(db.pragma('integrity_check')));console.log('foreign_key',JSON.stringify(db.pragma('foreign_key_check')));db.close()"
+
+# ⑤ （可选）现有用户增量加卡：先在副本验证，再预览，最后显式写入
+node scripts\verify-add-existing-user-cards.js
+node scripts\add-existing-user-cards.js --db data\rongzhi.db --user-id 1 --preview
+node scripts\add-existing-user-cards.js --db data\rongzhi.db --user-id 1 --apply            # 仅加卡
+node scripts\add-existing-user-cards.js --db data\rongzhi.db --user-id 1 --apply --with-consumption   # 再加样例消费
+```
+
+### 回退（迁移失败 / 需回到旧结构）
+
+```powershell
+cd C:\Users\HUAWEI123\Desktop\rongzhi-agent\backend
+
+# ① 停止服务（避免运行中写库）
+#   停止 3000 后端进程（Ctrl+C 或 taskkill /PID <pid> /F）
+
+# ② 保存失败现场（失败后的库 + WAL/SHM，供排查，先留存）
+$ts = Get-Date -Format 'yyyyMMdd-HHmmss'
+$scene = "data\backups\failure-scene-$ts"
+New-Item -ItemType Directory -Force -Path $scene | Out-Null
+Copy-Item data\rongzhi.db      "$scene\rongzhi.db"      -ErrorAction SilentlyContinue
+Copy-Item data\rongzhi.db-wal  "$scene\rongzhi.db-wal"  -ErrorAction SilentlyContinue
+Copy-Item data\rongzhi.db-shm  "$scene\rongzhi.db-shm"  -ErrorAction SilentlyContinue
+
+# ③ 恢复数据库：用【独立快照】（Online Backup 产物），并删除运行库的 -wal/-shm，不混入旧 WAL/SHM
+Copy-Item data\backups\rongzhi.pre-transfer-<时间戳>.db data\rongzhi.db -Force
+Remove-Item data\rongzhi.db-wal, data\rongzhi.db-shm -Force -ErrorAction SilentlyContinue
+#   对应加密主密钥 data\.verification-key 保持不动（数据库与主密钥必须成套恢复）
+
+# ④ 回退代码版本：用与旧结构兼容的代码，避免新代码启动时立即自动重迁移
+#   切回「信用卡功能之前」的代码版本后，再重启：
+npm start
+```
+
+> **要点**：① 副本演练在迁移前做，是「提前验证」，不是迁移后的唯一验证——迁移后必须再查真实库；
+> ② 恢复用 Online Backup 的独立快照（已合并 WAL），恢复后要删除 `-wal`/`-shm`，不要把旧的 `-wal`/`-shm`
+> 与新快照混在一起；③ 若回退目标是旧结构，必须同时回退代码，否则新代码启动时会自动再次迁移。
 
 ## 备份与恢复
 

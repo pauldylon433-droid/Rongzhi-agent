@@ -135,6 +135,7 @@ function viewTask(db, userId, row, now) {
     kind: row.kind,
     status: row.status,
     month: row.month,
+    session_id: row.session_id, // 发起该任务的助手会话（前端据此把任务绑定到当前对话）
     selected_subscription_id: row.selected_subscription_id,
     selected_subscription: subscriptionView(db, userId, row.selected_subscription_id),
     op_ref: row.op_ref,

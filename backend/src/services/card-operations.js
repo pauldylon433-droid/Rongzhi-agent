@@ -105,6 +105,10 @@ export function finalizeCardOperation(db, userId, row, now, expectedStatus) {
     JSON.stringify({ action: row.action, card_id: row.card_id, from: row.from_status, to: row.to_status }),
   )
 
+  // 完成同步（与转账一致）：清除发起该单的会话「待确认」引用，避免会话保留已完成的旧「待确认」上下文。
+  // 银行卡操作单无 session_id 列，按引用号反向清除（操作单 ref 全局唯一，属单一会话，无歧义）。
+  db.prepare('UPDATE chat_sessions SET pending_card_op_ref = NULL WHERE pending_card_op_ref = ?').run(row.ref_no)
+
   return { outcome: 'completed', op: viewCardOperation(db, getById(db, row.id)) }
 }
 

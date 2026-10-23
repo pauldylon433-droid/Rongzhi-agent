@@ -16,8 +16,18 @@ export function createAnalyticsRouter(db, demoUserId) {
       return badRequest(res, 'month 参数格式应为 YYYY-MM（月份 01-12）')
     }
 
+    // 借记卡选择驱动的按账户过滤：仅接受单个正整数账户 id（数组 / 非法值一律 400）
+    let accountId
+    if (req.query.account_id !== undefined) {
+      if (typeof req.query.account_id !== 'string' || !/^\d+$/.test(req.query.account_id)) {
+        return badRequest(res, 'account_id 必须是正整数')
+      }
+      accountId = Number(req.query.account_id)
+      if (accountId < 1) return badRequest(res, 'account_id 必须是正整数')
+    }
+
     const asOf = new Date().toISOString()
-    const data = monthlyAnalytics(db, demoUserId, { ...month, asOf })
+    const data = monthlyAnalytics(db, demoUserId, { ...month, asOf, accountId })
     ok(res, data)
   })
 

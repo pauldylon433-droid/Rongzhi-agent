@@ -1,5 +1,6 @@
 // 模拟转账路由：创建 / 查看 / 确认 / 取消 / 强验证。身份与数据归属由服务端演示用户固定，
-// 客户端不能指定付款账户、收款人、风险级别之外的字段；确认/验证不接受重新指定金额或收款人。
+// 客户端可显式指定「付款账户」（from_account_id）：服务端核验归属 / 状态 / 账户类型（信用卡拒绝）/ 余额；
+// 其余字段（收款人、金额、备注）由客户端提供，风险级别由服务端判定；确认/验证不接受重新指定金额或收款人。
 import { Router } from 'express'
 import { ok, badRequest } from './helpers.js'
 import {
@@ -41,18 +42,23 @@ export function createTransfersRouter(db, demoUserId) {
     ok(res, listRecipients(db))
   })
 
-  // 创建转账单（不扣款）
+  // 创建转账单（不扣款）。from_account_id 必须由前端显式传入（付款账户不能静默代选）；
+  // 服务端在 createTransfer 内核验归属、状态、account_type='deposit' 与余额。
   router.post('/', (req, res) => {
     const body = req.body || {}
-    const allowed = ['recipient_id', 'amount_cents', 'remark']
+    const allowed = ['recipient_id', 'amount_cents', 'remark', 'from_account_id']
     const extra = Object.keys(body).filter((k) => !allowed.includes(k))
     if (extra.length) return badRequest(res, `不允许提交字段：${extra.join('、')}`)
+    if (body.from_account_id === undefined || body.from_account_id === null) {
+      return badRequest(res, '请选择付款账户（from_account_id）')
+    }
 
     try {
       const op = createTransfer(db, demoUserId, {
         recipientId: body.recipient_id,
         amountCents: body.amount_cents,
         remark: body.remark,
+        fromAccountId: body.from_account_id,
       })
       ok(res, op)
     } catch (e) {

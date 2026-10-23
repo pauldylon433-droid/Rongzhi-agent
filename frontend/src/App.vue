@@ -1,212 +1,201 @@
 <script setup>
-import AccountOverview from './components/AccountOverview.vue'
-import TransferPanel from './components/TransferPanel.vue'
-import AssistantPanel from './components/AssistantPanel.vue'
-import MonthlyAnalytics from './components/MonthlyAnalytics.vue'
-import TransactionList from './components/TransactionList.vue'
-import CardList from './components/CardList.vue'
-import SubscriptionList from './components/SubscriptionList.vue'
+// 应用外壳：CSS Grid 三栏（导航 / 业务主区 / 总览右侧 AI），比例相对整个应用宽度。
+// 总览展开态 = 14 : 56.5 : 29.5；其余视图（AI 工作区、各业务页）与总览「收起 AI」时退化为导航 + 主区。
+import { ref, computed, onMounted } from 'vue'
+import { useNavigation } from './composables/useNavigation.js'
+import { useAssistantState } from './composables/useAssistantState.js'
+import NavSidebar from './components/NavSidebar.vue'
+import AssistantSidebar from './components/AssistantSidebar.vue'
+import BrandMark from './components/BrandMark.vue'
+import OverviewView from './views/OverviewView.vue'
+import AssistantView from './views/AssistantView.vue'
+import AccountsView from './views/AccountsView.vue'
+import BillView from './views/BillView.vue'
+import CardsView from './views/CardsView.vue'
+import SubscriptionsView from './views/SubscriptionsView.vue'
+import TasksView from './views/TasksView.vue'
 
-const scenarios = [
-  { name: '智能转账', desc: '对话式发起转账', state: '模拟转账已实现' },
-  { name: '账单分析', desc: '账单洞察与可视化', state: '数据展示已实现' },
-  { name: '卡片管理', desc: '卡片状态统一管理', state: '查询/冻结/解冻已实现' },
-  { name: '订阅与代扣', desc: '订阅与自动扣款管理', state: '数据展示已实现' },
-  { name: '跨场景联动', desc: '多场景任务协同', state: '订阅审查单链已实现' },
-]
+const { currentView } = useNavigation()
+const { open: assistantOpen, collapse: collapseAssistant } = useAssistantState()
+
+const navCollapsed = ref(false)
+const mobileNavOpen = ref(false)
+const isCompactNav = ref(false) // 平板（768—1279px）导航自动收为图标栏
+
+const effectiveNavCollapsed = computed(() => navCollapsed.value || isCompactNav.value)
+
+function syncNavCompact() {
+  if (typeof window === 'undefined') return
+  const w = window.innerWidth
+  isCompactNav.value = w >= 768 && w < 1280
+}
+
+const viewMap = {
+  overview: OverviewView,
+  assistant: AssistantView,
+  accounts: AccountsView,
+  bill: BillView,
+  cards: CardsView,
+  subscriptions: SubscriptionsView,
+  tasks: TasksView,
+}
+const currentComponent = computed(() => viewMap[currentView.value] || OverviewView)
+
+const isOverview = computed(() => currentView.value === 'overview')
+// 仅总览显示第三栏（AI 助手）；其余视图占满主区
+const aiVisible = computed(() => isOverview.value && assistantOpen.value)
+
+// 三栏网格：展开态 14fr 56.5fr 29.5fr；收起 AI 或非总览视图退化为导航 + 主区
+const gridColumns = computed(() => {
+  const nav = effectiveNavCollapsed.value ? '64px' : '14fr'
+  if (aiVisible.value) return `${nav} 56.5fr 29.5fr`
+  return effectiveNavCollapsed.value ? '64px 1fr' : '14fr 86fr'
+})
+
+function toggleCollapse() {
+  navCollapsed.value = !navCollapsed.value
+}
+function closeMobileNav() {
+  mobileNavOpen.value = false
+}
+
+// 手机端 AI 侧栏默认收起（抽屉），桌面端默认展开
+onMounted(() => {
+  if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches) {
+    collapseAssistant()
+  }
+  syncNavCompact()
+  window.addEventListener('resize', syncNavCompact)
+})
 </script>
 
 <template>
-  <div class="page">
-    <header class="topbar">
-      <div class="topbar-inner">
-        <div class="brand">
-          <span class="brand-mark">融智</span>
-          <span class="brand-name">融智 Agent</span>
+  <div class="app-shell" :style="{ gridTemplateColumns: gridColumns }">
+    <NavSidebar
+      :collapsed="effectiveNavCollapsed"
+      :mobile-open="mobileNavOpen"
+      @toggle-collapse="toggleCollapse"
+      @navigate="closeMobileNav"
+    />
+
+    <div class="app-main">
+      <header class="mobile-topbar">
+        <button class="mobile-menu" aria-label="打开导航" @click="mobileNavOpen = true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 6h16M4 12h16M4 18h16" />
+          </svg>
+        </button>
+        <div class="mobile-brand">
+          <BrandMark :size="28" />
+          <span class="mobile-brand-name">融智 Agent</span>
         </div>
-        <span class="env-badge">模拟银行环境 · 数据仅供演示</span>
-      </div>
-    </header>
+        <span class="mobile-env">模拟银行环境</span>
+      </header>
 
-    <main class="container">
-      <section class="hero">
-        <h1 class="title">融智 Agent</h1>
-        <p class="subtitle">银行 AI 智能体</p>
-        <p class="hero-note">以下账户、交易、卡片与订阅均为模拟数据，不接入真实银行账户</p>
-      </section>
+      <component :is="currentComponent" />
+    </div>
 
-      <AccountOverview />
-      <TransferPanel />
-      <AssistantPanel />
-      <MonthlyAnalytics />
-      <TransactionList />
-      <CardList />
-      <SubscriptionList />
+    <AssistantSidebar v-if="aiVisible" :open="assistantOpen" @collapse="collapseAssistant" />
 
-      <section class="section scenarios">
-        <h2 class="section-title">业务场景规划</h2>
-        <p class="scenarios-note">当前已实现只读数据展示、模拟小额转账、银行卡查询 / 临时冻结 / 解冻、订阅暂停 / 恢复 / 取消；跨场景联动已支持「分析本月支出 → 列出生效订阅 → 选择后暂停一项」这一条任务链，其余组合尚未支持。正式挂失、销卡、补卡、调额仍在规划中。</p>
-        <div class="grid">
-          <div v-for="(s, i) in scenarios" :key="s.name" class="card">
-            <div class="card-top">
-              <span class="card-index">{{ i + 1 }}</span>
-              <span class="card-state" :class="s.state === '规划中' ? 'is-pending' : 'is-done'">
-                {{ s.state }}
-              </span>
-            </div>
-            <span class="card-name">{{ s.name }}</span>
-            <span class="card-desc">{{ s.desc }}</span>
-          </div>
-        </div>
-      </section>
-    </main>
-
-    <footer class="footer">
-      融智 Agent · 银行 AI 智能体竞赛项目 · 所有业务均为模拟数据，不接入真实银行账户
-    </footer>
+    <div v-if="mobileNavOpen" class="nav-backdrop" @click="closeMobileNav"></div>
+    <div v-if="isOverview && assistantOpen" class="assistant-backdrop" @click="collapseAssistant"></div>
   </div>
 </template>
 
 <style scoped>
-.page {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-}
-.topbar {
-  background: #0b2545;
-  color: #fff;
-}
-.topbar-inner {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 14px 24px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.brand-mark {
-  background: #2563eb;
-  padding: 4px 10px;
-  border-radius: 6px;
-  font-weight: 600;
-  font-size: 14px;
-}
-.brand-name {
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-}
-.env-badge {
-  background: #fef3c7;
-  color: #92400e;
-  border: 1px solid #fde68a;
-  padding: 4px 12px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
-}
-.container {
-  flex: 1;
-  width: 100%;
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 40px 24px 24px;
-}
-.hero {
-  text-align: center;
-  margin-bottom: 32px;
-}
-.title {
-  margin: 0;
-  font-size: 40px;
-  font-weight: 700;
-  color: #0b2545;
-  letter-spacing: 1px;
-}
-.subtitle {
-  margin: 8px 0 0;
-  font-size: 20px;
-  color: #475569;
-}
-.hero-note {
-  margin: 12px 0 0;
-  font-size: 13px;
-  color: #94a3b8;
-}
-.scenarios {
-  margin-bottom: 0;
-}
-.scenarios-note {
-  margin: 0 0 16px;
-  font-size: 13px;
-  color: #64748b;
-}
-.grid {
+.app-shell {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 16px;
+  height: 100vh;
+  overflow: hidden;
+  align-items: stretch;
 }
-.card {
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
-  padding: 16px;
+.app-main {
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  background: #f5f7fa;
+  overflow-y: auto;
 }
-.card-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+.mobile-topbar {
+  display: none;
 }
-.card-index {
-  font-size: 12px;
-  color: #2563eb;
-  font-weight: 600;
+.nav-backdrop {
+  display: none;
 }
-.card-state {
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 999px;
-}
-.card-state.is-done {
-  background: #dcfce7;
-  color: #15803d;
-}
-.card-state.is-pending {
-  background: #f1f5f9;
-  color: #64748b;
-}
-.card-name {
-  font-size: 16px;
-  font-weight: 600;
-  color: #0f172a;
-}
-.card-desc {
-  font-size: 13px;
-  color: #64748b;
-}
-.footer {
-  text-align: center;
-  padding: 20px;
-  font-size: 13px;
-  color: #94a3b8;
-  border-top: 1px solid #e2e8f0;
+.assistant-backdrop {
+  display: none;
 }
 
-@media (max-width: 640px) {
-  .title {
-    font-size: 32px;
+@media (max-width: 767px) {
+  .app-shell {
+    display: block;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+  .app-main {
+    overflow: visible;
+    min-height: 100vh;
+  }
+  .mobile-topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--navy);
+    color: #fff;
+    position: sticky;
+    top: 0;
+    z-index: 40;
+  }
+  .mobile-menu {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 6px;
+    color: #fff;
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .mobile-menu svg {
+    width: 20px;
+    height: 20px;
+  }
+  .mobile-brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+  }
+  .mobile-brand-name {
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .mobile-env {
+    font-size: 11px;
+    color: #cbd5e1;
+    background: rgba(255, 255, 255, 0.12);
+    padding: 3px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .nav-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 45;
+    background: rgba(15, 23, 42, 0.35);
+  }
+  .assistant-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 65;
+    background: rgba(15, 23, 42, 0.35);
   }
 }
 </style>

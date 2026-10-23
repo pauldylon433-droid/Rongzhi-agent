@@ -3,7 +3,14 @@ import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { fetchTransactions } from '../api/index.js'
 import { useMonthRange } from '../composables/useMonthRange.js'
 import { useDataRefresh } from '../composables/useDataRefresh.js'
+import { useCardSelection } from '../composables/useCardSelection.js'
 import { formatCentsToYuan, formatShanghaiDateTime } from '../utils/format.js'
+import MonthPicker from './MonthPicker.vue'
+import CategoryBadge from './CategoryBadge.vue'
+import AccountScopeSelect from './AccountScopeSelect.vue'
+
+// 全局账户范围（含「全部账户」）驱动流水过滤；与银行卡页选卡共用同一状态
+const { selectedAccountId } = useCardSelection()
 
 const PAGE_SIZE = 10
 
@@ -23,11 +30,7 @@ const monthNum = ref(currentMonth)    // 选中的月份（1-12）
 const statusFilter = ref('')          // 入账状态：'' 全部 / 'posted' 已入账 / 'pending' 待入账
 const page = ref(1)
 
-const isAll = computed(() => year.value === '')
 const selectedYear = computed(() => (year.value === '' ? null : Number(year.value)))
-
-// 当前选中年份可选月份
-const monthOptions = computed(() => monthOptionsFor(selectedYear.value))
 
 const rows = ref([])
 const total = ref(0)
@@ -38,7 +41,6 @@ const error = ref('')
 let requestId = 0
 
 // 分页稳定性：翻页加载时保留上一页列表高度，避免整段塌陷导致视口上跳。
-// 外层 .tx-body-reserve 用 min-height 预留「完整页」高度，内层 .tx-body 测量自然高度（只增不减）。
 const bodyEl = ref(null)
 const reserveHeight = ref(0)
 const reserveStyle = computed(() =>
@@ -67,6 +69,7 @@ async function load() {
     const res = await fetchTransactions({
       month: monthValue,
       status: statusFilter.value === '' ? undefined : statusFilter.value,
+      accountId: selectedAccountId.value || undefined,
       limit: PAGE_SIZE,
       offset,
     })
@@ -87,12 +90,9 @@ const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)
 const hasPrev = computed(() => page.value > 1)
 const hasNext = computed(() => page.value < totalPages.value)
 
-function onYearChange() {
-  // 切换年份后，把月份钳制到该年份可选范围内（默认取最大可选月份）
-  const opts = monthOptions.value
-  if (opts.length && !opts.includes(monthNum.value)) {
-    monthNum.value = opts[opts.length - 1]
-  }
+function onMonthSelect({ year: y, month: m }) {
+  year.value = y
+  if (y !== '') monthNum.value = m
   changeFilter()
 }
 
@@ -130,22 +130,28 @@ onMounted(() => {
 // 转账成功后刷新当前月份流水，与账户余额、月度统计保持一致
 const { version } = useDataRefresh()
 watch(version, load)
+
+// 切换选中卡（账户过滤）后回到第一页重新加载
+watch(selectedAccountId, () => {
+  changeFilter()
+})
 </script>
 
 <template>
   <section class="section">
     <div class="section-head">
       <h2 class="section-title">交易流水</h2>
-      <div class="filter">
-        <label class="filter-label">月份</label>
+      <div class="filter-toolbar">
+        <AccountScopeSelect />
         <template v-if="!accountsLoading && !filterMessage">
-          <select v-model="year" class="select" aria-label="年份" @change="onYearChange">
-            <option value="">全部月份</option>
-            <option v-for="y in yearOptions" :key="y" :value="String(y)">{{ y }} 年</option>
-          </select>
-          <select v-model="monthNum" class="select" aria-label="月份" :disabled="isAll" @change="changeFilter">
-            <option v-for="m in monthOptions" :key="m" :value="m">{{ m }} 月</option>
-          </select>
+          <MonthPicker
+            :year="year"
+            :month="monthNum"
+            :year-options="yearOptions"
+            :month-options-for="monthOptionsFor"
+            allow-all
+            @select="onMonthSelect"
+          />
         </template>
         <span v-else-if="accountsLoading" class="filter-note">正在获取开户日期…</span>
         <span v-else class="filter-warn">{{ filterMessage }}</span>
@@ -166,25 +172,41 @@ watch(version, load)
           <button class="btn-ghost" @click="load">重试</button>
         </div>
         <p v-else-if="rows.length === 0" class="state-empty">当前筛选条件下暂无交易记录</p>
-        <ul v-else class="tx-list">
-          <li v-for="t in rows" :key="t.id" class="tx-item">
-            <div class="tx-main">
-              <span class="tx-merchant">{{ t.merchant || '—' }}</span>
-              <span class="tx-sub">
-                {{ t.category }}<template v-if="t.description"> · {{ t.description }}</template>
-              </span>
-            </div>
-            <div class="tx-side">
-              <span class="tx-amount" :class="t.direction === 'income' ? 'is-income' : 'is-expense'">
-                {{ amountPrefix(t.direction) }}{{ formatCentsToYuan(t.amount_cents) }}
-              </span>
-              <span class="status-badge" :class="statusTone(t.status)">
-                {{ statusText[t.status] || '未知状态' }}
-              </span>
-              <span class="tx-time">{{ formatShanghaiDateTime(t.transaction_at) }}</span>
-            </div>
-          </li>
-        </ul>
+        <div v-else class="tx-table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>交易描述</th>
+                <th>分类</th>
+                <th>状态</th>
+                <th class="num">金额</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="t in rows" :key="t.id">
+                <td class="tx-time">{{ formatShanghaiDateTime(t.transaction_at) }}</td>
+                <td>
+                  <div class="tx-desc-cell">
+                    <span class="tx-merchant">
+                      <span v-if="t.flow_kind === 'repayment'" class="repay-tag">还款</span>{{ t.merchant || '—' }}
+                    </span>
+                    <span v-if="t.description" class="tx-sub">{{ t.description }}</span>
+                  </div>
+                </td>
+                <td><span class="cat-inline"><CategoryBadge :category="t.category" /><span>{{ t.category }}</span></span></td>
+                <td>
+                  <span class="status-badge" :class="statusTone(t.status)">
+                    {{ statusText[t.status] || '未知状态' }}
+                  </span>
+                </td>
+                <td class="num tx-amount" :class="t.direction === 'income' ? 'is-income' : 'is-expense'">
+                  {{ amountPrefix(t.direction) }}{{ formatCentsToYuan(t.amount_cents) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -211,15 +233,6 @@ watch(version, load)
 .section-title {
   margin: 0;
 }
-.filter {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.filter-label {
-  font-size: 13px;
-  color: var(--muted);
-}
 .filter-note {
   font-size: 13px;
   color: var(--muted);
@@ -228,27 +241,24 @@ watch(version, load)
   font-size: 13px;
   color: #b45309;
 }
-.tx-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
+.repay-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #ede9fe;
+  color: #6d28d9;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: 1px;
 }
-.tx-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--border);
+.tx-table-wrap {
+  overflow-x: auto;
 }
-.tx-item:last-child {
-  border-bottom: none;
-}
-.tx-main {
+.tx-desc-cell {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  min-width: 0;
 }
 .tx-merchant {
   font-weight: 600;
@@ -258,27 +268,14 @@ watch(version, load)
   font-size: 12px;
   color: var(--muted);
 }
-.tx-side {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-  flex-shrink: 0;
+.tx-time {
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .tx-amount {
   font-weight: 600;
-  font-size: 15px;
-  font-variant-numeric: tabular-nums;
-}
-.is-income {
-  color: #15803d;
-}
-.is-expense {
-  color: #b91c1c;
-}
-.tx-time {
-  font-size: 12px;
-  color: var(--muted);
+  white-space: nowrap;
 }
 .pager {
   display: flex;
@@ -302,21 +299,5 @@ watch(version, load)
 .pager-info {
   font-size: 13px;
   color: var(--text);
-}
-
-@media (max-width: 640px) {
-  .filter {
-    flex-wrap: wrap;
-  }
-  .tx-item {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-  .tx-side {
-    flex-direction: row;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
 }
 </style>

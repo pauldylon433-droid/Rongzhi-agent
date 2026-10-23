@@ -11,7 +11,7 @@ import { useTransferSignal } from '../composables/useTransferSignal.js'
 const props = defineProps({
   op: { type: Object, required: true }, // 初始操作视图（至少含 ref_no）
 })
-const emit = defineEmits(['confirmed', 'cancelled'])
+const emit = defineEmits(['confirmed', 'cancelled', 'status'])
 
 const op = ref(props.op)
 const opError = ref('')
@@ -140,6 +140,10 @@ watch(version, () => {
     load()
   }
 })
+
+// 状态变化（挂载回读 / 确认 / 取消 / 强验证 / 改单回读）时，把最新状态上报父级，
+// 供聊天面板隐藏过期的「创建时说明」提示并标注旧 AI 文本。
+watch(op, () => emit('status', op.value && op.value.status), { deep: true })
 </script>
 
 <template>
@@ -165,7 +169,7 @@ watch(version, () => {
       <div class="card-head">
         <span class="card-title">{{ opTitle }}</span>
         <span v-if="showRisk" class="risk-badge" :class="isRed ? 'is-red' : 'is-yellow'">
-          {{ isRed ? '高风险 · 需强验证' : '低风险' }}
+          {{ isRed ? '高风险（红色）· 需强验证' : '低风险（黄色）· 界面确认' }}
         </span>
       </div>
 
@@ -221,7 +225,7 @@ watch(version, () => {
               {{ verifying ? '验证中…' : '验证并确认转账' }}
             </button>
             <button class="btn-ghost" :disabled="verifying || cancelling" @click="onCancel">
-              {{ cancelling ? '取消中…' : '取消' }}
+              {{ cancelling ? '取消中…' : '取消本次操作' }}
             </button>
           </div>
         </template>

@@ -13,7 +13,10 @@ function pad(n) {
 }
 
 // 整数分 → "42,331.09"（仅处理非负金额）
+// 分 → 元字符串（两位小数）。非法值（null / undefined / NaN / Infinity / 字符串）返回「—」；
+// 合法 0 仍显示 0.00。调用方对「不可用」的语义可自行替换为「暂无法获取」。
 export function formatCentsToYuan(cents) {
+  if (typeof cents !== 'number' || !Number.isFinite(cents)) return '—'
   const abs = Math.abs(Math.round(cents))
   const yuan = Math.floor(abs / 100)
   const fen = String(abs % 100).padStart(2, '0')

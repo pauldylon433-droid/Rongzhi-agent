@@ -164,7 +164,7 @@
 
 ### GET /api/analytics/monthly
 
-返回演示用户某上海自然月的账单统计（已入账收支、待入账、支出分类）。
+返回演示用户某上海自然月的账单统计（已入账收支、待入账、收入分类、支出分类）。
 
 #### 查询参数
 
@@ -193,6 +193,9 @@
     "net_cents": 1370904,
     "posted_count": 13,
     "pending": { "count": 2, "amount_cents": 69413 },
+    "income_by_category": [
+      { "category": "收入", "amount_cents": 1580000, "count": 2 }
+    ],
     "expense_by_category": [
       { "category": "住房", "amount_cents": 83959, "count": 2 }
     ]
@@ -201,7 +204,8 @@
 ```
 
 - `as_of` 为本次统计截止时刻（UTC ISO），与统计月份 `month` 明确区分；
-- `expense_by_category` 按支出金额倒序，仅统计已入账支出；
+- `income_by_category` 按收入金额倒序，仅统计已入账收入；合计恒等于 `income_cents`；
+- `expense_by_category` 按支出金额倒序，仅统计已入账支出；合计恒等于 `expense_cents`；
 - 无记录月份正常返回零值与空分类数组。
 
 #### 说明
@@ -259,6 +263,7 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | get_accounts | 无 | 查询账户列表（复用 `listAccounts`） |
 | get_monthly_analytics | `month`（YYYY-MM，严格校验） | 月度账单统计（复用 `monthlyAnalytics`） |
 | search_transfer_recipients | `name`（字符串） | 按姓名 / 虚构联系方式搜索收款人，仅返回 `id`、姓名、掩码账户 |
+| list_transfer_recipients | 无 | 列举当前用户常用收款人（复用 `listRecipients`，仅返回 `id`、姓名、掩码账户），用于「我的收款人有哪些」；只读，不建单 / 不改收款人 / 不动资金 |
 | prepare_transfer | `recipient_id`、`amount_yuan`（字符串）、`remark`（可选）、`account_id`（可选） | 调用现有转账服务生成「待确认转账单」（不扣款） |
 | get_transfer_status | `ref_no`（字符串） | 按操作编号查询转账单当前状态（以数据库为准） |
 | get_cards | 无 | 查询本人银行卡列表（复用 `listCards`，含掩码卡号 / 卡类型 / 状态 / 日限额） |
@@ -270,6 +275,8 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | start_subscription_review | `month`（YYYY-MM，必填） | 启动跨场景「订阅审查」任务（分析该月支出 + 列出生效订阅，落到等待选择；仅此一条任务链） |
 
 - 转账流程：先用 `search_transfer_recipients` 确认收款人；信息齐全且收款人明确后调用 `prepare_transfer` 生成草稿。
+  「我的收款人有哪些 / 列出常用收款人」等列举需求用 `list_transfer_recipients`（只读，返回全部收款人的 `id`/姓名/掩码账户）；
+  指定姓名查找仍用 `search_transfer_recipients`。
   金额参数用 `amount_yuan` 字符串（如 `"100.00"`），服务端用字符串拆分精确转换为整数分（拒绝负数、零、
   超过两位小数、科学计数法、超出安全整数范围；不采用浮点乘 100）。付款账户不唯一且用户未指定时先澄清。
 - `prepare_transfer` 的 `data` 为转账单视图（同 `POST /api/transfers` 返回），前端据此渲染确认卡；
@@ -323,7 +330,6 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
   "success": true,
   "data": {
     "sessionId": "0d7c...-...",
-    "expired": false,
     "messages": [
       { "role": "user", "text": "我的账户余额是多少？", "toolRecords": null, "incomplete": false, "error": null },
       { "role": "assistant", "text": "...", "toolRecords": [ "本次工具执行记录" ], "incomplete": false, "error": null }
@@ -333,7 +339,6 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 ```
 
 - `sessionId`：当前会话标识；无当前对话时为 `null`。
-- `expired`：会话模型上下文是否已过期（超过 30 分钟未活跃）。为 `true` 时历史仍可查看，但后续对话将从全新上下文开始。
 - `messages`：用户可见消息（按顺序）。`role` 为 `user` / `assistant`；助手消息含 `toolRecords`（工具展示记录）、
   `incomplete`（是否因达到调用/工具上限而未完成）、`error`（失败说明，正常为空）。
 - 历史消息为查询时的**快照**；转账 / 银行卡操作卡以其中的 `ref_no` 回读业务库**最新状态**，不会沿用历史里的旧状态。
@@ -595,6 +600,67 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
   若关联操作单已确认完成（确认与取消竞态），以事务结果为准：任务按真实结果对账为 `completed`，**不反向**已发生的订阅变更。
 - 继续（resume）重新检查任务、订阅版本与操作单有效期；过期 / 失效单需重新生成并要求再次确认，不直接执行。
 - 失败（failed）任务可「继续」回到等待选择，重新选择；已确认的订阅变更不会因任务取消 / 失败 / 转手动被自动反向。
+
+### GET /api/activity
+
+业务活动聚合列表（**只读**）：把当前用户四类真实业务记录——转账操作单、银行卡操作单、订阅操作单、
+跨场景任务——合并为一条统一时间线，供「最近任务」页与 AI 工作区左侧「最近任务」共用。
+
+事实来源为原业务表（`transfer_operations` / `card_operations` / `subscription_operations` / `agent_tasks`），
+不拼接聊天 `toolRecords`、不生成新记录、不猜测会话关联；普通余额 / 状态 / 回执查询**不会**产生新记录。
+跨场景任务通过选择订阅生成的关联订阅操作单（`agent_tasks.op_ref` 指向的订阅单）**不重复列出**，
+避免同一暂停被误以为执行两次；独立的订阅操作正常列出。
+
+#### 查询参数
+
+| 参数 | 类型 | 默认 | 说明 |
+| ---- | ---- | ---- | ---- |
+| type | string | 无 | `transfer` / `card_op` / `subscription_op` / `task`；不传则全部 |
+| status | string | 无 | 操作单或任务状态；支持逗号分隔多个状态（如 `pending,waiting_confirmation` 表示「待确认」合并筛选）；不传则全部 |
+| limit | integer | 50 | 每页条数，1-100 |
+| offset | integer | 0 | 偏移量，非负整数 |
+
+- 结果按「创建时间倒序 + 类型固定序 + 编号」稳定排序，保证分页不重不漏。
+- `type` 非法返回 400；`status` 必须为字符串，非字符串返回 400；`limit` / `offset` 非法返回 400。
+- `status` 支持逗号分隔多个状态（在**分页之前**对全集生效，`meta.total` 与列表、页数一致）：
+  独立操作单的 `pending`（待确认）与跨场景任务的 `waiting_confirmation`（等待确认）语义同属「等待界面确认」，
+  前端「待确认」筛选项传 `status=pending,waiting_confirmation` 同时包含两类，仅改展示与筛选、不改数据库状态值。
+- `meta.total` 为完整筛选条件下（`type` + `status`）的总条数，不受分页影响。
+
+#### 响应
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "key": "subscription_op:9f86bf9d-…",
+      "kind": "subscription_op",
+      "ref_no": "9f86bf9d-…",
+      "task_no": null,
+      "status": "completed",
+      "action": "pause",
+      "object": "Adobe 摄影计划",
+      "amount_cents": 8800,
+      "billing_cycle": "yearly",
+      "month": null,
+      "op_ref": null,
+      "created_at": "2026-10-23T06:30:00.000Z",
+      "updated_at": "2026-10-23T06:30:00.000Z",
+      "completed_at": "2026-10-23T06:31:00.000Z"
+    }
+  ],
+  "meta": { "total": 12, "limit": 50, "offset": 0 }
+}
+```
+
+- `key` 为「类型 + 编号」唯一键（如 `transfer:…` / `card_op:…` / `subscription_op:…` / `task:…`），供前端去重与定位。
+- `kind` 四类：`transfer`（转账）、`card_op`（银行卡）、`subscription_op`（订阅）、`task`（跨场景任务）。
+- `ref_no` 为操作单编号（任务为 `null`）；`task_no` 为任务编号（非任务为 `null`）；二者必居其一。
+- `object` 为摘要对象：转账收款人、银行卡掩码卡号、订阅商户、任务所选商户（未选则空）。
+- `amount_cents` / `billing_cycle`：转账与订阅为金额（分）与周期（`monthly` / `yearly`）；银行卡操作与无金额任务为 `null`。
+- `created_at` / `updated_at` / `completed_at` 统一为 UTC ISO 8601（操作单用 ISO，任务用 epoch 毫秒在服务端归一化后返回）。
+- `status` 保留数据库原值（操作单与任务两套词汇并存），展示层仅做文案映射，不改语义；过期判定由各操作单详情读取时应用，聚合列表为只读不写。
 
 ## 错误处理
 

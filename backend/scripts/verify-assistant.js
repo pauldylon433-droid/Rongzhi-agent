@@ -1,6 +1,6 @@
 // AI 助手验证脚本：使用「模拟模型响应 + 独立临时数据库」验证助手服务。
 // 覆盖：正常工具调用及多工具回传、未知工具/额外参数/非法月份拒绝、工具失败不伪造结果、
-//       轮次上限、会话过期、上下文追问、客户端伪造 system/tool 历史拒绝、转账不触发写入。
+//       轮次上限、会话闲置不丢上下文、上下文追问、客户端伪造 system/tool 历史拒绝、转账不触发写入。
 // 不修改开发数据库（backend/data/rongzhi.db），不调用真实模型，不依赖外部服务。
 // 用法：node scripts/verify-assistant.js
 import { openDatabase } from '../src/db/connection.js'
@@ -182,7 +182,7 @@ const demoUserId = u1
   check('5.3 仅发起一轮模型请求', mock.calls.length === 1, `${mock.calls.length}`)
 }
 
-// ---------- 6. 会话过期 ----------
+// ---------- 6. 会话闲置不丢上下文 ----------
 {
   const mock = makeScriptedMock([
     { content: '你好，有什么可以帮你？' },
@@ -191,12 +191,12 @@ const demoUserId = u1
   const assistant = createAssistant({ db, demoUserId, chatFn: mock })
   const r1 = await assistant.chat({ message: '你好' })
   check('6.1 首次会话生成 sessionId', typeof r1.sessionId === 'string' && r1.sessionId.length > 0)
-  // 手动把会话标记为过期
+  // 手动把会话标记为长期闲置（超过原 30 分钟阈值）
   assistant._sessions.get(r1.sessionId).lastActiveAt = Date.now() - 31 * 60 * 1000
   const r2 = await assistant.chat({ message: '上个月呢？', sessionId: r1.sessionId })
-  check('6.2 过期会话沿用同一 sessionId（可见历史保留，上下文重新开始）', r2.sessionId === r1.sessionId)
+  check('6.2 闲置会话沿用同一 sessionId（历史延续）', r2.sessionId === r1.sessionId)
   const userMsgs = mock.calls[1].messages.filter((m) => m.role === 'user').map((m) => m.content)
-  check('6.3 过期会话不保留旧上下文', userMsgs.length === 1 && userMsgs[0] === '上个月呢？', JSON.stringify(userMsgs))
+  check('6.3 闲置会话保留旧上下文（含此前用户消息）', userMsgs.includes('你好') && userMsgs.includes('上个月呢？'), JSON.stringify(userMsgs))
 }
 
 // ---------- 7. 上下文追问（历史保留完整工具调用与结果） ----------

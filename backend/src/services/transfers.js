@@ -8,7 +8,7 @@ export const TRANSFER_EXPIRY_MS = 5 * 60 * 1000     // 待确认有效期：5 �
 export const MAX_REMARK_LEN = 200
 
 const OPERATION_COLS = `
-  id, ref_no, user_id, from_account_id, from_account_name, recipient_id, recipient_name,
+  id, ref_no, user_id, session_id, from_account_id, from_account_name, recipient_id, recipient_name,
   recipient_masked_account, amount_cents, remark, status, risk_level,
   created_at, expires_at, confirmed_at
 `
@@ -79,7 +79,7 @@ export function viewTransfer(db, row) {
 // 前置：归属、到期、终态、当日累计（以及红色验证码）均已在校验通过后调用。
 export function finalizeTransfer(db, userId, row, now, expectedStatus) {
   const acct = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').get(row.from_account_id, userId)
-  if (!acct || acct.status !== 'active') {
+  if (!acct || acct.status !== 'active' || acct.account_type !== 'deposit') {
     db.prepare(`UPDATE transfer_operations SET status = 'failed' WHERE id = ? AND status = ?`).run(row.id, expectedStatus)
     return { outcome: 'failed', op: viewTransfer(db, getById(db, row.id)) }
   }
@@ -115,6 +115,14 @@ export function finalizeTransfer(db, userId, row, now, expectedStatus) {
      VALUES (?, 'transfer', ?, 'confirm', 'success', ?)`,
   ).run(userId, row.ref_no, JSON.stringify({ amount_cents: row.amount_cents, transaction_id: txId }))
 
+  // 权威回执：清除发起该单的原始会话的「待确认」引用（仅当仍指向本单，不影响后续新单）。
+  // 后续查询据此以数据库最新状态为准，不再沿用「已生成待确认单」的旧上下文。
+  if (row.session_id) {
+    db.prepare(
+      `UPDATE chat_sessions SET pending_transfer_ref = NULL WHERE id = ? AND pending_transfer_ref = ?`,
+    ).run(row.session_id, row.ref_no)
+  }
+
   return { outcome: 'completed', op: viewTransfer(db, getById(db, row.id)), transaction_id: txId }
 }
 
@@ -122,8 +130,32 @@ export function listRecipients(db) {
   return db.prepare('SELECT id, name, masked_account FROM transfer_recipients ORDER BY id').all()
 }
 
+// 读取某助手会话最近一笔转账的权威状态（供聊天上下文注入；不扫描全部历史，仅单条按会话索引查询）。
+// 返回精简回执（真实操作状态、金额、付款账户、收款人、流水引用、确认时间），无会话或无转账返回 null。
+export function latestTransferForSession(db, userId, sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId) return null
+  const row = db
+    .prepare(
+      `SELECT ${OPERATION_COLS} FROM transfer_operations
+       WHERE user_id = ? AND session_id = ? ORDER BY id DESC LIMIT 1`,
+    )
+    .get(userId, sessionId)
+  if (!row) return null
+  const v = viewTransfer(db, row)
+  return {
+    ref_no: row.ref_no,
+    status: row.status,
+    amount_cents: row.amount_cents,
+    from_account_name: row.from_account_name,
+    recipient_name: row.recipient_name,
+    transaction_id: v.transaction_id || null,
+    confirmed_at: row.confirmed_at,
+  }
+}
+
 // 创建转账单（不扣款）。校验金额 / 收款人 / 账户状态与余额，风险级别由后端判定。
-export function createTransfer(db, userId, { recipientId, amountCents, remark, fromAccountId }, now = new Date()) {
+// sessionId 为发起该单的助手会话（可空）：确认时据此把权威回执关联回原始会话，而非「确认时恰好打开的会话」。
+export function createTransfer(db, userId, { recipientId, amountCents, remark, fromAccountId, sessionId }, now = new Date()) {
   if (typeof amountCents !== 'number' || !Number.isSafeInteger(amountCents) || amountCents <= 0) {
     throw new TransferError('金额必须为正整数（单位：分）', 'bad_amount')
   }
@@ -142,13 +174,20 @@ export function createTransfer(db, userId, { recipientId, amountCents, remark, f
     fromAcct = db
       .prepare("SELECT * FROM accounts WHERE id = ? AND user_id = ? AND status = 'active'")
       .get(fromAccountId, userId)
+    // 信用卡账户（account_type='credit'）不得作为对外付款账户；不得自动替换成借记卡。
+    if (fromAcct && fromAcct.account_type !== 'deposit') {
+      throw new TransferError('信用卡账户不可用于对外转账，请选择借记卡关联的活期账户', 'bad_account')
+    }
   } else {
     fromAcct = db
-      .prepare("SELECT * FROM accounts WHERE user_id = ? AND status = 'active' ORDER BY id LIMIT 1")
+      .prepare("SELECT * FROM accounts WHERE user_id = ? AND status = 'active' AND account_type = 'deposit' ORDER BY id LIMIT 1")
       .get(userId)
   }
   if (!fromAcct) {
     throw new TransferError('没有可用的付款账户', 'no_account')
+  }
+  if (fromAcct.account_type !== 'deposit') {
+    throw new TransferError('信用卡账户不可用于对外转账', 'bad_account')
   }
   if (fromAcct.balance_cents < amountCents) {
     throw new TransferError('账户余额不足', 'insufficient_balance')
@@ -169,12 +208,13 @@ export function createTransfer(db, userId, { recipientId, amountCents, remark, f
     const info = db
       .prepare(
         `INSERT INTO transfer_operations
-          (ref_no, user_id, from_account_id, from_account_name, recipient_id, recipient_name,
+          (ref_no, user_id, session_id, from_account_id, from_account_name, recipient_id, recipient_name,
            recipient_masked_account, amount_cents, remark, status, risk_level, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        refNo, userId, fromAcct.id, fromAcct.account_name, recipient.id, recipient.name,
+        refNo, userId, typeof sessionId === 'string' && sessionId ? sessionId : null,
+        fromAcct.id, fromAcct.account_name, recipient.id, recipient.name,
         recipient.masked_account, amountCents, cleanRemark, status, riskLevel, createdAt, expiresAt,
       )
     db.prepare(

@@ -6,9 +6,9 @@ import { ok, badRequest } from './helpers.js'
 import { createAssistant, AssistantError, MAX_USER_MESSAGE_LEN } from '../services/assistant.js'
 import { hasAiKey } from '../config.js'
 
-const ALLOWED_BODY_KEYS = ['message', 'sessionId']
+const ALLOWED_BODY_KEYS = ['message', 'sessionId', 'selectedCardId']
 
-// 解析并校验请求体。返回 { error } 或 { message, sessionId }。
+// 解析并校验请求体。返回 { error } 或 { message, sessionId, selectedCardId }。
 export function parseChatBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { error: '请求体必须是 JSON 对象' }
@@ -16,7 +16,7 @@ export function parseChatBody(body) {
   const keys = Object.keys(body)
   const forbidden = keys.filter((k) => !ALLOWED_BODY_KEYS.includes(k))
   if (forbidden.length) {
-    return { error: `不允许提交字段：${forbidden.join('、')}（客户端只能提交 message 与 sessionId）` }
+    return { error: `不允许提交字段：${forbidden.join('、')}（客户端只能提交 message、sessionId 与 selectedCardId）` }
   }
   if (typeof body.message !== 'string' || body.message.trim() === '') {
     return { error: 'message 不能为空' }
@@ -30,9 +30,18 @@ export function parseChatBody(body) {
   if (typeof body.sessionId === 'string' && body.sessionId.trim() === '') {
     return { error: 'sessionId 不能是空白字符串' }
   }
+  if (body.selectedCardId !== undefined && body.selectedCardId !== null) {
+    if (typeof body.selectedCardId !== 'number' || !Number.isSafeInteger(body.selectedCardId) || body.selectedCardId <= 0) {
+      return { error: 'selectedCardId 必须是正整数' }
+    }
+  }
   return {
     message: body.message.trim(),
     sessionId: typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined,
+    selectedCardId:
+      typeof body.selectedCardId === 'number' && Number.isSafeInteger(body.selectedCardId) && body.selectedCardId > 0
+        ? body.selectedCardId
+        : null,
   }
 }
 
@@ -52,12 +61,19 @@ export function createAssistantRouter(db, demoUserId) {
     }
 
     try {
-      const result = await assistant.chat({ message: parsed.message, sessionId: parsed.sessionId })
+      const result = await assistant.chat({ message: parsed.message, sessionId: parsed.sessionId, selectedCardId: parsed.selectedCardId })
       ok(res, result)
     } catch (e) {
       if (e instanceof AssistantError) {
         if (e.code === 'locked') {
           return res.status(409).json({ success: false, message: e.message })
+        }
+        if (e.code === 'bad_card') {
+          return res.status(400).json({ success: false, message: e.message })
+        }
+        if (e.code === 'credential_detected') {
+          // 固定安全提示，不含用户原文；不写日志、不落库。
+          return res.status(400).json({ success: false, code: 'credential_detected', message: e.message })
         }
         if (e.code === 'model') {
           console.error('[助手] 模型调用失败（脱敏）：', e.message)
@@ -76,6 +92,28 @@ export function createAssistantRouter(db, demoUserId) {
     } catch (e) {
       console.error('[助手] 读取当前对话失败：', e && e.message ? e.message : e)
       res.status(500).json({ success: false, message: '读取聊天记录失败' })
+    }
+  })
+
+  // 会话历史列表（只读）：返回当前用户全部会话（标题取首条用户消息），无需模型密钥。
+  router.get('/conversations', (req, res) => {
+    try {
+      ok(res, assistant.listConversations())
+    } catch (e) {
+      console.error('[助手] 读取会话列表失败：', e && e.message ? e.message : e)
+      res.status(500).json({ success: false, message: '读取会话列表失败' })
+    }
+  })
+
+  // 打开历史会话：切换当前对话指针并返回该会话消息（无需模型密钥、不重发消息、不调用模型）。
+  router.post('/conversations/:id/select', (req, res) => {
+    try {
+      const view = assistant.getConversation(req.params.id)
+      if (!view) return badRequest(res, '会话不存在或已失效')
+      ok(res, view)
+    } catch (e) {
+      console.error('[助手] 打开历史会话失败：', e && e.message ? e.message : e)
+      res.status(500).json({ success: false, message: '打开历史会话失败' })
     }
   })
 

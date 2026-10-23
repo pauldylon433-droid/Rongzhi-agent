@@ -47,6 +47,7 @@
 | opening_balance_cents | INTEGER | NOT NULL, >= 0 | 期初余额（分） |
 | balance_cents | INTEGER | NOT NULL, >= 0 | 当前余额（分） |
 | currency | TEXT | NOT NULL DEFAULT 'CNY' | 币种 |
+| account_type | TEXT | NOT NULL DEFAULT 'deposit', deposit/credit | 账户类型（活期 / 信用） |
 | status | TEXT | NOT NULL, active/frozen/closed | 状态 |
 | opened_on | TEXT | 可空，演示数据为 2026-08-01 | 开户日期（业务日期 YYYY-MM-DD） |
 | created_at | TEXT | NOT NULL | 创建时间 |
@@ -66,9 +67,12 @@
 | transaction_at | TEXT | NOT NULL | 交易时间（UTC ISO） |
 | status | TEXT | NOT NULL, posted/pending | 状态 |
 | transfer_ref | TEXT | 可空 | 转账操作编号（非转账流水为 NULL） |
+| flow_kind | TEXT | NOT NULL DEFAULT 'external', external/repayment | 资金性质（普通收支 / 信用卡还款冲抵） |
+| repayment_ref | TEXT | 可空 | 还款操作编号（非还款流水为 NULL） |
 | created_at | TEXT | NOT NULL | 创建时间 |
 
 > 余额核算只统计 `status = 'posted'`（已入账）的交易；`pending`（待入账）不计入余额。
+> `flow_kind = 'repayment'` 的还款冲抵流水既不计为消费支出、也不计作收入（`monthlyAnalytics` 排除）。
 
 ### 4. cards — 银行卡
 
@@ -282,6 +286,95 @@
 > 任务、节点、依赖、状态、结果摘要与业务单引用全部持久化，刷新 / 后端重启可恢复；恢复不重发模型请求、不重发业务操作。
 > `UNIQUE(task_id, node_key)` 保证同一任务内节点唯一。
 
+### 16. credit_accounts — 信用账户（多银行卡）
+
+一张信用卡关联一个独立信用账户（`accounts.account_type = 'credit'`）。活期账户（deposit）沿用
+`accounts.balance_cents` 记余额；信用账户的 `balance_cents` 恒为 0，债务在此表单独维护，
+避免「信用欠款」与「活期余额」语义混淆。
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 信用账户 ID |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户 |
+| account_id | INTEGER | NOT NULL UNIQUE, FK→accounts.id | 对应 accounts 行（account_type='credit'） |
+| credit_limit_cents | INTEGER | NOT NULL, > 0 | 信用额度（分） |
+| posted_outstanding_cents | INTEGER | NOT NULL DEFAULT 0, >= 0 | 已入账未还（= 各账单剩余应还之和） |
+| pending_occupied_cents | INTEGER | NOT NULL DEFAULT 0, >= 0 | 待入账消费占额 |
+| version | INTEGER | NOT NULL DEFAULT 1 | 乐观锁版本号 |
+| created_at | TEXT | NOT NULL | 创建时间 |
+
+> 可用额度 = `credit_limit_cents - posted_outstanding_cents - pending_occupied_cents`。
+> 待入账消费占额、入账后转欠款、还款冲抵均在同一事务内维护本表两个计数，保证不重复占额 / 不重复计债。
+
+### 17. statements — 信用卡账单（跨期独立）
+
+每个上海自然月一份账单；出账日 = 下月 1 日，到期日 = 下月 25 日（均按 Asia/Shanghai 边界）。
+每笔已入账消费按 `transaction_at` 的上海自然月归入**唯一**账单；还款只冲抵**指定**账单，
+从模型上杜绝重复计债 / 重复冲抵。逾期未还的剩余应还如实保留在各自账单，不自动结转合并。
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 账单 ID |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户 |
+| credit_account_id | INTEGER | NOT NULL, FK→credit_accounts.id | 信用账户 |
+| statement_year | INTEGER | NOT NULL | 账期年（上海） |
+| statement_month | INTEGER | NOT NULL, 1-12 | 账期月（上海） |
+| period_start | TEXT | NOT NULL | 账期起（上海月初，UTC ISO） |
+| period_end | TEXT | NOT NULL | 账期止（下月月初，UTC ISO） |
+| issued_on | TEXT | NOT NULL | 出账日（下月 1 日 00:00 上海） |
+| due_on | TEXT | NOT NULL | 到期日（下月 25 日 00:00 上海） |
+| new_charges_cents | INTEGER | NOT NULL DEFAULT 0, >= 0 | 本期新增消费 |
+| paid_cents | INTEGER | NOT NULL DEFAULT 0, >= 0 | 累计已冲抵 |
+| version | INTEGER | NOT NULL DEFAULT 1 | 乐观锁版本号（还款确认时校验账单未变） |
+| created_at | TEXT | NOT NULL | 创建时间 |
+
+> 剩余应还 = `new_charges_cents - paid_cents`（恒 >= 0）。状态派生：剩余 <= 0 → paid（已结清）；
+> 剩余 > 0 且已过 `due_on` → overdue（到期未还）；否则 open（未到期未结清）。
+> `UNIQUE(credit_account_id, statement_year, statement_month)` 保证同一信用账户每月至多一份账单。
+
+### 18. statement_payments — 还款冲抵明细
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 明细 ID |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户 |
+| statement_id | INTEGER | NOT NULL, FK→statements.id | 被冲抵账单 |
+| repayment_ref | TEXT | NOT NULL UNIQUE | 对应还款操作编号 |
+| amount_cents | INTEGER | NOT NULL, > 0 | 冲抵金额（分） |
+| paid_at | TEXT | NOT NULL | 冲抵时间 |
+
+> 每笔还款只冲抵一个账单；`repayment_ref` 唯一，从数据库层防同一还款重复冲抵（还款可追溯性）。
+
+### 19. repayment_operations — 信用卡还款操作单（全额还款 + 强验证）
+
+仅支持「指定账单剩余应还」的全额还款，不支持最低还款 / 分期 / 取现。恒为红色强验证
+（交易密码 + TOTP），复用现有验证服务；建单快照 `statement_version + amount_cents`，
+确认时重新核验账单版本与剩余应还，再原子扣款 + 冲抵 + 审计。
+
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | 记录 ID |
+| ref_no | TEXT | NOT NULL UNIQUE | 操作唯一编号 |
+| user_id | INTEGER | NOT NULL, FK→users.id | 所属用户 |
+| from_account_id | INTEGER | NOT NULL, FK→accounts.id | 还款账户（活期） |
+| from_account_name | TEXT | NOT NULL | 还款账户名称快照 |
+| credit_account_id | INTEGER | NOT NULL, FK→credit_accounts.id | 信用账户 |
+| credit_account_name | TEXT | NOT NULL | 信用账户名称快照 |
+| statement_id | INTEGER | NOT NULL, FK→statements.id | 目标账单 |
+| statement_month | TEXT | NOT NULL | 账单期标签（YYYY-MM） |
+| amount_cents | INTEGER | NOT NULL, > 0 | 全额 = 建单时该账单剩余应还 |
+| statement_version | INTEGER | NOT NULL | 建单时账单版本快照（乐观锁 CAS 依据） |
+| risk_level | TEXT | NOT NULL, red | 风险级别（恒为红色强验证） |
+| status | TEXT | NOT NULL, needs_verification/completed/cancelled/expired/failed | 状态 |
+| created_at | TEXT | NOT NULL | 创建时间 |
+| expires_at | TEXT | NOT NULL | 确认有效期（5 分钟） |
+| confirmed_at | TEXT | 可空 | 确认时间 |
+
+> 还款执行：扣减活期账户余额 + 记一条 `flow_kind='repayment'` 的还款流水（不计入收支/消费）+
+> 写 `statement_payments` 冲抵明细 + 账单 `paid_cents` 累加 + 信用账户 `posted_outstanding_cents` 扣减，
+> 全部同一事务；操作单状态 CAS 认领保证重复确认只执行一次。
+> 冻结（cards.status='frozen'）期间允许还款、禁止新增消费；已待入账流水仍可正常入账。
+
 ### 索引
 
 为各外键列及常用查询列建立了索引（`idx_*`），例如：
@@ -297,6 +390,11 @@ AI 助手相关：`idx_chat_sessions_user_id` / `_last_active_at`、
 `idx_chat_messages_session_id`（`session_id` + `seq`）等。
 跨场景任务相关：`idx_agent_tasks_user_id` / `idx_agent_tasks_status`、`idx_agent_task_nodes_task_id`，
 `agent_tasks.task_no` 以 `UNIQUE` 约束保证编号唯一，`agent_task_nodes` 以 `UNIQUE(task_id, node_key)` 保证节点唯一。
+信用卡相关：`idx_credit_accounts_user_id`、`idx_statements_credit_account_id`、
+`idx_statement_payments_statement_id` / `idx_statement_payments_repayment_ref`（还款冲抵唯一）、
+`idx_repayment_operations_user_id` / `_status` / `_statement_id`、
+唯一索引 `idx_transactions_repayment_ref`（同一还款操作单最多对应一条还款流水，数据库层面防重复入账）；
+`statements` 以 `UNIQUE(credit_account_id, statement_year, statement_month)` 保证每信用账户每月至多一份账单。
 
 ## 四、模拟数据生成方式
 
@@ -310,6 +408,22 @@ AI 助手相关：`idx_chat_sessions_user_id` / `_last_active_at`、
 - 订阅：6 条，覆盖 active / paused / cancelled 三种状态；`next_billing_date` 为未来日期。
 - 账户 / 卡片各 1 条；审计日志 0 条。
 - 虚构收款人 4 条（李雷 / 韩梅梅 / 王强 / 赵敏），由迁移在 `transfer_recipients` 为空时写入。
+
+### 可选演示数据（信用卡·多银行卡，默认关闭）
+
+`backend/scripts/seed-demo.js` 是一份**独立、可选、幂等**的演示数据脚本，不接入 `db:init` / 启动流程，默认不执行。
+它在**隔离演示库**（默认 `data/demo.db`，与开发库 `data/rongzhi.db` 分离）生成可控样本：
+
+- **2 张借记卡**，各自关联一个独立活期账户（`deposit`，含少量已入账收支）；
+- **1 张信用卡**，关联一个独立信用账户（`credit`，额度 ¥50000）；
+- 跨期消费样本覆盖三种账单状态 + 待入账占用：
+  - 上上月：两笔已入账消费 → 已出账并全额还款 → `paid`（已结清）；
+  - 上月：两笔已入账消费 → 已出账未结清 → `open` / `overdue`（未到期 / 逾期）；
+  - 本月：一笔已入账消费 → `unissued`（未出账）+ 一笔待入账消费 → `pending_occupied`（待入账占用）。
+
+金额固定（非随机），演示「交易发生 / 入账 / 出账 / 还款」四种时间与账单状态机。安全护栏：目标库默认与开发库分离；
+`--db` 显式指向开发库须加 `--allow-dev-db`；`--preview`（一次性临时库真实生成后打印清单，不落盘）与
+`--check`（只读一致性校验）供未来开发库部署前检查。
 
 ## 五、初始化与约束
 
@@ -358,6 +472,21 @@ AI 助手相关：`idx_chat_sessions_user_id` / `_last_active_at`、
 重复请求幂等、依赖与参数校验、越权、旧版本 / 过期单、暂停 / 取消与确认竞态、刷新 / 重启恢复、
 失败后安全继续、手动接管、助手模型启动任务、HTTP 路由字段校验、原业务无回归（70 项断言）。
 
+`backend/scripts/verify-credit-repayment.js` 在独立临时库上验证信用卡模型 / 迁移（mock，不调用收费模型）：
+旧库兼容补列与回填、消费→入账→出账→全额还款闭环、七项重点（不重复占额 / 不重复计债 / 还款不计收支 /
+重复确认幂等 / 越权拒绝 / 冻结可还款禁消费 / 账期按入账时间月初边界）、强验证接线（错误凭据拒绝、未绑定被拒）
+（62 项断言）。
+
+`backend/scripts/verify-credit-routes.js` 在独立临时库上验证信用卡 / 还款 HTTP 路由：信用账户视图（含账单）、
+还款操作单 prepare / verify / status / cancel、服务器端字段校验、越权拒绝、信用卡账户不可对外转账 / 不可作还款来源。
+
+`backend/scripts/verify-activity.js` 验证 `/api/activity` 聚合纳入 `repayment` 类型（转账 / 银行卡 / 订阅 / 还款 / 任务）。
+
+`backend/scripts/verify-demo-seed.js` 在独立临时库上验证可选演示数据 `seed-demo.js`：
+2 借记卡 + 1 信用卡、paid / open·overdue / unissued 状态覆盖、`posted_outstanding` / `pending_occupied` 一致性、
+还款流水 / 冲抵明细 / 审计完整、幂等不重复插入（21 项断言）。
+
 运行：`node backend/scripts/verify-db.js`、`node backend/scripts/verify-transfers.js`、
 `node backend/scripts/verify-card-operations.js`、`node backend/scripts/verify-subscription-operations.js`、
-`node backend/scripts/verify-chat-persistence.js`
+`node backend/scripts/verify-chat-persistence.js`、`node backend/scripts/verify-credit-repayment.js`、
+`node backend/scripts/verify-credit-routes.js`、`node backend/scripts/verify-demo-seed.js`

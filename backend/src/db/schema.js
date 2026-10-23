@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   opening_balance_cents INTEGER NOT NULL DEFAULT 0 CHECK (opening_balance_cents >= 0),
   balance_cents         INTEGER NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
   currency              TEXT NOT NULL DEFAULT 'CNY',
+  account_type          TEXT NOT NULL DEFAULT 'deposit' CHECK (account_type IN ('deposit', 'credit')),
   status                TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'frozen', 'closed')),
   opened_on             TEXT,
   created_at            TEXT NOT NULL DEFAULT (datetime('now')),
@@ -31,8 +32,11 @@ CREATE TABLE IF NOT EXISTS transactions (
   merchant      TEXT,
   description   TEXT,
   transaction_at TEXT NOT NULL,
+  posted_at     TEXT,                                    -- 入账时间（信用卡消费 pending→posted 时写入；非信用卡流水为 NULL）
   status        TEXT NOT NULL DEFAULT 'posted' CHECK (status IN ('posted', 'pending')),
   transfer_ref  TEXT,
+  flow_kind     TEXT NOT NULL DEFAULT 'external' CHECK (flow_kind IN ('external', 'repayment')),
+  repayment_ref TEXT,
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (user_id) REFERENCES users(id),
   FOREIGN KEY (account_id) REFERENCES accounts(id)
@@ -102,6 +106,7 @@ CREATE TABLE IF NOT EXISTS transfer_operations (
   id                       INTEGER PRIMARY KEY AUTOINCREMENT,
   ref_no                   TEXT NOT NULL UNIQUE,
   user_id                  INTEGER NOT NULL,
+  session_id               TEXT,                      -- 发起该转账单的助手会话（可空，仅溯源；独立转账页建单为 NULL）
   from_account_id          INTEGER NOT NULL,
   from_account_name        TEXT NOT NULL,
   recipient_id             INTEGER NOT NULL,
@@ -122,6 +127,7 @@ CREATE TABLE IF NOT EXISTS transfer_operations (
 CREATE INDEX IF NOT EXISTS idx_transfer_operations_user_id       ON transfer_operations(user_id);
 CREATE INDEX IF NOT EXISTS idx_transfer_operations_status        ON transfer_operations(status);
 CREATE INDEX IF NOT EXISTS idx_transfer_operations_confirmed_at  ON transfer_operations(confirmed_at);
+-- 注意：session_id 的索引不在此创建（旧库尚未有该列），由 migrate 在补列后建立，见 migrate.js。
 
 -- 银行卡操作单：查询 / 临时冻结（yellow，点击确认）/ 解冻（red，交易密码 + TOTP 强验证）。
 -- 保存卡片归属、动作、预期状态与建单时的卡片版本快照，确认时重新校验卡片状态与版本。
@@ -219,6 +225,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
   pending_transfer_ref TEXT,                      -- 本会话当前待确认转账单编号（改单时取消旧单）
   pending_card_op_ref TEXT,                       -- 本会话当前待确认银行卡操作单编号
   pending_subscription_op_ref TEXT,               -- 本会话当前待确认订阅操作单编号
+  pending_repayment_ref TEXT,                     -- 本会话当前待确认信用卡还款单编号
   created_at          INTEGER NOT NULL,           -- 创建时间（epoch 毫秒）
   last_active_at      INTEGER NOT NULL,           -- 最近活跃时间（epoch 毫秒，用于 TTL）
   FOREIGN KEY (user_id) REFERENCES users(id)
@@ -296,6 +303,96 @@ CREATE TABLE IF NOT EXISTS agent_task_nodes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_task_nodes_task_id ON agent_task_nodes(task_id);
+
+-- 多银行卡·信用账户：一张信用卡关联一个独立信用账户（accounts.account_type='credit'）。
+-- 活期账户（deposit）沿用 accounts.balance_cents 记余额；信用账户的 balance_cents 恒为 0，
+-- 债务（已入账未还 / 待入账占用）在此表单独维护，避免与活期余额语义混淆。
+CREATE TABLE IF NOT EXISTS credit_accounts (
+  id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id                  INTEGER NOT NULL,
+  account_id               INTEGER NOT NULL UNIQUE,               -- 对应 accounts 行（account_type='credit'）
+  credit_limit_cents       INTEGER NOT NULL CHECK (credit_limit_cents > 0),
+  posted_outstanding_cents INTEGER NOT NULL DEFAULT 0 CHECK (posted_outstanding_cents >= 0),  -- 已入账未还（= 各账单剩余应还之和）
+  pending_occupied_cents   INTEGER NOT NULL DEFAULT 0 CHECK (pending_occupied_cents >= 0),    -- 待入账消费占额
+  version                  INTEGER NOT NULL DEFAULT 1,
+  created_at               TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_accounts_user_id ON credit_accounts(user_id);
+
+-- 信用卡账单：每个上海自然月一份（跨期独立），出账日=下月 1 日，到期日=下月 25 日。
+-- 每笔已入账消费按 posted_at（入账时间）的上海自然月归入唯一账单，还款只冲抵指定账单，杜绝重复计债 / 重复冲抵。
+-- 未出账（issued_at 为 NULL）时 new_charges_cents 随入账累加；出账（issued_at 置值）后出账金额与消费明细冻结，
+-- 出账后才入账的旧交易进入后续未出账账期，不再重开已出账账单。剩余应还 = new_charges_cents - paid_cents（恒 >= 0）。
+CREATE TABLE IF NOT EXISTS statements (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id           INTEGER NOT NULL,
+  credit_account_id INTEGER NOT NULL,
+  statement_year    INTEGER NOT NULL,
+  statement_month   INTEGER NOT NULL,                             -- 1-12
+  period_start      TEXT NOT NULL,                                -- 账期起（上海月初，UTC ISO）
+  period_end        TEXT NOT NULL,                                -- 账期止（下月月初，UTC ISO）
+  issued_on         TEXT NOT NULL,                                -- 出账日（下月 1 日 00:00 上海）
+  issued_at         TEXT,                                         -- 出账时间（实际出账/冻结时刻，UTC ISO；NULL=未出账）
+  due_on            TEXT NOT NULL,                                -- 到期日（下月 25 日 00:00 上海）
+  new_charges_cents INTEGER NOT NULL DEFAULT 0 CHECK (new_charges_cents >= 0),  -- 本期新增消费（出账后冻结）
+  paid_cents        INTEGER NOT NULL DEFAULT 0 CHECK (paid_cents >= 0),         -- 累计已冲抵
+  version           INTEGER NOT NULL DEFAULT 1,                   -- 乐观锁（还款确认时校验账单未变）
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (credit_account_id) REFERENCES credit_accounts(id),
+  UNIQUE (credit_account_id, statement_year, statement_month)
+);
+
+CREATE INDEX IF NOT EXISTS idx_statements_credit_account_id ON statements(credit_account_id);
+
+-- 还款冲抵明细：每笔还款只冲抵一个账单，repayment_ref 唯一，从数据库层防重复冲抵。
+CREATE TABLE IF NOT EXISTS statement_payments (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       INTEGER NOT NULL,
+  statement_id  INTEGER NOT NULL,
+  repayment_ref TEXT NOT NULL,                                    -- 对应 repayment_operations.ref_no
+  amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
+  paid_at       TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (statement_id) REFERENCES statements(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_statement_payments_statement_id ON statement_payments(statement_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_statement_payments_repayment_ref ON statement_payments(repayment_ref);
+
+-- 信用卡还款操作单：全额还款（指定账单剩余应还），恒为红色强验证（交易密码 + TOTP），复用现有安全机制。
+-- 建单快照 statement_version + amount_cents，确认时重新核验账单版本与剩余应还，再原子扣款 + 冲抵 + 审计。
+CREATE TABLE IF NOT EXISTS repayment_operations (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref_no              TEXT NOT NULL UNIQUE,
+  user_id             INTEGER NOT NULL,
+  session_id          TEXT,                                       -- 发起该还款单的助手会话（可空，仅溯源；独立页面建单为 NULL）
+  from_account_id     INTEGER NOT NULL,                           -- 还款账户（活期）
+  from_account_name   TEXT NOT NULL,
+  credit_account_id   INTEGER NOT NULL,                           -- 信用账户
+  credit_account_name TEXT NOT NULL,
+  statement_id        INTEGER NOT NULL,                           -- 目标账单
+  statement_month     TEXT NOT NULL,                              -- 账单期标签（YYYY-MM）
+  amount_cents        INTEGER NOT NULL CHECK (amount_cents > 0),  -- 全额 = 建单时该账单剩余应还
+  statement_version   INTEGER NOT NULL,                           -- 建单时账单版本快照
+  risk_level          TEXT NOT NULL CHECK (risk_level IN ('red')),
+  status              TEXT NOT NULL DEFAULT 'needs_verification' CHECK (status IN ('needs_verification','completed','cancelled','expired','failed')),
+  created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at          TEXT NOT NULL,
+  confirmed_at        TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (from_account_id) REFERENCES accounts(id),
+  FOREIGN KEY (credit_account_id) REFERENCES credit_accounts(id),
+  FOREIGN KEY (statement_id) REFERENCES statements(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repayment_operations_user_id      ON repayment_operations(user_id);
+CREATE INDEX IF NOT EXISTS idx_repayment_operations_status       ON repayment_operations(status);
+CREATE INDEX IF NOT EXISTS idx_repayment_operations_statement_id ON repayment_operations(statement_id);
+CREATE INDEX IF NOT EXISTS idx_repayment_operations_session_id   ON repayment_operations(session_id);
 `
 
 export function createSchema(db) {

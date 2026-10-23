@@ -5,6 +5,7 @@ import { useAsyncData } from '../composables/useAsyncData.js'
 import { useDataRefresh } from '../composables/useDataRefresh.js'
 import { formatCentsToYuan, formatShanghaiDate } from '../utils/format.js'
 import SectionState from './SectionState.vue'
+import MerchantLogo from './MerchantLogo.vue'
 import SubscriptionOperationConfirmCard from './SubscriptionOperationConfirmCard.vue'
 
 const { data, loading, error, load } = useAsyncData(fetchSubscriptions)
@@ -114,7 +115,10 @@ function dismiss() {
     <ul v-if="!loading && !error && filteredSubs.length" class="sub-list">
       <li v-for="s in filteredSubs" :key="s.id" class="sub-item">
         <div class="sub-main">
-          <span class="sub-merchant">{{ s.merchant }}</span>
+          <span class="sub-merchant">
+            <MerchantLogo :merchant="s.merchant" :size="26" />
+            <span>{{ s.merchant }}</span>
+          </span>
           <span class="sub-meta">
             {{ formatCentsToYuan(s.amount_cents) }} 元 / {{ cycleLabel(s.billing_cycle) }}
           </span>
@@ -204,6 +208,9 @@ function dismiss() {
   min-width: 0;
 }
 .sub-merchant {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 600;
   color: var(--text);
 }

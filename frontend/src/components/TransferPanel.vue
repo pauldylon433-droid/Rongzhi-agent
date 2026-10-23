@@ -1,15 +1,28 @@
 <script setup>
-import { ref, onMounted } from 'vue'
-import { fetchTransferRecipients, createTransfer } from '../api/index.js'
+import { ref, computed, onMounted } from 'vue'
+import { fetchTransferRecipients, createTransfer, fetchCards, fetchAccounts } from '../api/index.js'
 import { useDataRefresh } from '../composables/useDataRefresh.js'
-import { yuanToCents } from '../utils/format.js'
+import { useCardSelection } from '../composables/useCardSelection.js'
+import { yuanToCents, formatCentsToYuan } from '../utils/format.js'
+import {
+  accountsIndex, isActivePayerCard, isFiniteCents, resolveAccountName, resolveDebitBalance,
+} from '../utils/cardBalance.js'
 import TransferConfirmCard from './TransferConfirmCard.vue'
 
 const { refresh } = useDataRefresh()
+const { selectedCard } = useCardSelection()
 
 const recipients = ref([])
 const recipientsLoading = ref(false)
 const recipientsError = ref('')
+
+// 付款账户：仅现金存款类（account_type='deposit'、账户与卡片均 active）可对外转账。
+// 初始值只取「当前全局选中的借记卡」；若当前选中信用卡或无选中，则不预选（不静默选第一张）。
+const payerAccounts = ref([])
+const payersLoading = ref(false)
+const payersError = ref('')
+const fromAccountId = ref(0) // 0 表示未选择
+const selectedIsCredit = computed(() => !!selectedCard.value && selectedCard.value.account_type === 'credit')
 
 const recipientId = ref(0) // 0 表示未选择
 const amountText = ref('')
@@ -32,6 +45,40 @@ async function loadRecipients() {
   }
 }
 
+async function loadPayerAccounts() {
+  payersLoading.value = true
+  payersError.value = ''
+  try {
+    const cards = await fetchCards()
+    // 旧接口无 account_status / balance_cents：按 account_id 关联账户接口（只读，仅一次）
+    let idx = new Map()
+    const needAccounts = (cards || []).some((c) => !c.account_status || !isFiniteCents(c.balance_cents))
+    if (needAccounts) {
+      try {
+        idx = accountsIndex(await fetchAccounts())
+      } catch {
+        // 账户接口不可用时仍按卡片自身字段判断；余额显示「暂无法获取」，不影响服务端余额校验
+      }
+    }
+    const list = (cards || [])
+      .filter((c) => isActivePayerCard(c, idx))
+      .map((c) => ({
+        ...c,
+        resolvedName: resolveAccountName(c, idx) || c.account_name || '',
+        resolvedBalance: resolveDebitBalance(c, idx),
+      }))
+    payerAccounts.value = list
+    const cur = selectedCard.value
+    if (cur && cur.account_type === 'deposit' && list.some((c) => c.account_id === cur.account_id)) {
+      fromAccountId.value = cur.account_id
+    }
+  } catch (e) {
+    payersError.value = e && e.message ? e.message : '加载付款账户失败'
+  } finally {
+    payersLoading.value = false
+  }
+}
+
 async function onCreate() {
   formError.value = ''
   const cents = yuanToCents(amountText.value)
@@ -47,12 +94,17 @@ async function onCreate() {
     formError.value = '请选择收款人'
     return
   }
+  if (!fromAccountId.value) {
+    formError.value = '请选择付款账户（借记卡 / 活期账户）'
+    return
+  }
   creating.value = true
   try {
     op.value = await createTransfer({
       recipient_id: recipientId.value,
       amount_cents: cents,
       remark: remark.value,
+      from_account_id: fromAccountId.value,
     })
   } catch (e) {
     formError.value = e && e.message ? e.message : '生成转账单失败'
@@ -73,7 +125,10 @@ function dismiss() {
   formError.value = ''
 }
 
-onMounted(loadRecipients)
+onMounted(() => {
+  loadRecipients()
+  loadPayerAccounts()
+})
 </script>
 
 <template>
@@ -83,6 +138,23 @@ onMounted(loadRecipients)
 
     <!-- 生成转账单表单 -->
     <div class="transfer-form">
+      <div class="field">
+        <label class="field-label" for="transfer-payer">付款账户</label>
+        <p v-if="payersLoading" class="field-hint">正在加载借记账户…</p>
+        <p v-else-if="payersError" class="field-warn">{{ payersError }}</p>
+        <template v-else>
+          <select id="transfer-payer" v-model="fromAccountId" class="select" aria-label="付款账户">
+            <option :value="0" disabled>请选择付款账户（借记卡）</option>
+            <option v-for="c in payerAccounts" :key="c.id" :value="c.account_id">
+              {{ c.resolvedName || '关联账户' }}（{{ c.masked_card_number }}）· 可用
+              {{ c.resolvedBalance.available ? `${formatCentsToYuan(c.resolvedBalance.cents)} 元` : '暂无法获取' }}
+            </option>
+          </select>
+          <p v-if="selectedIsCredit" class="field-warn">当前选中的是信用卡，不能作为对外付款账户，请选择借记账户。</p>
+          <p v-else-if="payerAccounts.length === 0" class="field-warn">没有可用的借记付款账户。</p>
+        </template>
+      </div>
+
       <div class="field">
         <label class="field-label" for="transfer-recipient">收款人</label>
         <p v-if="recipientsLoading" class="field-hint">正在加载收款人…</p>

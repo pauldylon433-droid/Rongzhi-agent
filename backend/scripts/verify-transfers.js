@@ -196,7 +196,7 @@ await withServer(async (base) => {
   const badAmt = await postJson(`${base}/transfers`, { recipient_id: 1, amount_cents: 1.5 })
   check('创建小数金额返回 400', badAmt.status === 400)
 
-  const cb = await (await postJson(`${base}/transfers`, { recipient_id: 1, amount_cents: 100, remark: 'http 测试' })).json()
+  const cb = await (await postJson(`${base}/transfers`, { recipient_id: 1, amount_cents: 100, remark: 'http 测试', from_account_id: acct().id })).json()
   check('HTTP 创建黄色转账单', cb.success && cb.data.status === 'pending')
   const refNo = cb.data.ref_no
 

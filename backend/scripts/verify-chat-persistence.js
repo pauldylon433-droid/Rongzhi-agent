@@ -2,7 +2,7 @@
 // 覆盖（对应需求 9 场景）：
 //  1. 两轮对话保存/恢复顺序与内容一致；
 //  2. 有效会话重启后恢复合法模型上下文（含工具配对）；
-//  3. 后端重启 + 过期（历史仍可查看、上下文重新开始）；
+//  3. 后端重启 + 闲置（历史仍可查看、沿原上下文续聊）；
 //  4. 工具调用与结果配对完整；伪造/越权历史被拒；
 //  5. 新建对话切换服务端当前对话，旧对话不泄漏；
 //  6. 恢复只读（不调用模型、不重发、不伪造中断请求）；
@@ -95,10 +95,9 @@ const demoUserId = u1
     cur.messages[2].role === 'user' && cur.messages[2].text === '再问一次' &&
     cur.messages[3].role === 'assistant' && cur.messages[3].text === '这是第二次回答。')
   check('1.4 助手消息含工具展示记录', Array.isArray(cur.messages[1].toolRecords) && cur.messages[1].toolRecords[0]?.name === 'get_accounts')
-  check('1.5 未过期', cur.expired === false)
 }
 
-// ---------- 2 + 3. 后端重启恢复合法上下文；过期后历史仍可查看 ----------
+// ---------- 2 + 3. 后端重启恢复合法上下文；闲置后历史仍可查看并续聊 ----------
 {
   const mock = makeScriptedMock([
     { toolCalls: [tc('c1', 'get_monthly_analytics', { month: '2026-10' })] },
@@ -123,21 +122,23 @@ const demoUserId = u1
   check('2.3 重启后保留上一轮工具结果（配对完整）', !!priorTool && JSON.parse(priorTool.content).month === '2026-10')
   check('2.4 system 消息不持久化', secondCall.filter((m) => m.role === 'system').length === 1 && secondCall[0].role === 'system', '每次由服务端生成')
 
-  // 过期：手动把 last_active_at 调到 31 分钟前
+  // 闲置：手动把 last_active_at 调到 31 分钟前（超过原 30 分钟闲置阈值）
   db.prepare('UPDATE chat_sessions SET last_active_at = ? WHERE id = ?').run(Date.now() - 31 * 60 * 1000, r1.sessionId)
   // 新实例模拟再次重启，避免内存缓存
   const assistantC = createAssistant({ db, demoUserId, chatFn: mock })
-  const curExpired = assistantC.getCurrent()
-  check('3.1 过期会话历史仍可查看', curExpired.expired === true && curExpired.sessionId === r1.sessionId && curExpired.messages.length >= 2, JSON.stringify({ expired: curExpired.expired, n: curExpired.messages.length }))
+  const curIdle = assistantC.getCurrent()
+  check('3.1 闲置后历史仍可查看', curIdle.sessionId === r1.sessionId && curIdle.messages.length >= 2, String(curIdle.messages.length))
 
-  // 过期后发送：沿用同一 sessionId，但上下文重新开始（不假装记得）
-  const mockFresh = makeScriptedMock([{ content: '全新回答' }])
+  // 闲置后发送：沿用同一 sessionId，且保留旧上下文（此前用户消息与工具结果仍在）
+  const mockFresh = makeScriptedMock([{ content: '延续回答' }])
   const assistantD = createAssistant({ db, demoUserId, chatFn: mockFresh })
   const r3 = await assistantD.chat({ message: '新消息', sessionId: r1.sessionId })
-  check('3.2 过期后沿用同一 sessionId（历史延续）', r3.sessionId === r1.sessionId)
+  check('3.2 闲置后沿用同一 sessionId', r3.sessionId === r1.sessionId)
   const freshCall = mockFresh.calls[0].messages
   const freshUsers = freshCall.filter((m) => m.role === 'user').map((m) => m.content)
-  check('3.3 过期后上下文重新开始（不含旧用户消息）', freshUsers.length === 1 && freshUsers[0] === '新消息', JSON.stringify(freshUsers))
+  const hasPriorTool = freshCall.find((m) => m.role === 'tool' && m.tool_call_id === 'c1')
+  check('3.3 闲置后保留旧上下文（含此前用户消息）', freshUsers.includes('这个月花了多少？') && freshUsers.includes('上个月呢？') && freshUsers.includes('新消息'), JSON.stringify(freshUsers))
+  check('3.4 闲置后保留旧工具结果（配对完整）', !!hasPriorTool && JSON.parse(hasPriorTool.content).month === '2026-10')
 }
 
 // ---------- 4. 工具调用与结果配对完整；越权被拒 ----------

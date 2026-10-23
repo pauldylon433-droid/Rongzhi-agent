@@ -97,15 +97,38 @@ check('餐饮 3111 / 3 笔（含月初 111）', oct.expense_by_category[1]?.cate
 check('购物 3000 / 1 笔（不含下月 222）', oct.expense_by_category[2]?.category === '购物' && oct.expense_by_category[2]?.amount_cents === 3000 && oct.expense_by_category[2]?.count === 1)
 check('pending 未混入已入账（交通/娱乐不在分类）', !oct.expense_by_category.some((c) => c.category === '交通' || c.category === '娱乐'))
 
+// 收入分类：与支出分类同一已入账口径（仅 posted 且已发生），合计恒等于顶部「已入账收入」
+check('收入分类 1 项（薪资+奖金均为「收入」）', oct.income_by_category.length === 1, JSON.stringify(oct.income_by_category))
+check('收入分类：收入 15000 / 2 笔', oct.income_by_category[0]?.category === '收入' && oct.income_by_category[0]?.amount_cents === 15000 && oct.income_by_category[0]?.count === 2)
+check('收入分类合计 = 已入账收入 15000', oct.income_by_category.reduce((s, c) => s + c.amount_cents, 0) === oct.income_cents)
+check('支出分类合计 = 已入账支出 10111', oct.expense_by_category.reduce((s, c) => s + c.amount_cents, 0) === oct.expense_cents)
+check('收入分类不含支出类别（方向隔离）', !oct.income_by_category.some((c) => ['餐饮', '购物', '住房', '交通', '娱乐'].includes(c.category)))
+
 // 无记录月份：零值 + 空分类
 const empty = monthlyAnalytics(db, u1, { year: 2026, month: 1, asOf: AS_OF })
 check('无记录月份返回零值', empty.income_cents === 0 && empty.expense_cents === 0 && empty.net_cents === 0 && empty.posted_count === 0)
-check('无记录月份空分类 + 零待入账', empty.expense_by_category.length === 0 && empty.pending.count === 0 && empty.pending.amount_cents === 0)
+check('无记录月份空分类 + 零待入账', empty.expense_by_category.length === 0 && empty.income_by_category.length === 0 && empty.pending.count === 0 && empty.pending.amount_cents === 0)
 
 // 其他用户数据不进入演示用户统计
 check('李四数据未混入演示用户（income 仍 15000）', oct.income_cents === 15000 && !oct.expense_by_category.some((c) => c.amount_cents === 88888888))
 const li = monthlyAnalytics(db, u2, { year: 2026, month: 10, asOf: AS_OF })
 check('李四自身统计正确', li.income_cents === 99999999 && li.expense_cents === 88888888)
+
+// 多收入类别（王五）：验证收入按类别分别聚合（非仅单一「收入」），且待入账不计入
+const u3 = db.prepare("INSERT INTO users (name) VALUES ('王五')").run().lastInsertRowid
+const a3 = db.prepare(
+  "INSERT INTO accounts (user_id, account_name, opened_on) VALUES (?, ?, ?)",
+).run(u3, '王五测试账户', '2026-08-01').lastInsertRowid
+insertTx.run(u3, a3, 'income', 8000, '工资', shanghaiIso(2026, 10, 5), 'posted')
+insertTx.run(u3, a3, 'income', 2000, '理财', shanghaiIso(2026, 10, 6), 'posted')
+insertTx.run(u3, a3, 'income', 1000, '工资', shanghaiIso(2026, 10, 7), 'posted')
+insertTx.run(u3, a3, 'income', 500, '奖金', shanghaiIso(2026, 10, 8), 'pending')
+const wang = monthlyAnalytics(db, u3, { year: 2026, month: 10, asOf: AS_OF })
+check('多收入类别：2 项（工资/理财）', wang.income_by_category.length === 2, JSON.stringify(wang.income_by_category))
+check('多收入类别：工资 9000 / 2 笔', wang.income_by_category.some((c) => c.category === '工资' && c.amount_cents === 9000 && c.count === 2))
+check('多收入类别：理财 2000 / 1 笔', wang.income_by_category.some((c) => c.category === '理财' && c.amount_cents === 2000 && c.count === 1))
+check('多收入类别：待入账奖金未混入', !wang.income_by_category.some((c) => c.category === '奖金'))
+check('多收入类别合计 = 已入账收入 11000', wang.income_cents === 11000 && wang.income_by_category.reduce((s, c) => s + c.amount_cents, 0) === wang.income_cents)
 
 db.close()
 
@@ -146,8 +169,9 @@ try {
 
   const ok = await get('/api/analytics/monthly?month=2026-10')
   const d = ok.body?.data
-  check('合法月份返回 200 且字段齐全', ok.status === 200 && ok.body?.success === true && d && d.month === '2026-10' && d.timezone === 'Asia/Shanghai' && typeof d.as_of === 'string' && typeof d.net_cents === 'number' && Array.isArray(d.expense_by_category))
+  check('合法月份返回 200 且字段齐全', ok.status === 200 && ok.body?.success === true && d && d.month === '2026-10' && d.timezone === 'Asia/Shanghai' && typeof d.as_of === 'string' && typeof d.net_cents === 'number' && Array.isArray(d.income_by_category) && Array.isArray(d.expense_by_category))
   check('路由层：演示用户收入 = 15000（李四 99999999 未混入）', d.income_cents === 15000, d.income_cents)
+  check('路由层：收入分类已返回且合计 15000', d.income_by_category.length === 1 && d.income_by_category[0].category === '收入' && d.income_by_category.reduce((s, c) => s + c.amount_cents, 0) === d.income_cents)
   check('路由层：李四 88888888 未出现在分类', !d.expense_by_category.some((c) => c.amount_cents === 88888888))
 } catch (e) {
   console.error('测试脚本异常：', e)
