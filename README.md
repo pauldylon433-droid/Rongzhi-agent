@@ -18,8 +18,8 @@
 扩展能力（同一演示用户）：多账户 / 多银行卡（2 借记 + 1 信用卡）、信用卡账单与两种全额还款（指定账单 / 结清全部已入账欠款，
 含未出账提前还款）、订阅扣款来源更换、账户范围筛选与逐笔结余 / 交易后可用额度、聊天历史续聊与结构化可视化。
 
-> 交付文档入口：`docs/validation-record.md`（验证记录与评分对应）、`docs/demo-script.md`（5 分钟演示与答辩提纲）、
-> `docs/development-log.md`（分阶段开发与验收记录）。
+> 仓库地址：https://github.com/pauldylon433-droid/Rongzhi-agent
+> 评审入口：`docs/validation-record.md`（验证记录）、`docs/security-design.md`（安全设计）、`docs/render-deploy.md`（公网演示部署说明）。
 
 ## 技术栈
 
@@ -73,8 +73,7 @@ rongzhi-agent/
   金额由服务端计算，提前还款保留冲抵明细，出账后不重复计债；均需交易密码 + TOTP 强验证。
 - **强验证**：交易密码（scrypt）+ 手机验证器 TOTP（RFC 6238，AES-256-GCM 加密存储），跨业务防重放、失败锁定（5 次锁 15 分钟）。
 - **聊天持久化**：会话与消息落库，刷新 / 后端重启后可经只读接口恢复；**不按闲置时长自动删除**。
-  为避免模型请求无限增长，模型上下文仅保留最近 **8 轮**，单会话可见消息最多 **200 条**（更早消息不进入模型，
-  但仍保存在数据库中可查看）。本项目**不提供无限记忆**，也不为保存无限上下文扩大模型请求成本。
+  为避免模型请求无限增长，模型上下文仅保留最近 **8 轮**，单会话可见消息最多 **200 条**，超出上限时裁剪最旧的可见消息。本项目**不提供无限记忆**，也不为保存无限上下文扩大模型请求成本。
 
 ## 模拟边界与未实现项
 
@@ -100,7 +99,7 @@ rongzhi-agent/
 ## 环境要求
 
 - Windows 10 / 11，PowerShell（5.1 或 7）。
-- Node.js **≥ 20.12**（后端用内置 `process.loadEnvFile` 读取 `.env`；已验证 **v24.21.0**）。
+- Node.js **≥ 22 且 < 25**（当前 better-sqlite3 依赖要求 Node ≥22；Render 配置使用 22.14.0，本地记录已验证 v24.21.0）。
 - npm（已验证 **11.19.0**）。
 - （可选）手机验证器 App：Google Authenticator / Microsoft Authenticator，仅用于红色强验证。
 
@@ -283,7 +282,7 @@ node scripts/acceptance-totp.js                 # 隔离验收环境：本机生
 > 隔离环境的交易密码为 `acceptance-demo-pass`（仅测试用，不进入正式配置）。
 
 > 隔离前端用 `frontend/vite.config.isolated.js`（端口 5180，`/api` 代理到隔离后端，页面带红色隔离横幅）。
-> 上述脚本均与开发库 / 3000 / 5174 完全分离，详见 `docs/development-log.md`「第四十二阶段」。
+> 隔离验收请按下面的独立数据库与端口配置启动，不复用开发库或开发强验证凭据。
 >
 > **隔离环境启动（Windows PowerShell；示例端口 4100 / 5180，按实际空闲端口调整）**：
 >
@@ -400,9 +399,7 @@ npm start
 
 - `docs/render-deploy.md` —— Render 免费 Web Service 公网演示部署说明（口令保护 / 独立演示库 / AI 配额 / 强验证配置）
 - `docs/validation-record.md` —— 验证记录：自动化 / mock / 真实模型 / 浏览器人工验收的区分与评分维度对应
-- `docs/demo-script.md` —— 5 分钟演示脚本、PPT 大纲、答辩要点与待核实项
 - `docs/api.md` —— 全部 HTTP 接口与 AI 工具白名单
 - `docs/database-design.md` —— 表结构、迁移与种子数据
 - `docs/security-design.md` —— 身份 / 金额 / 风险 / 防重放 / 防篡改 / AI 边界
 - `docs/ai-usage.md` —— 真实模型调用用量记录
-- `docs/development-log.md` —— 分阶段开发记录与验证结果
