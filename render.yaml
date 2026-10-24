@@ -1,0 +1,37 @@
+# Render Blueprint（单 Web Service：后端同时提供前端静态页面与 /api）
+# 免费方案（Free）：无持久磁盘；实例休眠 / 重启 / 重新部署后文件系统重置，演示库会重新初始化。
+# 不购买域名、不启用付费资源；autoDeploy 关闭，避免推送即自动发布。
+services:
+  - type: web
+    name: rongzhi-agent-demo
+    runtime: node
+    plan: free
+    buildCommand: npm --prefix backend ci && npm --prefix frontend ci && npm --prefix frontend run build
+    startCommand: node backend/src/index.js
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: NODE_VERSION
+        value: "22.14.0"
+      - key: PUBLIC_DEMO
+        value: "1"
+      - key: PUBLIC_AI_ENABLED
+        value: "0"
+      # 仅在 PUBLIC_AI_ENABLED=1 时使用；三项缺一不可，否则服务拒绝启动
+      - key: PUBLIC_AI_RATE_LIMIT_PER_MIN
+        value: "6"
+      - key: PUBLIC_AI_DAILY_CALL_QUOTA
+        value: "200"
+      - key: PUBLIC_AI_MAX_CONCURRENCY
+        value: "2"
+      # 以下为敏感项：在 Render 控制台填写（sync: false），不写入仓库
+      - key: DEMO_ACCESS_PASSWORD
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: VERIFICATION_KEY
+        sync: false
+      - key: DEMO_VERIFICATION_PASSWORD
+        sync: false
+      - key: DEMO_TOTP_SECRET
+        sync: false
