@@ -1090,7 +1090,9 @@ async function runLoop(messages, db, demoUserId, chatFn, ctx) {
       r = await chatFn({ messages, tools: TOOL_DEFS, maxTokens: REPLY_MAX_TOKENS })
     } catch (e) {
       if (e instanceof AiError) {
-        throw new AssistantError(e.message, 'model')
+        // 公网护栏的配额 / 并发限制转为明确错误码，由路由返回 429；其余模型错误保持原处理
+        const code = e.kind === 'quota' || e.kind === 'concurrency' ? 'ai_quota' : 'model'
+        throw new AssistantError(e.message, code)
       }
       throw e
     }

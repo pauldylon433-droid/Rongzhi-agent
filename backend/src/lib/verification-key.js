@@ -14,10 +14,13 @@ function parseKey(b64) {
   return key.length === 32 ? key : null
 }
 
-// 读取主密钥；缺失或非法返回 null（此时红色转账保持阻断）
+// 读取主密钥；缺失或非法返回 null（此时红色转账保持阻断）。
+// 公网演示模式（PUBLIC_DEMO=1）只允许使用环境变量 VERIFICATION_KEY，绝不读取本地开发主密钥文件，
+// 避免把开发环境的密钥 / 验证绑定带到公网实例。
 export function loadVerificationKey() {
   const envKey = parseKey(process.env.VERIFICATION_KEY)
   if (envKey) return envKey
+  if (process.env.PUBLIC_DEMO === '1') return null
   try {
     if (!existsSync(VERIFICATION_KEY_PATH)) return null
     return parseKey(readFileSync(VERIFICATION_KEY_PATH, 'utf8'))

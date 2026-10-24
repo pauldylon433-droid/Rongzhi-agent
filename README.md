@@ -241,6 +241,7 @@ node scripts/verify-assistant-repayment.js
 node scripts/verify-activity.js
 node scripts/verify-account-filter.js
 node scripts/verify-demo-seed.js
+node scripts/verify-public-demo.js
 
 cd ../frontend
 node scripts/verify-markdown.mjs
@@ -397,6 +398,7 @@ npm start
 
 ## 文档索引
 
+- `docs/render-deploy.md` —— Render 免费 Web Service 公网演示部署说明（口令保护 / 独立演示库 / AI 配额 / 强验证配置）
 - `docs/validation-record.md` —— 验证记录：自动化 / mock / 真实模型 / 浏览器人工验收的区分与评分维度对应
 - `docs/demo-script.md` —— 5 分钟演示脚本、PPT 大纲、答辩要点与待核实项
 - `docs/api.md` —— 全部 HTTP 接口与 AI 工具白名单

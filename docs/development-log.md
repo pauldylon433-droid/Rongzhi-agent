@@ -2863,3 +2863,24 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 - 前端应用源码未改，本轮未重新执行 `npm run build`（构建证据沿用上一轮）。
 - 3000 受控重启为单实例（新 PID 44820），使用 `deepseek-flash`；5174 未动；隔离环境保持停止。
 - 未调用模型；未在开发库执行交易 / 还款 / 冻结 / 订阅操作；未推送 Git。
+
+---
+
+## 第五十四阶段：Render 免费 Web Service 部署适配（未推送 / 未发布）
+
+- 单服务同源部署：后端提供 `frontend/dist` 静态页面与 `/api`；SPA 路由回退为页面，未知 `/api` 返回 JSON 404。
+- 公网演示模式 `PUBLIC_DEMO=1`：独立数据库 `backend/data/public-demo.db`（仅文件不存在时初始化基础数据 +
+  第二张借记卡 + 一张信用卡及样例）；不使用开发库；指向开发库路径时拒绝启动；公网模式不加载 `.env`。
+- 访问口令：服务端 Basic Auth（用户名 `demo` + `DEMO_ACCESS_PASSWORD`），覆盖页面与业务 API，`/api/health` 例外；
+  缺少口令拒绝启动；共享模拟环境，不是多用户登录。
+- AI：公网默认关闭；`PUBLIC_AI_ENABLED=1` 时必须同时配置模型密钥、每 IP 请求限流、每日调用配额与并发上限，
+  否则拒绝启动；工具循环内每次模型调用都经护栏计数；配额为内存态、重启清零；是调用次数限制，不是人民币费用硬上限。
+- 强验证：公网模式只从环境变量读取 `VERIFICATION_KEY`，不读本地开发主密钥；支持用
+  `DEMO_VERIFICATION_PASSWORD` + `DEMO_TOTP_SECRET` 在首次启动时自动绑定；未配置时红色操作保持阻断。
+  新增 `scripts/generate-verification-env.js` 生成本地随机值（只打印、不写文件）。
+- Render 配置：`render.yaml`（Web Service / Free / Node 22.14.0 / 构建与启动命令 / 健康检查 `/api/health` /
+  `autoDeploy:false`）；说明见 `docs/render-deploy.md`。
+- 验证：`scripts/verify-public-demo.js`（28 项，临时库 + 本地临时服务 + mock 模型）：缺口令 / 缺配额拒绝启动、
+  独立库初始化内容、口令拦截页面与 API、页面与刷新、静态资源、未知 API JSON 404、AI 默认关闭、
+  环境变量强验证绑定、配额 / 并发 / 日切重置；本地模式相关回归（assistant / 强验证 / 转账 / 聊天 / 风险升级）通过。
+- 未提交 / 未推送 Git；未调用真实模型；未发布网站；未购买域名或付费资源。

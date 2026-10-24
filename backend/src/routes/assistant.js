@@ -4,7 +4,10 @@
 import { Router } from 'express'
 import { ok, badRequest } from './helpers.js'
 import { createAssistant, AssistantError, MAX_USER_MESSAGE_LEN } from '../services/assistant.js'
-import { hasAiKey } from '../config.js'
+import { hasAiKey, isPublicDemo, getPublicDemoConfig } from '../config.js'
+import { createAiGuard } from '../lib/ai-guard.js'
+import { createRateLimiter } from '../lib/rate-limit.js'
+import { chatCompletions } from '../lib/ai-client.js'
 
 const ALLOWED_BODY_KEYS = ['message', 'sessionId', 'selectedCardId']
 
@@ -46,18 +49,48 @@ export function parseChatBody(body) {
 }
 
 export function createAssistantRouter(db, demoUserId) {
-  const assistant = createAssistant({ db, demoUserId })
+  const publicDemo = isPublicDemo()
+  const publicCfg = getPublicDemoConfig()
+  // 公网演示：AI 默认关闭；显式开启时所有模型调用（含工具循环）经过配额 / 并发护栏，
+  // 并对 /chat 做按 IP 的请求限流。本地模式保持原行为（无限流、无配额）。
+  let assistant
+  let chatLimiter = null
+  if (publicDemo && publicCfg.aiEnabled) {
+    const guard = createAiGuard({
+      chatFn: chatCompletions,
+      dailyCallQuota: publicCfg.aiDailyCallQuota,
+      maxConcurrency: publicCfg.aiMaxConcurrency,
+    })
+    assistant = createAssistant({ db, demoUserId, chatFn: guard.chatFn })
+    chatLimiter = createRateLimiter({ windowMs: 60 * 1000, max: publicCfg.aiRateLimitPerMin })
+  } else {
+    assistant = createAssistant({ db, demoUserId })
+  }
   const router = Router()
 
   router.post('/chat', async (req, res) => {
     const parsed = parseChatBody(req.body)
     if (parsed.error) return badRequest(res, parsed.error)
 
+    // 公网演示默认关闭 AI；即使存在密钥也不得默认开启
+    if (publicDemo && !publicCfg.aiEnabled) {
+      return res.status(503).json({
+        success: false,
+        message: '公网演示环境未开启 AI 助手；查询与手动操作仍可使用',
+      })
+    }
     if (!hasAiKey()) {
       return res.status(503).json({
         success: false,
         message: 'AI 助手尚未配置模型密钥，请在 backend/.env 配置后重启后端',
       })
+    }
+    if (chatLimiter) {
+      const lim = chatLimiter(req.ip || 'unknown')
+      if (!lim.allowed) {
+        res.set('Retry-After', String(Math.ceil(lim.retryAfterMs / 1000)))
+        return res.status(429).json({ success: false, message: 'AI 请求过于频繁，请稍后重试' })
+      }
     }
 
     try {
@@ -74,6 +107,10 @@ export function createAssistantRouter(db, demoUserId) {
         if (e.code === 'credential_detected') {
           // 固定安全提示，不含用户原文；不写日志、不落库。
           return res.status(400).json({ success: false, code: 'credential_detected', message: e.message })
+        }
+        if (e.code === 'ai_quota') {
+          // 公网护栏：配额 / 并发限制；消息为固定文案，不含密钥或用户内容
+          return res.status(429).json({ success: false, message: e.message })
         }
         if (e.code === 'model') {
           console.error('[助手] 模型调用失败（脱敏）：', e.message)
