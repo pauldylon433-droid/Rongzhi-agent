@@ -34,11 +34,11 @@ export const MAX_MODEL_CALLS = 4 // 每条用户消息最多 4 轮模型请求
 export const MAX_TOOL_CALLS = 6 // 每条用户消息最多 6 次工具执行
 export const MAX_TURNS = 8 // 会话保留最近 8 轮对话
 export const MAX_USER_MESSAGE_LEN = 2000 // 消息长度上限（字符）
-const REPLY_MAX_TOKENS = 1024 // 助手回复额度
+export const REPLY_MAX_TOKENS = 1024 // 助手回复额度
 const CHAT_MAX_MESSAGES_PER_SESSION = 200 // 单会话可见消息上限（约 100 轮，防无限增长）
 
 // 工具白名单（模型可见的 function schema）
-const TOOL_DEFS = [
+export const TOOL_DEFS = [
   {
     type: 'function',
     function: {
@@ -293,7 +293,7 @@ const TOOL_DEFS = [
 ]
 
 // 工具参数/未知工具错误
-class ToolError extends Error {}
+export class ToolError extends Error {}
 
 // 供路由层映射 HTTP 状态码的助手错误：code 为 'locked' | 'model'
 export class AssistantError extends Error {
@@ -313,7 +313,7 @@ function shanghaiNowText() {
     `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}（周${week}，Asia/Shanghai）`
 }
 
-function buildSystemMessage(transferContext = '', repaymentContext = '') {
+export function buildSystemMessage(transferContext = '', repaymentContext = '') {
   const ctxBlock = [transferContext, repaymentContext].filter(Boolean).join('\n\n')
   return {
     role: 'system',
@@ -350,7 +350,7 @@ function buildSystemMessage(transferContext = '', repaymentContext = '') {
 }
 
 // 解析工具参数 JSON 字符串；无效 JSON 或非对象抛 ToolError
-function parseToolArgs(raw) {
+export function parseToolArgs(raw) {
   if (raw == null || raw === '') return {}
   let obj
   try {
@@ -365,19 +365,19 @@ function parseToolArgs(raw) {
 }
 
 // 操作编号尾号（用于确定性文案，避免在说明里暴露完整 UUID）
-function refTail(refNo) {
+export function refTail(refNo) {
   return typeof refNo === 'string' && refNo.length >= 8 ? `${refNo.slice(0, 8)}…` : refNo || ''
 }
 
 // 金额（分）→ 元字符串（两位小数），用于系统提示中的权威回执文案
-function centsToYuan(cents) {
+export function centsToYuan(cents) {
   const sign = cents < 0 ? '-' : ''
   const abs = Math.abs(cents)
   return `${sign}${Math.trunc(abs / 100)}.${String(abs % 100).padStart(2, '0')}`
 }
 
 // UTC ISO 字符串 → Asia/Shanghai 展示文本（固定 +8，无夏令时）
-function shanghaiTimeText(iso) {
+export function shanghaiTimeText(iso) {
   if (!iso) return ''
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return ''
@@ -387,7 +387,7 @@ function shanghaiTimeText(iso) {
     `${pad(s.getUTCHours())}:${pad(s.getUTCMinutes())}:${pad(s.getUTCSeconds())}`
 }
 
-const TRANSFER_STATUS_TEXT = {
+export const TRANSFER_STATUS_TEXT = {
   pending: '待确认（尚未扣款）',
   needs_verification: '需要强验证（尚未扣款）',
   completed: '已完成（已扣款）',
@@ -435,7 +435,7 @@ function truncateDataText(value, maxLen = 40) {
 // 业务字段以单行 JSON（标准序列化）嵌入，而不是手工拼接引号：
 // JSON.stringify 会转义引号 / 反斜杠 / 换行 / 控制字符，且整块只有一行，不可信数据无法伪造新的段落。
 // 这是模型输入表示层的边界处理，不构成完整的 Prompt 注入防御；工具权限与执行边界仍由服务端固定。
-function buildTransferStatusText(t) {
+export function buildTransferStatusText(t) {
   const st = TRANSFER_STATUS_TEXT[t.status] || t.status
   const data = {
     ref_tail: refTail(t.ref_no),
@@ -480,7 +480,7 @@ function buildTransferStatusReply(db, demoUserId, snapshot) {
   return `该笔转账${st}。`
 }
 
-const REPAYMENT_STATUS_TEXT = {
+export const REPAYMENT_STATUS_TEXT = {
   needs_verification: '需要强验证（尚未扣款）',
   completed: '已完成（已扣款并冲抵账单）',
   cancelled: '已取消',
@@ -519,7 +519,7 @@ function resolveReferencedRepayment(db, demoUserId, sessionId) {
 }
 
 // 用已解析的权威状态构造系统提示回执文案（含查询时点与状态快照）。
-function buildRepaymentStatusText(r) {
+export function buildRepaymentStatusText(r) {
   const st = REPAYMENT_STATUS_TEXT[r.status] || r.status
   const scope = r.scope === 'all_posted' ? 'all_posted' : 'statement'
   const data = {
@@ -563,7 +563,7 @@ function buildRepaymentStatusReply(db, demoUserId, snapshot) {
 }
 
 // 根据旧单取消的真实结果与新旧编号，生成确定性状态说明（状态由服务端读取，不由模型推断）。
-function buildTransferNotice(previous, newRefNo) {
+export function buildTransferNotice(previous, newRefNo) {
   const newT = refTail(newRefNo)
   if (!previous) return `已生成待确认转账单（${newT}）。`
   const old = refTail(previous.ref_no)
@@ -584,7 +584,7 @@ function buildTransferNotice(previous, newRefNo) {
 }
 
 // 根据旧银行卡操作单取消的真实结果与新旧编号，生成确定性状态说明（状态由服务端读取，不由模型推断）。
-function buildCardOpNotice(previous, newRefNo, action) {
+export function buildCardOpNotice(previous, newRefNo, action) {
   const newT = refTail(newRefNo)
   const actText = action === 'freeze' ? '冻结' : '解冻'
   if (!previous) return `已生成${actText}操作单（${newT}），请在界面确认。`
@@ -606,7 +606,7 @@ function buildCardOpNotice(previous, newRefNo, action) {
 }
 
 // 根据旧订阅操作单取消的真实结果与新旧编号，生成确定性状态说明（状态由服务端读取，不由模型推断）。
-function buildSubscriptionOpNotice(previous, newRefNo, action) {
+export function buildSubscriptionOpNotice(previous, newRefNo, action) {
   const newT = refTail(newRefNo)
   const actText = { pause: '暂停', resume: '恢复', cancel: '取消', change_source: '更换扣款账户' }[action] || action
   const needsVerify = action === 'resume' || action === 'change_source'
@@ -631,7 +631,7 @@ function buildSubscriptionOpNotice(previous, newRefNo, action) {
 }
 
 // 根据旧还款单取消的真实结果与新旧编号，生成确定性状态说明（状态由服务端读取，不由模型推断）。
-function buildRepaymentNotice(previous, newRefNo) {
+export function buildRepaymentNotice(previous, newRefNo) {
   const newT = refTail(newRefNo)
   if (!previous) return `已生成待确认还款单（${newT}），请在界面用交易密码与动态验证码验证确认。`
   const old = refTail(previous.ref_no)

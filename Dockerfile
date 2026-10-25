@@ -21,7 +21,7 @@ ENV NODE_ENV=production \
     PORT=3000 \
     PUBLIC_DEMO=1 \
     PUBLIC_AI_ENABLED=0 \
-    DB_PATH=/app/backend/data/public-demo.db \
+    DB_MODE=cloudbase \
     STATIC_DIR=/app/frontend/dist
 WORKDIR /app
 COPY --from=backend-build --chown=node:node /app/backend/ ./backend/

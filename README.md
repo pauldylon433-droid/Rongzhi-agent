@@ -5,7 +5,7 @@
 
 ## 项目状态
 
-五个业务场景均已通过用户网页验收：
+以下五个业务场景的本地版本已通过用户网页验收；云数据库适配的验证范围另见下方 CloudBase 文档：
 
 | # | 场景 | 状态 |
 | - | ---- | ---- |
@@ -19,7 +19,8 @@
 含未出账提前还款）、订阅扣款来源更换、账户范围筛选与逐笔结余 / 交易后可用额度、聊天历史续聊与结构化可视化。
 
 > 仓库地址：https://github.com/pauldylon433-droid/Rongzhi-agent
-> 评审入口：`docs/validation-record.md`（验证记录）、`docs/security-design.md`（安全设计）、`docs/render-deploy.md`（公网演示部署说明）。
+> 评审入口：`docs/validation-record.md`（原有本地验证记录）、`docs/security-design.md`（安全设计）、
+> [腾讯云部署步骤](docs/cloudbase-deployment.md)、[云数据库适配验证](docs/cloudbase-validation.md)。
 
 ## 技术栈
 
@@ -27,12 +28,23 @@
 | ---- | ---- |
 | 前端 | Vue 3 + Vite 8 |
 | 后端 | Node.js + Express 5（ES Modules） |
-| 数据库 | SQLite（better-sqlite3，WAL 模式） |
+| 数据库 | 本地默认 SQLite（better-sqlite3，WAL）；公网可选 CloudBase PostgreSQL 固定 RPC |
 | 助手文本渲染 | markdown-it + DOMPurify（严格白名单净化） |
 | 大模型 | DeepSeek（可选，仅自然语言助手使用） |
 
 > 图表库（ECharts 等）**未使用**：月度账单分析以「统计卡片 + 分类表格 + 本地 SVG 环形图」呈现
 > （分类占比由 `CategoryPieChart.vue` 用原生 SVG 绘制），不依赖第三方图表库，亦非部署前置条件，请勿将其列为缺项。
+
+### CloudBase 持久数据库模式（公网演示）
+
+- 本地默认 `DB_MODE=sqlite`，行为与验证脚本保持不变。
+- 公网设置 `DB_MODE=cloudbase`：业务数据只写 CloudBase PostgreSQL，通过后端 Service Role Key
+  调用 `rongzhi_bank_*` 固定 RPC；不依赖容器临时磁盘。
+- 安装 / 升级 / 回退 / 环境变量 / 验证命令见 **[docs/cloudbase-deployment.md](docs/cloudbase-deployment.md)**。
+- 本地 SQL / RPC 桩验证结果与证据边界见 **[docs/cloudbase-validation.md](docs/cloudbase-validation.md)**。
+- SQL 对象与版本化脚本见 **[cloudbase/sql/README.md](cloudbase/sql/README.md)**。
+- 公网 AI 默认关闭；显式开启且模型密钥 / 配额 / 并发配置齐全时，云端模式复用同一套系统提示与 17 个工具白名单，
+  通过固定 RPC 完成查询、准备操作单与订阅审查任务。助手仍无确认、扣款、验证凭据或任意 SQL 权限。
 
 ## 目录结构
 
@@ -99,7 +111,7 @@ rongzhi-agent/
 ## 环境要求
 
 - Windows 10 / 11，PowerShell（5.1 或 7）。
-- Node.js **≥ 22 且 < 25**（当前 better-sqlite3 依赖要求 Node ≥22；Render 配置使用 22.14.0，本地记录已验证 v24.21.0）。
+- Node.js **≥ 22 且 < 25**（当前 better-sqlite3 依赖要求 Node ≥22；云托管 Dockerfile 使用 Node 22）。
 - npm（已验证 **11.19.0**）。
 - （可选）手机验证器 App：Google Authenticator / Microsoft Authenticator，仅用于红色强验证。
 
@@ -397,9 +409,12 @@ npm start
 
 ## 文档索引
 
+- `docs/cloudbase-deployment.md` —— 腾讯云首次安装、控制台填写表、强验证绑定、AI 开启与回退
+- `docs/cloudbase-validation.md` —— 云数据库适配的本地验证结果及尚未完成的云端验证
 - `docs/render-deploy.md` —— Render 免费 Web Service 公网演示部署说明（口令保护 / 独立演示库 / AI 配额 / 强验证配置）
 - `docs/validation-record.md` —— 验证记录：自动化 / mock / 真实模型 / 浏览器人工验收的区分与评分维度对应
 - `docs/api.md` —— 全部 HTTP 接口与 AI 工具白名单
 - `docs/database-design.md` —— 表结构、迁移与种子数据
 - `docs/security-design.md` —— 身份 / 金额 / 风险 / 防重放 / 防篡改 / AI 边界
 - `docs/ai-usage.md` —— 真实模型调用用量记录
+

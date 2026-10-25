@@ -1,6 +1,6 @@
 // 生成本地随机的「公网演示强验证」环境变量值（只在终端打印，不写文件、不读取任何现有密钥）。
 //
-// 输出三项，由用户自行粘贴到 Render 环境变量：
+// 输出三项，由用户自行粘贴到云托管服务端环境变量：
 //   VERIFICATION_KEY          base64 32 字节（AES-256-GCM 主密钥）
 //   DEMO_TOTP_SECRET          Base32 20 字节（用验证器 App 添加账户，或手工输入）
 //   DEMO_VERIFICATION_PASSWORD 由用户自定（≥8 位）；本脚本不生成、不打印密码占位以外的内容
@@ -12,7 +12,7 @@ import { base32Encode } from '../src/lib/totp.js'
 const key = randomBytes(32).toString('base64')
 const secret = base32Encode(randomBytes(20))
 
-console.log('请将以下值填入 Render 的环境变量（仅公网演示实例使用，勿提交到仓库）：')
+console.log('请将以下值填入云托管服务端环境变量（仅公网演示实例使用，勿提交到仓库）：')
 console.log('')
 console.log(`VERIFICATION_KEY=${key}`)
 console.log(`DEMO_TOTP_SECRET=${secret}`)

@@ -20,7 +20,8 @@ function parseKey(b64) {
 export function loadVerificationKey() {
   const envKey = parseKey(process.env.VERIFICATION_KEY)
   if (envKey) return envKey
-  if (process.env.PUBLIC_DEMO === '1') return null
+  // 云端持久库模式只允许环境变量主密钥，不读取开发机本地密钥文件。
+  if (process.env.PUBLIC_DEMO === '1' || process.env.DB_MODE === 'cloudbase') return null
   try {
     if (!existsSync(VERIFICATION_KEY_PATH)) return null
     return parseKey(readFileSync(VERIFICATION_KEY_PATH, 'utf8'))

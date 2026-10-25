@@ -10,7 +10,7 @@ export const ENV_PATH = join(BACKEND_DIR, '.env')
 
 // 公网演示模式（PUBLIC_DEMO=1）只使用真实环境变量，不加载 backend/.env，
 // 避免把本地开发密钥 / 配置无意带到公网实例；本地模式保持原行为。
-if (process.env.PUBLIC_DEMO !== '1') {
+if (process.env.PUBLIC_DEMO !== '1' && process.env.SKIP_ENV_FILE !== '1') {
   try {
     process.loadEnvFile(ENV_PATH)
   } catch {
@@ -25,6 +25,40 @@ export function getDeepSeekConfig() {
     baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
     model: process.env.DEEPSEEK_MODEL || 'deepseek-flash',
   }
+}
+
+// —— 数据库模式 ——
+// 本地默认 sqlite；云端显式 DB_MODE=cloudbase，业务数据只存 CloudBase PostgreSQL。
+export function getDbMode() {
+  const v = String(process.env.DB_MODE || 'sqlite').trim().toLowerCase()
+  if (v !== 'sqlite' && v !== 'cloudbase') {
+    throw new Error('DB_MODE 仅支持 sqlite / cloudbase')
+  }
+  return v
+}
+
+// 读取 CloudBase 配置（只返回是否配置与目标地址，不返回密钥内容）。
+export function getCloudBaseConfig() {
+  const rawUserId = Number(process.env.CLOUDBASE_DEMO_USER_ID || 1)
+  return {
+    base: process.env.CLOUDBASE_RPC_BASE || '',
+    serviceKey: process.env.CLOUDBASE_SERVICE_KEY || '',
+    demoUserId: Number.isSafeInteger(rawUserId) && rawUserId > 0 ? rawUserId : 1,
+    configured: Boolean(process.env.CLOUDBASE_RPC_BASE && process.env.CLOUDBASE_SERVICE_KEY),
+    verificationConfigured: Boolean(
+      process.env.VERIFICATION_KEY && process.env.DEMO_VERIFICATION_PASSWORD && process.env.DEMO_TOTP_SECRET,
+    ),
+  }
+}
+
+// 云端模式启动前校验：只返回缺失的环境变量名，不包含任何值。
+export function validateCloudConfig() {
+  const c = getCloudBaseConfig()
+  const missing = []
+  if (!c.base) missing.push('CLOUDBASE_RPC_BASE')
+  if (!c.serviceKey) missing.push('CLOUDBASE_SERVICE_KEY')
+  if (process.env.PUBLIC_AI_ENABLED === '1' && !hasAiKey()) missing.push('DEEPSEEK_API_KEY')
+  return missing
 }
 
 // 是否已填写 AI 密钥（真实密钥由用户填写后生效）
