@@ -76,6 +76,22 @@ try {
   skipped('真实多连接并发失败计数：未执行（PGlite 单连接）')
 
   // —— 2. 日累计：受控顺序复核（非真实多连接） ——
+  await seed(10)
+  const expiryAccount = (await ownerRows('SELECT id FROM public.rongzhi_bank_accounts WHERE user_id=10 ORDER BY id'))[0].id
+  const expire1 = await fn('rongzhi_bank_transfer_write_v1', 10, 'create', { recipient_id: 1, amount_cents: 60000, from_account_id: expiryAccount })
+  await ownerRows("UPDATE public.rongzhi_bank_transfer_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE ref_no=$1", [expire1.ref_no])
+  const expire2 = await fn('rongzhi_bank_transfer_write_v1', 10, 'create', { recipient_id: 1, amount_cents: 60000, from_account_id: expiryAccount })
+  check('600 元旧单过期但尚未落库 expired：第二笔仍为黄色', expire2.status === 'pending' && expire2.risk_level === 'yellow')
+  const expiredResult = await fn('rongzhi_bank_transfer_write_v1', 10, 'confirm', { ref_no: expire1.ref_no })
+  const cancelledResult = await fn('rongzhi_bank_transfer_write_v1', 10, 'cancel', { ref_no: expire2.ref_no })
+  const expire3 = await fn('rongzhi_bank_transfer_write_v1', 10, 'create', { recipient_id: 1, amount_cents: 60000, from_account_id: expiryAccount })
+  check('已过期与已取消单都不占累计额度，新 600 元单仍为黄色', expiredResult.outcome === 'expired' && cancelledResult.outcome === 'cancelled' && expire3.risk_level === 'yellow')
+  const oldTx = Number((await ownerOne('SELECT count(*) n FROM public.rongzhi_bank_transactions WHERE transfer_ref=ANY($1::text[])', [[expire1.ref_no, expire2.ref_no]])).n)
+  const oldBalance = Number((await ownerOne('SELECT balance_cents FROM public.rongzhi_bank_accounts WHERE id=$1', [expiryAccount])).balance_cents)
+  check('过期、取消和仅建单：余额仍 10000 元，旧单无转账流水', oldTx === 0 && oldBalance === 1000000)
+  const completeNew = await fn('rongzhi_bank_transfer_write_v1', 10, 'confirm', { ref_no: expire3.ref_no })
+  const afterNew = Number((await ownerOne('SELECT balance_cents FROM public.rongzhi_bank_accounts WHERE id=$1', [expiryAccount])).balance_cents)
+  check('新 600 元单可普通确认，只有本次完成后余额变为 9400 元', completeNew.outcome === 'completed' && afterNew === 940000)
   await seed(3)
   const acct = (await ownerRows('SELECT id FROM public.rongzhi_bank_accounts WHERE user_id=3 ORDER BY id'))[0].id
   const t1 = await fn('rongzhi_bank_transfer_write_v1', 3, 'create', { recipient_id: 1, amount_cents: 60000, from_account_id: acct })

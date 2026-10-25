@@ -49,7 +49,8 @@ try {
     CLOUDBASE_RPC_BASE: 'http://127.0.0.1:' + stubPort,
     CLOUDBASE_SERVICE_KEY: 'test-service-key', CLOUDBASE_DEMO_USER_ID: '1',
     STATIC_DIR: runtimeRoot + '/frontend/dist', SKIP_ENV_FILE: '1',
-    VERIFICATION_KEY: '', DEMO_VERIFICATION_PASSWORD: '', DEMO_TOTP_SECRET: '',
+    VERIFICATION_KEY: Buffer.alloc(32, 7).toString('base64'),
+    DEMO_VERIFICATION_PASSWORD: 'startup-test-password', DEMO_TOTP_SECRET: 'JBSWY3DPEHPK3PXPJBSWY3DP',
     DEEPSEEK_API_KEY: '', DEEPSEEK_BASE_URL: 'http://127.0.0.1:9',
   }
   let app = start(root + '/backend/src/index.js', env)
@@ -66,6 +67,25 @@ try {
   r = await fetch(base + '/api/accounts', { headers }); j = await r.json()
   check('实际启动入口账户查询返回 3 个账户', r.status === 200 && j.data.length === 3)
   const before = JSON.stringify(j.data)
+  const accountId = j.data.find((a) => a.account_type === 'deposit').id
+  const post = (path, body, auth = headers) => fetch(base + path, {
+    method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })
+  r = await fetch(base + '/api/transfers/recipients', { headers }); j = await r.json()
+  const recipientId = j.data[0].id
+  r = await post('/api/transfers', { from_account_id: accountId, recipient_id: recipientId, amount_cents: 120000 })
+  j = await r.json()
+  check('公网入口创建红色测试单，不执行转账', r.status === 200 && j.data.status === 'needs_verification')
+  const verifyPath = '/api/transfers/' + j.data.ref_no + '/verify'
+  r = await post(verifyPath, { password: 'wrong-test-password', totp: '000000' }, {})
+  check('缺少网站口令仍返回 401 与 Basic challenge', r.status === 401 && r.headers.get('www-authenticate')?.startsWith('Basic '))
+  r = await post(verifyPath, { password: 'wrong-test-password', totp: '000000' })
+  j = await r.json()
+  check('网站已登录后的交易凭据错误返回 403，不触发网站 401 challenge', r.status === 403 && j.code === 'bad_credentials' && !r.headers.has('www-authenticate'))
+  r = await fetch(base + '/api/verification/status', { headers }); j = await r.json()
+  check('错误后访问身份保持有效，绑定保留且只计一次失败', r.status === 200 && j.data.bound && !j.data.locked && j.data.remaining_attempts === 4)
+  r = await fetch(base + '/api/accounts', { headers }); j = await r.json()
+  check('凭据失败不扣款', r.status === 200 && JSON.stringify(j.data) === before)
   r = await fetch(base + '/api/assistant/chat', { method:'POST', headers:{...headers,'Content-Type':'application/json'}, body:JSON.stringify({message:'查询账户'}) })
   check('初次上线关闭 AI，聊天返回 503', r.status === 503)
   const stopped = once(app, 'exit'); app.kill(); await stopped

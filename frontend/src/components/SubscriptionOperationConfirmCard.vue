@@ -266,7 +266,6 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
             />
           </label>
           <p v-if="vStatus.remaining_attempts < 5" class="verify-hint">剩余尝试次数：{{ vStatus.remaining_attempts }}</p>
-          <p v-if="opError" class="form-error">{{ opError }}</p>
           <div class="card-actions">
             <button class="btn" :disabled="verifying || cancelling || !password || !totpCode" @click="onVerify">
               {{ verifying ? '验证中…' : `验证并确认${verifyActionText}` }}

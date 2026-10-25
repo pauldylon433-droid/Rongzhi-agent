@@ -13,7 +13,7 @@ import { hasAiKey, isPublicDemo, getPublicDemoConfig } from '../config.js'
 
 const TRANSFER_CONFIRM_MSG = {
   expired: '转账单已过期，未扣款', cancelled: '转账单已取消',
-  needs_verification: '当日累计转账金额已超限，需要强验证：请使用交易密码与动态验证码验证后确认',
+  needs_verification: '本笔金额加今日已完成转账超过 1,000 元，需要强验证；本单尚未扣款，过期和未完成单不计入累计',
   failed: '转账单校验失败，未扣款',
 }
 const TRANSFER_CANCEL_MSG = {
@@ -68,7 +68,9 @@ function cloudFailure(res, e, fallback = '云端数据库暂不可用，请稍�
     return res.status(503).json({ success: false, message: fallback })
   }
   if (e instanceof VerificationError) {
-    const status = { not_bound: 409, no_key: 503, decrypt_failed: 503, locked: 423, bad_credentials: 401, code_reused: 409 }[e.code] || 400
+    // A business credential mismatch must not re-challenge browser Basic Auth.
+    // Public access authentication alone uses 401; local API compatibility stays unchanged.
+    const status = { not_bound: 409, no_key: 503, decrypt_failed: 503, locked: 423, bad_credentials: isPublicDemo() ? 403 : 401, code_reused: 409 }[e.code] || 400
     return res.status(status).json({ success: false, message: e.message, code: e.code })
   }
   throw e

@@ -195,7 +195,7 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
 
       <!-- 红色待验证单：强验证表单（交易密码 + 动态验证码） -->
       <div v-if="isRedPending" class="verify-section">
-        <p class="red-note">当日累计转账金额已超限，需用交易密码与手机验证器动态码二次确认。</p>
+        <p class="red-note">按建单或确认时的判定，本笔金额加今日已完成转账超过 1,000 元，需强验证。本单尚未扣款；过期、取消和未完成单不计入累计。</p>
 
         <p v-if="vLoading" class="verify-hint">正在读取验证器状态…</p>
         <p v-else-if="vError || !vStatus" class="verify-blocked">
@@ -230,7 +230,6 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
             />
           </label>
           <p v-if="vStatus.remaining_attempts < 5" class="verify-hint">剩余尝试次数：{{ vStatus.remaining_attempts }}</p>
-          <p v-if="opError" class="form-error">{{ opError }}</p>
           <div class="card-actions">
             <button class="btn" :disabled="verifying || cancelling || !password || !totpCode" @click="onVerify">
               {{ verifying ? '验证中…' : '验证并确认转账' }}

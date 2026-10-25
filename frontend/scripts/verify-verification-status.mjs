@@ -6,7 +6,7 @@ import { JSDOM } from 'jsdom'
 import { parse, compileScript } from '@vue/compiler-sfc'
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost' })
-for (const name of ['window', 'document', 'Element', 'HTMLElement', 'SVGElement', 'Node', 'Event', 'CustomEvent']) {
+for (const name of ['window', 'document', 'Document', 'ShadowRoot', 'Element', 'HTMLElement', 'SVGElement', 'Node', 'Event', 'CustomEvent']) {
   globalThis[name] = dom.window[name]
 }
 const { createApp, nextTick } = await import('vue')
@@ -25,7 +25,7 @@ try {
     await writeFile(compiled, compileScript(descriptor, { id: `test-${name}`, inlineTemplate: true }).content)
     try {
       const component = (await import(compiled.href)).default
-      for (const scenario of ['failed-after-credentials', 'unbound', 'locked', 'invalid-response']) {
+      for (const scenario of ['failed-after-credentials', 'credentials-only', 'unbound', 'locked', 'invalid-response']) {
         let current = { bound: true, locked: false, remaining_attempts: 5 }
         if (scenario === 'unbound') current.bound = false
         if (scenario === 'locked') Object.assign(current, { locked: true, locked_until: '2099-01-01T00:00:00Z' })
@@ -37,7 +37,7 @@ try {
           requests.push({ path, method })
           if (method === 'POST') {
             assert.ok(String(path).endsWith('/verify'), 'only fixture verification may be submitted')
-            current = null
+            current = scenario === 'credentials-only' ? { bound: true, locked: false, remaining_attempts: 4 } : null
             return new Response(JSON.stringify({ success: false, code: 'bad_credentials', message: '交易密码或动态验证码不正确，请核对后重试（还可尝试 4 次）' }), { status: 401 })
           }
           if (path === '/api/verification/status') {
@@ -53,7 +53,7 @@ try {
           app.mount(host)
           await settle()
           const label = `${name}/${scenario}`
-          if (scenario === 'failed-after-credentials') {
+          if (scenario === 'failed-after-credentials' || scenario === 'credentials-only') {
             check(`${label}: initial bound status permits form`, host.querySelectorAll('input').length === 2)
             const inputs = host.querySelectorAll('input')
             for (let i = 0; i < inputs.length; i++) {
@@ -76,6 +76,9 @@ try {
             await settle()
             check(`${label}: retry only reads status`, requests.length === before + 1 && requests[before].path === '/api/verification/status' && requests[before].method === 'GET')
             check(`${label}: recovery restores empty inputs`, host.querySelectorAll('input').length === 2 && [...host.querySelectorAll('input')].every((i) => i.value === ''))
+          } else if (scenario === 'credentials-only') {
+            check(`${label}: one credential error, not duplicated`, host.querySelectorAll('.form-error').length === 1)
+            check(`${label}: remaining count refreshed without losing binding`, host.textContent.includes('剩余尝试次数：4') && host.querySelectorAll('input').length === 2)
           } else if (scenario === 'unbound') {
             check(`${label}: explicit unbound is accurately shown`, host.textContent.includes('尚未绑定验证器，无法执行') && host.querySelectorAll('input').length === 0)
           } else {
