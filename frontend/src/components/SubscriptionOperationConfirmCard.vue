@@ -27,6 +27,7 @@ const totpCode = ref('')
 const verifying = ref(false)
 const vStatus = ref(null) // { bound, locked, locked_until, remaining_attempts }
 const vLoading = ref(false)
+const vError = ref('')
 
 const { notifyChange, isChanged, version } = useSubscriptionOpSignal()
 
@@ -90,10 +91,16 @@ async function load() {
 // 读取验证器绑定 / 锁定状态（供红色表单渲染；不请求任何秘密）
 async function loadVerificationStatus() {
   vLoading.value = true
+  vError.value = ''
   try {
-    vStatus.value = await fetchVerificationStatus()
+    const status = await fetchVerificationStatus()
+    if (!status || typeof status.bound !== 'boolean' || typeof status.locked !== 'boolean') {
+      throw new Error('invalid_verification_status')
+    }
+    vStatus.value = status
   } catch {
-    vStatus.value = { bound: false }
+    vStatus.value = null
+    vError.value = '验证器状态读取失败，请重新查询；这不代表尚未绑定。'
   } finally {
     vLoading.value = false
   }
@@ -227,7 +234,11 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
         </p>
 
         <p v-if="vLoading" class="verify-hint">正在读取验证器状态…</p>
-        <p v-else-if="!vStatus || vStatus.bound === false" class="verify-blocked">尚未绑定验证器，无法执行强验证{{ verifyActionText }}。</p>
+        <p v-else-if="vError || !vStatus" class="verify-blocked">
+          {{ vError || '验证器状态尚未确认，请重新查询。' }}
+          <button type="button" @click="loadVerificationStatus">重新查询状态</button>
+        </p>
+        <p v-else-if="vStatus.bound === false" class="verify-blocked">尚未绑定验证器，无法执行强验证{{ verifyActionText }}。</p>
         <p v-else-if="vStatus.locked" class="verify-blocked">
           强验证已锁定，{{ formatShanghaiDateTime(vStatus.locked_until) }} 后可重试。
         </p>
