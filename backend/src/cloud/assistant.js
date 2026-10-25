@@ -74,11 +74,19 @@ function resolveReferencedRepayment(store, sessionId, session) {
   }
 }
 
-function transferStatusReply(store, snapshot) {
+function transferStatusReply(store, snapshot, draft = '', preparedNewTransfer = false) {
   if (!snapshot || typeof snapshot.ref_no !== 'string' || !snapshot.ref_no) return null
   const row = (store.snapshot.transfer_operations || []).find((o) => o.ref_no === snapshot.ref_no)
   const current = store.transferOp(snapshot.ref_no)
-  if (!row || !current || current.status === snapshot.status) return null
+  if (!row || !current) return null
+  // Cover explicit stale claims about this completed order even if it completed
+  // before the turn began. Do not override discussion of a newly prepared order.
+  const staleCompletedClaim = current.status === 'completed' && !preparedNewTransfer
+    && String(draft).split(/[。！？\n]/).some((sentence) => {
+      const identifiesOrder = sentence.includes(snapshot.ref_no) || sentence.includes(snapshot.ref_no.slice(0, 8))
+      return identifiesOrder && /(?:仍为|仍是|还是|处于|状态[：:为是\s]*)(?:\*\*)?待确认/.test(sentence)
+    })
+  if (current.status === snapshot.status && !staleCompletedClaim) return null
   if (current.status === 'completed') {
     return `该笔转账已完成，金额 ${centsToYuan(row.amount_cents)} 元，流水编号 ${current.transaction_id ?? '未知'}。`
   }
@@ -576,7 +584,7 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions 
 
       // 回复生成后复核本轮引用单的最新状态；变化时用服务端权威文案替换模型草稿。
       await load().then((fresh) => { state.store = fresh })
-      const authoritativeTransferReply = transferStatusReply(state.store, snapshotTransfer)
+      const authoritativeTransferReply = transferStatusReply(state.store, snapshotTransfer, finalReply, messageState.prepareTransferDone)
       const authoritativeRepaymentReply = repaymentStatusReply(state.store, snapshotRepayment)
       let reply = finalReply
       const authoritativeReply = authoritativeTransferReply !== null ? authoritativeTransferReply : authoritativeRepaymentReply
