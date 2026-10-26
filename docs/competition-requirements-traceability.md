@@ -5,6 +5,7 @@
 - 主项目：`rongzhi-agent`，master，9ed8efd；含公网 Render 部署配置与本机业务库 / 密钥 / 备份。
 - 最新本地开发：`rongzhi-agent-cloudbase`，worktree，原分支 `feature/cloudbase-persistent-db`，阶段提交 `536497f`。
 - 本轮独立分支：`feature/competition-requirements`（从 536497f 创建，不覆盖原工作区）。
+- 本地阶段提交：`a738d7a`（安全 / 审计 / 沙箱 / DAG 实现）、`d470399`（文档与工具计数同步）；未推送。
 - 远端 main 用户确认是 `d79d037c51bf386849dfbbf4b22e446fd4c5b3ce`；本地与远端不同，且网络不可达，无法确认公网部署对应提交。
   **未合并、未推送、未强制覆盖远端；安全地在本地独立副本继续。**
 - 本机开发库 / 公网业务数据 / 验证绑定 / 真实密钥未修改；未调用收费模型；未执行云端 SQL / 部署。
