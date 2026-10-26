@@ -10,6 +10,8 @@
 - 验证（均用独立临时库，不碰开发库）：`cd backend && node scripts/verify-*.js`；前端 `cd frontend && node scripts/verify-markdown.mjs`
 - CloudBase 适配验证（本地 PGlite / RPC 桩，不连云端）：`cd backend && npm run cloud:verify`（SQL + RPC 桩 + mock 模型助手）
 - CloudBase 初始化 / 绑定：`npm run cloud:init` / `npm run cloud:bind-verification`（需后端环境变量）
+- 比赛安全 / DAG / 沙箱定向验证：`cd backend && npm run verify:competition`
+- 审计接口默认关闭；启用需 `AUDIT_ACCESS_TOKEN`，禁止把令牌或密钥写入日志 / 文档。
 
 ## 铁律
 - 不读取 / 打印 / 复制 `backend/.env` 真实密钥；`.verification-key` 严禁提交。

@@ -114,6 +114,39 @@ const demoUserId = u1
   check('1.5 待入账 1 笔 / 500 分', anaRec && anaRec.data.pending.count === 1 && anaRec.data.pending.amount_cents === 500)
   check('1.6 分类倒序（餐饮 3000 首位）', anaRec && anaRec.data.expense_by_category[0]?.category === '餐饮' && anaRec.data.expense_by_category[0]?.amount_cents === 3000)
 
+  // 1.7 月度统计支持账户范围；非本人账户被拒绝
+  {
+    const m1 = makeScriptedMock([{ toolCalls: [tc('f1', 'get_monthly_analytics', { month: '2026-10', account_id: a1 })] }, { content: 'ok' }])
+    const r1 = await createAssistant({ db, demoUserId, chatFn: m1 }).chat({ message: '本账户本月账单' })
+    check('1.9 月度统计 account_id=本人账户成功', r1.toolRecords[0]?.status === 'ok' && r1.toolRecords[0].data.expense_cents === 5500)
+    const m2 = makeScriptedMock([{ toolCalls: [tc('f2', 'get_monthly_analytics', { month: '2026-10', account_id: a2 })] }, { content: '无法查询' }])
+    const r2 = await createAssistant({ db, demoUserId, chatFn: m2 }).chat({ message: '查别人账户' })
+    check('1.10 月度统计非本人账户被拒绝', r2.toolRecords[0]?.status === 'error' && /不属于当前用户/.test(r2.toolRecords[0].error), JSON.stringify(r2.toolRecords[0]))
+  }
+
+  // 1.11 沙箱分析工具：正常执行 + 宿主访问被阻断（结果不冒充业务事实）
+  {
+    const code = 'function analyze(rows){ let total=0; for(const r of rows){ if(r.status==="posted" && r.flow_kind!=="repayment" && r.direction==="expense") total+=r.amount_cents; } return {total_cents:total}; }'
+    const ms = makeScriptedMock([{ toolCalls: [tc('s1', 'analyze_transactions_sandboxed', { month: '2026-10', code })] }, { content: '沙箱分析完成' }])
+    const rs = await createAssistant({ db, demoUserId, chatFn: ms }).chat({ message: '用沙箱分析本月支出' })
+    check('1.11 沙箱工具正常执行且标记为非权威', rs.toolRecords[0]?.status === 'ok'
+      && rs.toolRecords[0].data.execution.sandbox === 'quickjs-wasm'
+      && rs.toolRecords[0].data.authoritative === false
+      && rs.toolRecords[0].data.analysis.total_cents === 5500, JSON.stringify(rs.toolRecords[0]))
+    const badCode = "function analyze(){ return { data: require('fs').readFileSync('C:/Windows/win.ini') }; }"
+    const mb = makeScriptedMock([{ toolCalls: [tc('s2', 'analyze_transactions_sandboxed', { month: '2026-10', code: badCode })] }, { content: '无法访问宿主' }])
+    const rb = await createAssistant({ db, demoUserId, chatFn: mb }).chat({ message: '尝试读取文件' })
+    check('1.12 沙箱宿主访问被阻断', rb.toolRecords[0]?.status === 'error' && /沙箱分析失败/.test(rb.toolRecords[0].error), JSON.stringify(rb.toolRecords[0]))
+  }
+
+  // 1.13 受约束 DAG 计划工具
+  {
+    const mp = makeScriptedMock([{ toolCalls: [tc('p1', 'plan_workflow', { flow: 'subscription_review', params: { month: '2026-10' } })] }, { content: '计划已创建' }])
+    const rp = await createAssistant({ db, demoUserId, chatFn: mp }).chat({ message: '创建订阅审查计划' })
+    check('1.13 DAG 工具创建订阅审查计划', rp.toolRecords[0]?.status === 'ok'
+      && /^wf-/.test(rp.toolRecords[0].data.plan_no) && rp.toolRecords[0].data.status === 'waiting_selection', JSON.stringify(rp.toolRecords[0]))
+  }
+
   const secondMsgs = mock.calls[1].messages
   const tool1 = findToolMsg(secondMsgs, 'c1')
   const tool2 = findToolMsg(secondMsgs, 'c2')

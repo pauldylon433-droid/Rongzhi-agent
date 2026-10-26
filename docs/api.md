@@ -261,7 +261,7 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | 工具 | 参数 | 说明 |
 | ---- | ---- | ---- |
 | get_accounts | 无 | 查询账户列表（复用 `listAccounts`） |
-| get_monthly_analytics | `month`（YYYY-MM，严格校验） | 月度账单统计（复用 `monthlyAnalytics`） |
+| get_monthly_analytics | `month`（YYYY-MM，严格校验）、`account_id`（可选，归属校验） | 月度账单统计（复用 `monthlyAnalytics`；account_id 与页面账户范围一致） |
 | search_transfer_recipients | `name`（字符串） | 按姓名 / 虚构联系方式搜索收款人，仅返回 `id`、姓名、掩码账户 |
 | list_transfer_recipients | 无 | 列举当前用户常用收款人（复用 `listRecipients`，仅返回 `id`、姓名、掩码账户），用于「我的收款人有哪些」；只读，不建单 / 不改收款人 / 不动资金 |
 | prepare_transfer | `recipient_id`、`amount_yuan`（字符串）、`remark`（可选）、`account_id`（可选） | 调用现有转账服务生成「待确认转账单」（不扣款） |
@@ -272,7 +272,9 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 | get_subscriptions | 无 | 查询本人订阅与代扣列表（复用 `listSubscriptions`，含商户 / 金额 / 周期 / 下次扣费日期 / 状态） |
 | prepare_subscription_operation | `subscription_id`、`action`（pause/resume/cancel） | 调用订阅操作服务生成「订阅操作单」（不改状态）；暂停/取消需点击确认、恢复需强验证 |
 | get_subscription_operation_status | `ref_no`（字符串） | 按操作编号查询订阅操作单当前状态（以数据库为准） |
-| start_subscription_review | `month`（YYYY-MM，必填） | 启动跨场景「订阅审查」任务（分析该月支出 + 列出生效订阅，落到等待选择；仅此一条任务链） |
+| start_subscription_review | `month`（YYYY-MM，必填） | 启动旧「订阅审查」任务（分析该月支出 + 列出生效订阅，落到等待选择） |
+| analyze_transactions_sandboxed | `month`、`account_id`（可选）、`code` | 在 QuickJS WASM 沙箱中分析脱敏流水；输出非权威，不得当余额 / 交易事实 |
+| plan_workflow | `flow`（subscription_review / repayment_review）、`params`、`steps`（可选） | 创建受约束 DAG 计划；不确认 / 扣款 / 验证 |
 
 - 转账流程：先用 `search_transfer_recipients` 确认收款人；信息齐全且收款人明确后调用 `prepare_transfer` 生成草稿。
   「我的收款人有哪些 / 列出常用收款人」等列举需求用 `list_transfer_recipients`（只读，返回全部收款人的 `id`/姓名/掩码账户）；
@@ -600,6 +602,24 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
   若关联操作单已确认完成（确认与取消竞态），以事务结果为准：任务按真实结果对账为 `completed`，**不反向**已发生的订阅变更。
 - 继续（resume）重新检查任务、订阅版本与操作单有效期；过期 / 失效单需重新生成并要求再次确认，不直接执行。
 - 失败（failed）任务可「继续」回到等待选择，重新选择；已确认的订阅变更不会因任务取消 / 失败 / 转手动被自动反向。
+
+### 受约束 DAG 计划接口
+
+所有计划接口由服务端校验白名单节点、依赖、无环、步骤上限与参数；计划本身不执行确认 / 扣款 / 验证。
+
+- `GET /api/workflows`：最近计划
+- `POST /api/workflows`：创建计划，body `{ flow, params, steps? }`
+- `GET /api/workflows/:planNo`：读取 / 对账
+- `POST /api/workflows/:planNo/select`：订阅 `{subscription_id, action, to_account_id?}`；还款 `{scope, statement_id?, from_account_id, credit_account_id?}`
+- `POST /api/workflows/:planNo/pause|resume|cancel|retry|manual`
+- `POST /api/workflows/:planNo/modify`：body `{ params }`；取消旧待确认单并重置未执行步骤，原确认失效
+
+### 受保护审计接口
+
+- `GET /api/audit/timeline`：查询事件；支持 `request_id` / `session_id` / `plan_id` / `operation_ref` / `category` / `status` / `limit` / `offset`
+- `GET /api/audit/export`：导出 JSON（最多 500 条）
+- 未配置 `AUDIT_ACCESS_TOKEN` 时返回 404；配置后需 `Authorization: Bearer <token>` 或 `X-Audit-Token`；无 / 错令牌 401。
+- 审计只记录可观察业务决策，不记录模型思维链；密码 / 验证码 / 种子 / API Key / 沙箱代码原文已脱敏。
 
 ### GET /api/activity
 

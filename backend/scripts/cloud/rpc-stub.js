@@ -120,9 +120,12 @@ const server = http.createServer((req, res) => {
         rows = (await db.query(`SELECT public.${fn}() r`)).rows
       } else if (fn === 'rongzhi_bank_snapshot_v1' || fn === 'rongzhi_bank_verification_secret_v1') {
         rows = (await db.query(`SELECT public.${fn}($1::bigint) r`, [body.p_user_id])).rows
+      } else if (fn === 'rongzhi_bank_audit_event_v1') {
+        rows = (await db.query(`SELECT public.${fn}($1::bigint,$2::text,$3::jsonb) r`,
+          [body.p_user_id, body.p_op, JSON.stringify(body.p_payload || {})])).rows
       } else if (fn === 'rongzhi_bank_seed_v1') {
         rows = (await db.query(`SELECT public.${fn}($1::bigint) r`, [body.p_user_id || 1])).rows
-      } else if (/^rongzhi_bank_(transfer|card|sub|repay|chat|verification|task)_write_v1$/.test(fn)) {
+      } else if (/^rongzhi_bank_(transfer|card|sub|repay|chat|verification|task|audit|plan)_write_v1$/.test(fn)) {
         rows = (await db.query(`SELECT public.${fn}($1::bigint,$2::text,$3::jsonb) r`,
           [body.p_user_id, body.p_op, JSON.stringify(body.p_payload || {})])).rows
       } else {

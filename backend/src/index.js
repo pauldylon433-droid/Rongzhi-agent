@@ -9,6 +9,7 @@ import { createApiRouter } from './routes/index.js'
 import { createCloudRouter } from './routes/cloud.js'
 import { createCloudAssistant } from './cloud/assistant.js'
 import { createAiGuard } from './lib/ai-guard.js'
+import { createModelBreaker } from './services/security-guard.js'
 import { chatCompletions } from './lib/ai-client.js'
 import {
   isPublicDemo, getPublicDemoConfig, validatePublicConfig, hasAiKey,
@@ -106,8 +107,13 @@ if (dbMode === 'cloudbase') {
     const guard = publicDemo
       ? createAiGuard({ chatFn: chatCompletions, dailyCallQuota: pcfg.aiDailyCallQuota, maxConcurrency: pcfg.aiMaxConcurrency })
       : null
+    const breaker = createModelBreaker({
+      threshold: Number(process.env.MODEL_BREAKER_THRESHOLD) > 0 ? Number(process.env.MODEL_BREAKER_THRESHOLD) : 3,
+      cooldownMs: Number(process.env.MODEL_BREAKER_COOLDOWN_MS) > 0 ? Number(process.env.MODEL_BREAKER_COOLDOWN_MS) : 60000,
+    })
+    const baseChatFn = guard ? guard.chatFn : chatCompletions
     cloudAssistant = createCloudAssistant({
-      client: cloudClient, userId: cfg.demoUserId, chatFn: guard ? guard.chatFn : chatCompletions,
+      client: cloudClient, userId: cfg.demoUserId, chatFn: (args) => breaker.call(baseChatFn, args),
     })
   }
   cloudRouter = createCloudRouter({ client: cloudClient, demoUserId: cfg.demoUserId, assistant: cloudAssistant })

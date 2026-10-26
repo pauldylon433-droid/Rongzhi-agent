@@ -8,6 +8,7 @@ import { hasAiKey, isPublicDemo, getPublicDemoConfig } from '../config.js'
 import { createAiGuard } from '../lib/ai-guard.js'
 import { createRateLimiter } from '../lib/rate-limit.js'
 import { chatCompletions } from '../lib/ai-client.js'
+import { createModelBreaker, isSuspiciousError } from '../services/security-guard.js'
 
 const ALLOWED_BODY_KEYS = ['message', 'sessionId', 'selectedCardId']
 
@@ -94,7 +95,7 @@ export function createAssistantRouter(db, demoUserId) {
     }
 
     try {
-      const result = await assistant.chat({ message: parsed.message, sessionId: parsed.sessionId, selectedCardId: parsed.selectedCardId })
+      const result = await assistant.chat({ message: parsed.message, sessionId: parsed.sessionId, selectedCardId: parsed.selectedCardId, requestId: res.locals.requestId })
       ok(res, result)
     } catch (e) {
       if (e instanceof AssistantError) {

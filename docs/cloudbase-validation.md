@@ -8,11 +8,11 @@
 
 | 级别 | 本轮证据 | 能证明 | 不能证明 |
 | ---- | ---- | ---- | ---- |
-| SQLite 本地回归 | 38 个 `verify-*.js` + 前端构建 | 原有本地功能未回归 | 云端 RPC |
-| PGlite SQL | `npm run cloud:verify:sql` 27 PASS / 0 FAIL | 安装 / 升级幂等、权限、事务回滚、清理、演示数据幂等 | CloudBase 网关 / 令牌 / 多连接并发 |
+| SQLite 本地回归 | 43 个 `verify-*.js` + 前端构建 | 原有本地功能未回归 | 云端 RPC |
+| PGlite SQL | `npm run cloud:verify:sql` 28 PASS / 0 FAIL | 安装 / 升级幂等、权限、事务回滚、清理、演示数据幂等 | CloudBase 网关 / 令牌 / 多连接并发 |
 | PGlite 定向回归 | `npm run cloud:verify:races` 28 PASS / 0 FAIL / 3 SKIP | 锁定竞态、日累计顺序复核、会话版本合并、时间步不残留、过期视图、样例账期 | 真实多连接并发（明确 SKIP） |
 | PGlite RPC 桩 + 真实 Node 路由 | `npm run cloud:verify:api` 63 PASS / 0 FAIL | 云端模式 API 契约、业务原子性、幂等、TOTP、会话、任务、统计 | 真实 CloudBase 网关与 AccessToken |
-| mock 模型 + PGlite RPC 桩 + 真实 Express 路由 | `npm run cloud:verify:assistant` 29 PASS / 0 FAIL | 17 工具契约、查询、多轮建单、越权拒绝、敏感信息隔离、状态交错、AI 开关 | 真实模型行为与平台网络 |
+| mock 模型 + PGlite RPC 桩 + 真实 Express 路由 | `npm run cloud:verify:assistant` 48 PASS / 0 FAIL | 19 工具契约、查询、多轮建单、越权拒绝、敏感信息隔离、状态交错、AI 开关 | 真实模型行为与平台网络 |
 | 真实 CloudBase | 本轮未执行（按约束不建表 / 不部署） | — | 需部署后单独记录 |
 
 > 前置任务中的 HTTPS RPC 验收结果为 PASS 78 / FAIL 0 / SKIP 2（仅跳过 anon/authenticated 真实令牌）；
@@ -78,10 +78,10 @@ npm run build
 
 ## 本轮实际结果
 
-- `cloud:verify:sql`：PASS 27 / FAIL 0 / SKIP 0
+- `cloud:verify:sql`：PASS 28 / FAIL 0 / SKIP 0
 - `cloud:verify:races`：PASS 28 / FAIL 0 / SKIP 3
 - `cloud:verify:api`：PASS 63 / FAIL 0 / SKIP 0
-- `cloud:verify:assistant`：PASS 29 / FAIL 0 / SKIP 0（mock 模型）
-- SQLite `verify-*.js`：38 / 38 通过（`verify-public-demo` 需先构建 `frontend/dist`）
+- `cloud:verify:assistant`：PASS 48 / FAIL 0 / SKIP 0（mock 模型）
+- SQLite `verify-*.js`：43 / 43 通过（`verify-public-demo` 需先构建 `frontend/dist`）
 - 前端构建：成功
 - 未执行：真实 CloudBase SQL / 部署 / 真实模型调用

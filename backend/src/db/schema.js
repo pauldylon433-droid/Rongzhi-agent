@@ -95,6 +95,48 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_account_id  ON subscriptions(accoun
 CREATE INDEX IF NOT EXISTS idx_subscriptions_next_billing_date ON subscriptions(next_billing_date);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id        ON audit_logs(user_id);
 
+-- 结构化审计时间线：请求 / 会话 / 计划 / 工具 / 操作单 / 回执关联编号。
+-- 不含密码、验证码、TOTP 种子或 API Key；安全失败事件独立提交。
+CREATE TABLE IF NOT EXISTS audit_events (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id       TEXT NOT NULL UNIQUE,
+  user_id        INTEGER,
+  request_id     TEXT,
+  session_id     TEXT,
+  plan_id        TEXT,
+  tool_call_id   TEXT,
+  operation_ref  TEXT,
+  category       TEXT NOT NULL,
+  action         TEXT NOT NULL,
+  result         TEXT,
+  risk_level     TEXT,
+  detail_json    TEXT,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_request_id  ON audit_events(request_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_session_id  ON audit_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_plan_id     ON audit_events(plan_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_operation   ON audit_events(operation_ref);
+CREATE INDEX IF NOT EXISTS idx_audit_events_created_at  ON audit_events(created_at);
+
+-- 受约束 DAG 计划：白名单节点、依赖、参数、版本与进度全部持久化。
+CREATE TABLE IF NOT EXISTS workflow_plans (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_no      TEXT NOT NULL UNIQUE,
+  user_id      INTEGER NOT NULL,
+  flow         TEXT NOT NULL CHECK (flow IN ('subscription_review','repayment_review')),
+  status       TEXT NOT NULL,
+  plan_json    TEXT NOT NULL,
+  version      INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_plans_user_id ON workflow_plans(user_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_plans_status ON workflow_plans(status);
+
 CREATE TABLE IF NOT EXISTS transfer_recipients (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   name           TEXT NOT NULL,

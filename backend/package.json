@@ -16,12 +16,19 @@
     "cloud:verify:assistant": "node scripts/cloud/verify-assistant.js",
     "cloud:verify": "npm run cloud:verify:sql && npm run cloud:verify:races && npm run cloud:verify:api && npm run cloud:verify:assistant",
     "ai:check": "node scripts/ai-check.js",
-    "cloud:verify:races": "node scripts/cloud/verify-races.js"
+    "cloud:verify:races": "node scripts/cloud/verify-races.js",
+    "verify:receipts": "node scripts/verify-authoritative-receipts.js",
+    "verify:audit": "node scripts/verify-audit.js",
+    "verify:sandbox": "node scripts/verify-sandbox.js",
+    "verify:security": "node scripts/verify-security-controls.js",
+    "verify:workflows": "node scripts/verify-workflows.js",
+    "verify:competition": "npm run verify:receipts && npm run verify:audit && npm run verify:sandbox && npm run verify:security && npm run verify:workflows"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
     "express": "^5.3.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.11",

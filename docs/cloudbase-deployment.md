@@ -5,7 +5,7 @@
 - 电脑关闭后仍可访问：公网实例只保存进程状态，业务数据全部在 CloudBase PostgreSQL。
 - 本地默认 `DB_MODE=sqlite`；原有 SQLite 功能与验证脚本保持不变。
 - 云端模式通过后端持有 **Service Role API Key** 调用固定 RPC；容器内不保存业务数据。
-- 公网 AI 默认关闭；显式开启且配置齐全时，走与本地一致的 17 个工具白名单循环。
+- 公网 AI 默认关闭；显式开启且配置齐全时，走与本地一致的 19 个工具白名单循环。
 - 本轮未执行云端建表 / 部署 / 套餐操作；助手测试使用 mock 模型，未调用真实模型。
 
 ## 架构
@@ -155,4 +155,8 @@ npm run build
 - GitHub 远端本轮网络不可达（此前曾返回 Repository not found），无法核对远端差异；
   用户确认远端 main 为 `d79d037c51bf386849dfbbf4b22e446fd4c5b3ce`，本地基线为 `9ed8efd`，
   未提交 / 未推送 / 未合并。
+- 新的通用 DAG 计划（订阅 / 还款）已有后端 API、AI 工具与 CloudBase 存储；专用前端计划卡尚未接入，现有操作单确认卡 / 订阅审查任务 UI 仍可用。
+- 代码沙箱是 QuickJS WebAssembly 隔离，不是 OS 容器；若赛题强制要求 Docker / Firecracker 级隔离，需在云端增加该后端。
+- 审计查询 / 导出默认关闭；部署时如需使用，必须配置 `AUDIT_ACCESS_TOKEN` 并通过 Bearer / X-Audit-Token 访问。
+- CloudBase 云端还款计划的强验证端到端未执行（本地 SQLite 已执行完整 TOTP 链）；云端已执行建单 / 取消。
 - 单用户演示仍无正式登录认证；应用内归属校验不等于请求者身份认证。

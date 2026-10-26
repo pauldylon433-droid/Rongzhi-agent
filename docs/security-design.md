@@ -104,13 +104,14 @@
 
 ## 七、AI 助手安全边界
 
-- AI 助手工具白名单共 **17 个**（与源码 `TOOL_DEFS` 一致）：
+- AI 助手工具白名单共 **19 个**（与源码 `TOOL_DEFS` 一致）：
   - 账户 / 分析：`get_accounts`、`get_monthly_analytics`
   - 转账：`search_transfer_recipients`、`list_transfer_recipients`、`prepare_transfer`、`get_transfer_status`
   - 银行卡：`get_cards`、`prepare_card_operation`、`get_card_operation_status`
   - 订阅 / 跨场景：`get_subscriptions`、`prepare_subscription_operation`、`get_subscription_operation_status`、
     `start_subscription_review`
   - 信用卡：`get_credit_accounts`、`get_statement`、`prepare_repayment`、`get_repayment_status`
+  - 安全 / 计划：`analyze_transactions_sandboxed`、`plan_workflow`
   其中 `prepare_transfer` / `prepare_card_operation` / `prepare_subscription_operation` / `prepare_repayment`
   只能生成「待确认单」，**绝不扣款、绝不改卡片 / 订阅 / 扣款来源**；执行必须由用户在界面
   点击确认或强验证后，调用现有确认 / 验证接口完成。
@@ -132,6 +133,7 @@
 - 订阅操作同样：多个订阅匹配或指向不明确时先澄清，不擅自选第一项；已取消订阅不可再操作，恢复需强验证，
   暂停 / 取消为普通确认。用户仅回复「确认」等文字不触发订阅状态变更，须在确认卡上明确操作。
 - 模型不能通过工具写库、传 `user_id`、SQL、文件路径、URL；未知工具 / 额外参数 / 非法参数均被拒。
+- `analyze_transactions_sandboxed` 只在 QuickJS WebAssembly 沙箱中处理脱敏流水；无网络 / 文件系统 / 宿主绑定，输出标记为非权威；`plan_workflow` 只创建受约束 DAG 计划，不确认 / 扣款 / 验证。
 
 ### 聊天历史保留与模型上下文
 
@@ -186,8 +188,44 @@
 - 结构变更前使用 SQLite `backup()`（正确处理 WAL）创建一致性备份：`backend/scripts/backup-db.js`。
 - 余额与已入账流水强一致：`余额 = 期初余额 + 已入账收入 − 已入账支出`（含转账流水）。
 
-## 十、尚未实现
+## 十、结构化审计
+
+- `audit_events` 记录 `request_id` / `session_id` / `plan_id` / `tool_call_id` / `operation_ref` / category / action / result / risk / detail。
+- 助手记录请求（消息长度 / SHA-256，不落原文）、每次工具调用（脱敏参数、结果、耗时、操作单号）、回复摘要（不含思维链）；API 中间件记录状态变更请求；DAG 记录计划动作。
+- 密码 / 验证码 / TOTP 种子 / API Key / 加密密钥 / 哈希盐 / 沙箱代码原文不入审计；沙箱代码只记录长度与 SHA-256。
+- 业务成功审计仍在业务事务内（`audit_logs`）；安全失败 / 可疑行为事件独立提交，不随业务回滚丢失。
+- `/api/audit/timeline` 与 `/api/audit/export` 默认不暴露（未配置 `AUDIT_ACCESS_TOKEN` 返回 404），配置后必须 Bearer / `X-Audit-Token`。
+
+## 十一、异常熔断
+
+- 请求限流：内存令牌桶，按 IP / 接口返回 429，不修改持久业务状态。
+- 强验证锁定：`verification_failures` 行锁 + 5 次 / 15 分钟；晚到失败不清锁；业务提交在事务内复核锁定；跨实例以数据库行为准。
+- 可疑行为锁定：`security-guard` 基于服务端拒绝 / 工具拒绝事件计数，按 IP / 会话 scope 隔离；阈值 / 窗口 / 锁定时间由 `SECURITY_ANOMALY_*` 配置；锁定事件写入审计；不按提示词关键词判定。
+- 模型服务熔断：连续失败达到 `MODEL_BREAKER_THRESHOLD` 后在 `MODEL_BREAKER_COOLDOWN_MS` 内快速失败，返回 503 `model_breaker`；与配额 / 并发护栏分开。
+- 单个 scope 锁定不会锁死整个共享服务；其他 IP / 访客不受影响。
+
+## 十二、代码沙箱
+
+- `services/sandbox.js` 在独立 QuickJS WebAssembly 运行时执行模型生成的脱敏流水分析代码。
+- 输入只含金额 / 方向 / 分类 / 状态 / 时间 / 商户哈希 / 账户哈希，不含账户余额、账户名、用户或密钥。
+- 无 Node `require` / `process` / `fetch` / `fs` 或任何宿主函数；无网络、无文件系统、无银行写接口。
+- 限制：2 秒墙钟、32 MB 堆、1 MB 栈、16 KB 输出、8000 字符代码；超限中断并丢弃整个 runtime。
+- 结果带 `sandbox=quickjs-wasm`、限制、耗时、退出状态与代码 SHA-256；标记 `authoritative:false`，不得作为余额 / 交易事实。
+- 边界：这是 WASM 运行时隔离，不是 OS 容器；若赛题强制要求容器级隔离，需部署 Docker / Firecracker 等额外后端。
+
+## 十三、受约束 DAG 计划
+
+- 两条白名单链：`subscription_review`（月度分析→选择订阅→暂停/换来源→确认→核验）与 `repayment_review`（信用卡账单→选择范围/付款账户→建单→强验证→核验）。
+- 模型只能提交 flow / 参数 / 可选步骤依赖；服务端校验节点白名单、依赖存在、无环、最多 12 步、参数与归属。
+- 计划持久化到 SQLite `workflow_plans` / CloudBase `rongzhi_bank_workflow_plans`，版本 CAS 防覆盖。
+- 支持等待选择、暂停、继续、取消、重试、修改未执行步骤、转人工；修改会取消旧待确认操作单并使原确认失效。
+- 已完成操作只核验真实状态，不提供直接撤销；回退只重置未执行节点。
+- 当前新的通用计划卡尚未接入前端专用页面；现有订阅审查任务 UI 与操作单确认卡仍可用。
+
+## 十四、尚未实现 / 未验证
 
 - **正式登录认证**与多用户隔离。
 - 真实资金、真实账户与外部支付通道。
 - 正式挂失 / 销卡 / 补卡 / 调额（当前仅临时冻结 / 解冻，且仅改变卡片状态，无真实扣款 / 交易授权引擎）。
+- 真实 CloudBase 部署、真实多连接并发、真实模型调用、浏览器自动化未执行；本地证据不冒充云端通过。
+- 新 DAG 计划的专用前端页面未接入；后端 API / AI 工具 / 操作单确认卡已验证。

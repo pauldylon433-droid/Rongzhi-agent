@@ -228,6 +228,7 @@ await withServer(async (base) => {
     'prepare_transfer', 'get_transfer_status', 'get_cards', 'prepare_card_operation', 'get_card_operation_status',
     'get_subscriptions', 'prepare_subscription_operation', 'get_subscription_operation_status',
     'start_subscription_review', 'get_credit_accounts', 'get_statement', 'prepare_repayment', 'get_repayment_status',
+    'analyze_transactions_sandboxed', 'plan_workflow',
   ]
   const mockCapture = makeMock([{ content: 'ok' }])
   const captureAssistant = createAssistant({ db, demoUserId: u1, chatFn: mockCapture })

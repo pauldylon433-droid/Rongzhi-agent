@@ -13,9 +13,19 @@ import { createAgentTasksRouter } from './agent-tasks.js'
 import { createActivityRouter } from './activity.js'
 import { createCreditRouter } from './credit.js'
 import { createRepaymentsRouter } from './repayments.js'
+import { createAuditRouter, auditRequestMiddleware } from './audit.js'
+import { createAuditTrail } from '../services/audit-trail.js'
+import { createWorkflowsRouter } from './workflows.js'
+import { createWorkflowService, createLocalWorkflowOps, createLocalWorkflowStore } from '../services/workflow-plans.js'
+import { createSecurityGuard } from '../services/security-guard.js'
+import { securityGuardMiddleware } from './security.js'
 
-export function createApiRouter(db, demoUserId) {
+export function createApiRouter(db, demoUserId, auditTrail = createAuditTrail(db)) {
   const router = Router()
+  router.use(auditRequestMiddleware(auditTrail))
+  router.use(securityGuardMiddleware((scope) => createSecurityGuard({
+    auditTrail, listEvents: (filters) => auditTrail.list(filters), scopeKey: scope,
+  })))
   router.use('/accounts', createAccountsRouter(db, demoUserId))
   router.use('/transactions', createTransactionsRouter(db, demoUserId))
   router.use('/cards', createCardsRouter(db, demoUserId))
@@ -30,5 +40,9 @@ export function createApiRouter(db, demoUserId) {
   router.use('/activity', createActivityRouter(db, demoUserId))
   router.use('/credit', createCreditRouter(db, demoUserId))
   router.use('/repayments', createRepaymentsRouter(db, demoUserId))
+  router.use('/audit', createAuditRouter(auditTrail))
+  router.use('/workflows', createWorkflowsRouter(createWorkflowService({
+    store: createLocalWorkflowStore(db, demoUserId), ops: createLocalWorkflowOps(db, demoUserId), audit: auditTrail,
+  })))
   return router
 }

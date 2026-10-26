@@ -81,6 +81,8 @@ AS $$
     'agent_tasks', coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.updated_at DESC, t.id DESC) FROM public.rongzhi_bank_agent_tasks t WHERE t.user_id = p_user_id), '[]'::jsonb),
     'agent_task_nodes', coalesce((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.task_id, n.seq) FROM public.rongzhi_bank_agent_task_nodes n JOIN public.rongzhi_bank_agent_tasks t ON t.id = n.task_id WHERE t.user_id = p_user_id), '[]'::jsonb),
     'audit_logs', coalesce((SELECT jsonb_agg(to_jsonb(l) ORDER BY l.id DESC) FROM (SELECT * FROM public.rongzhi_bank_audit_logs WHERE user_id = p_user_id ORDER BY id DESC LIMIT 500) l), '[]'::jsonb),
+    'audit_events', coalesce((SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id DESC) FROM (SELECT * FROM public.rongzhi_bank_audit_events WHERE user_id = p_user_id ORDER BY id DESC LIMIT 2000) e), '[]'::jsonb),
+    'workflow_plans', coalesce((SELECT jsonb_agg(to_jsonb(w) ORDER BY w.id DESC) FROM (SELECT * FROM public.rongzhi_bank_workflow_plans WHERE user_id = p_user_id ORDER BY id DESC LIMIT 100) w), '[]'::jsonb),
     'verification', jsonb_build_object(
       'bound', coalesce((SELECT b.enabled = 1 FROM public.rongzhi_bank_verification_bindings b WHERE b.user_id = p_user_id), false),
       'fail_count', coalesce((SELECT f.fail_count FROM public.rongzhi_bank_verification_failures f WHERE f.user_id = p_user_id), 0),
@@ -109,6 +111,68 @@ AS $$
     LEFT JOIN public.rongzhi_bank_verification_failures f ON f.user_id = b.user_id
     WHERE b.user_id = p_user_id
   ), jsonb_build_object('enabled', 0, 'fail_count', 0, 'locked_until', null));
+$$;
+
+CREATE OR REPLACE FUNCTION public.rongzhi_bank_plan_write_v1(
+  p_user_id bigint, p_op text, p_payload jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE v_plan public.rongzhi_bank_workflow_plans%ROWTYPE;
+BEGIN
+  IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
+  p_payload := coalesce(p_payload, '{}'::jsonb);
+  IF p_op = 'create' THEN
+    INSERT INTO public.rongzhi_bank_workflow_plans
+      (plan_no, user_id, flow, status, plan_json, version, created_at, updated_at)
+    VALUES
+      (p_payload->>'plan_no', p_user_id, p_payload->>'flow', coalesce(p_payload->>'status','waiting_selection'),
+       coalesce(p_payload->'plan_json','{}'::jsonb), 0, clock_timestamp(), clock_timestamp())
+    RETURNING * INTO v_plan;
+    RETURN to_jsonb(v_plan);
+  ELSIF p_op = 'save' THEN
+    UPDATE public.rongzhi_bank_workflow_plans
+       SET status = p_payload->>'status', plan_json = coalesce(p_payload->'plan_json','{}'::jsonb),
+           version = version + 1, updated_at = clock_timestamp(),
+           completed_at = (p_payload->>'completed_at')::timestamptz
+     WHERE plan_no = p_payload->>'plan_no' AND user_id = p_user_id
+       AND version = coalesce((p_payload->>'base_version')::bigint, -1)
+    RETURNING * INTO v_plan;
+    IF NOT FOUND THEN RETURN jsonb_build_object('conflict', true); END IF;
+    RETURN to_jsonb(v_plan);
+  END IF;
+  RAISE EXCEPTION 'unsupported_operation' USING ERRCODE = '22023';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.rongzhi_bank_audit_event_v1(
+  p_user_id bigint, p_op text, p_payload jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE v_event public.rongzhi_bank_audit_events%ROWTYPE;
+BEGIN
+  IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
+  IF p_op <> 'event' THEN RAISE EXCEPTION 'unsupported_operation' USING ERRCODE = '22023'; END IF;
+  p_payload := coalesce(p_payload, '{}'::jsonb);
+  IF btrim(coalesce(p_payload->>'category','')) = '' OR btrim(coalesce(p_payload->>'action','')) = '' THEN
+    RAISE EXCEPTION 'invalid_parameters: category/action' USING ERRCODE = '22023';
+  END IF;
+  INSERT INTO public.rongzhi_bank_audit_events
+    (event_id, user_id, request_id, session_id, plan_id, tool_call_id, operation_ref,
+     category, action, result, risk_level, detail, created_at)
+  VALUES
+    (coalesce(nullif(p_payload->>'event_id',''), gen_random_uuid()::text), p_user_id,
+     nullif(p_payload->>'request_id',''), nullif(p_payload->>'session_id',''), nullif(p_payload->>'plan_id',''),
+     nullif(p_payload->>'tool_call_id',''), nullif(p_payload->>'operation_ref',''),
+     p_payload->>'category', p_payload->>'action', nullif(p_payload->>'result',''),
+     nullif(p_payload->>'risk_level',''), coalesce(p_payload->'detail','{}'::jsonb),
+     coalesce((p_payload->>'created_at')::timestamptz, clock_timestamp()))
+  RETURNING * INTO v_event;
+  RETURN to_jsonb(v_event);
+END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.rongzhi_bank_health_v1()
@@ -2059,6 +2123,8 @@ DECLARE
     'rongzhi_bank_snapshot_v1(bigint)',
     'rongzhi_bank_verification_secret_v1(bigint)',
     'rongzhi_bank_health_v1()',
+    'rongzhi_bank_audit_event_v1(bigint,text,jsonb)',
+    'rongzhi_bank_plan_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_transfer_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_card_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_sub_write_v1(bigint,text,jsonb)',

@@ -5,6 +5,12 @@ import { ok, badRequest, parseMonth, parsePagination } from './helpers.js'
 import { loadCloudStore } from '../cloud/store.js'
 import { CloudRpcError } from '../cloud/rpc-client.js'
 import { verifyCredentialsCloud } from '../cloud/verification.js'
+import { createCloudAuditTrail } from '../services/audit-trail.js'
+import { createSecurityGuard, isSuspiciousError } from '../services/security-guard.js'
+import { createWorkflowsRouter } from './workflows.js'
+import { createWorkflowService, createCloudWorkflowStore, createCloudWorkflowOps } from '../services/workflow-plans.js'
+import { securityGuardMiddleware } from './security.js'
+import { createAuditRouter, auditRequestMiddleware } from './audit.js'
 import { VerificationError } from '../services/verification.js'
 import { AssistantError } from '../services/assistant.js'
 import { loadVerificationKey } from '../lib/verification-key.js'
@@ -84,9 +90,38 @@ export function createCloudRouter({ client, demoUserId, assistant = null }) {
     : null
 
   const load = () => loadCloudStore({ client, userId: demoUserId })
+  const auditTrail = createCloudAuditTrail({ client, userId: demoUserId })
+  const workflowService = createWorkflowService({
+    store: createCloudWorkflowStore({ client, userId: demoUserId }),
+    ops: createCloudWorkflowOps({ client, userId: demoUserId }), audit: auditTrail,
+  })
+  router.use('/workflows', createWorkflowsRouter(workflowService))
+  const listAuditEvents = async (filters = {}) => {
+    const snap = await load()
+    let rows = (snap.snapshot.audit_events || []).slice()
+    if (filters.category) rows = rows.filter((r) => r.category === filters.category)
+    rows.sort((a, b) => Number(b.id) - Number(a.id))
+    return rows.slice(0, Math.min(Math.max(Number(filters.limit) || 100, 1), 500))
+  }
+  router.use(auditRequestMiddleware(auditTrail))
+  router.use(securityGuardMiddleware((scope) => createSecurityGuard({
+    auditTrail, listEvents: listAuditEvents, scopeKey: scope,
+  })))
   const write = (domain, op, payload = {}) => client.write(domain, op, payload, demoUserId)
 
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+
+  // —— 受保护审计时间线（CloudBase 快照中的 audit_events）——
+  router.use('/audit', createAuditRouter(async (filters) => {
+    const snap = await load()
+    let rows = (snap.snapshot.audit_events || []).slice()
+    for (const key of ['request_id', 'session_id', 'plan_id', 'operation_ref', 'category']) {
+      if (filters[key]) rows = rows.filter((r) => r[key] === filters[key])
+    }
+    if (filters.status) rows = rows.filter((r) => String(r.result) === filters.status)
+    rows.sort((a, b) => Number(b.id) - Number(a.id))
+    return rows.slice(filters.offset || 0, (filters.offset || 0) + (filters.limit || 100))
+  }))
 
   // —— 只读：账户 / 流水 / 银行卡 / 订阅 / 统计 ——
   router.get('/accounts', wrap(async (req, res) => {
@@ -476,7 +511,17 @@ export function createCloudRouter({ client, demoUserId, assistant = null }) {
         message: body.message.trim(),
         sessionId: typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined,
         selectedCardId: typeof body.selectedCardId === 'number' ? body.selectedCardId : null,
+        requestId: res.locals.requestId,
       })
+      const suspicious = (result.toolRecords || []).filter((t) => t.status === 'error' && isSuspiciousError(t.error))
+      if (suspicious.length && req.securityGuard) {
+        let locked = false
+        for (const t of suspicious) {
+          const rr = await req.securityGuard.record('invalid_tool', { tool: t.name, error: String(t.error).slice(0, 120) })
+          if (rr.locked) locked = true
+        }
+        if (locked) res.setHeader('X-Security-Lock', '1')
+      }
       ok(res, result)
     } catch (e) {
       if (e instanceof AssistantError) {
@@ -487,6 +532,10 @@ export function createCloudRouter({ client, demoUserId, assistant = null }) {
         if (e.code === 'model') {
           console.error('[助手] 模型调用失败（脱敏）：', e.message)
           return res.status(502).json({ success: false, message: '模型服务暂不可用，请稍后重试' })
+        }
+        if (e.code === 'breaker') {
+          if (e.retry_after_ms) res.set('Retry-After', String(Math.ceil(e.retry_after_ms / 1000)))
+          return res.status(503).json({ success: false, code: 'model_breaker', message: '模型服务暂时熔断，请稍后重试' })
         }
       }
       console.error('[助手] 未预期错误：', e && e.message ? e.message : e)

@@ -1,19 +1,23 @@
 // CloudBase 持久库模式的 AI 助手：复用既有系统提示、17 个工具契约与白名单，
 // 通过异步 CloudBase RPC 完成查询 / 准备操作单 / 任务启动；不确认、不扣款、不校验凭据、不执行 SQL。
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { chatCompletions, AiError } from '../lib/ai-client.js'
 import { loadCloudStore } from './store.js'
 import { CloudRpcError } from './rpc-client.js'
 import {
   AssistantError, ToolError, TOOL_DEFS, buildSystemMessage, parseToolArgs,
-  refTail, centsToYuan, buildTransferStatusText, buildRepaymentStatusText,
+  refTail, centsToYuan, buildTransferStatusText, buildRepaymentStatusText, buildCardStatusText, buildSubscriptionStatusText,
   buildTransferNotice, buildCardOpNotice, buildSubscriptionOpNotice, buildRepaymentNotice,
   TRANSFER_STATUS_TEXT, REPAYMENT_STATUS_TEXT,
   MAX_MODEL_CALLS, MAX_TOOL_CALLS, MAX_TURNS, MAX_USER_MESSAGE_LEN, REPLY_MAX_TOKENS,
 } from '../services/assistant.js'
 import { yuanToCents } from '../lib/money.js'
 import { parseMonth } from '../routes/helpers.js'
+import { shanghaiMonthRange } from '../lib/shanghai.js'
+import { runSandboxedAnalysis } from '../services/sandbox.js'
 import { detectCredential, scrubMessagesForModel, CREDENTIAL_REJECTION_MESSAGE } from '../services/credential-guard.js'
+import { createCloudAuditTrail, newRequestId } from '../services/audit-trail.js'
+import { createWorkflowService, createCloudWorkflowStore, createCloudWorkflowOps } from '../services/workflow-plans.js'
 
 function trimHistory(messages) {
   const userIdx = []
@@ -72,6 +76,43 @@ function resolveReferencedRepayment(store, sessionId, session) {
     statement: v ? v.statement || null : null,
     allocations: v ? v.allocations : [],
   }
+}
+
+function resolveReferencedCard(store, sessionId, session) {
+  const ref = session.pendingCardOpRef
+  if (!ref) return null
+  const view = store.cardOpByRef(ref)
+  if (!view) return null
+  return { ref_no: view.ref_no, status: view.status, action: view.action, card_masked: view.masked_card_number,
+    from_status: view.from_status, to_status: view.to_status, card: view.card }
+}
+
+function resolveReferencedSubscription(store, sessionId, session) {
+  const ref = session.pendingSubscriptionOpRef
+  if (!ref) return null
+  const view = store.subscriptionOpByRef(ref)
+  if (!view) return null
+  return { ref_no: view.ref_no, status: view.status, action: view.action, merchant: view.merchant,
+    amount_cents: view.amount_cents, billing_cycle: view.billing_cycle,
+    from_status: view.from_status, to_status: view.to_status }
+}
+
+function cardStatusReply(store, snapshot) {
+  if (!snapshot || !snapshot.ref_no) return null
+  const current = store.cardOpByRef(snapshot.ref_no)
+  if (!current || current.status === snapshot.status) return null
+  const act = current.action === 'freeze' ? '冻结' : '解冻'
+  if (current.status === 'completed') return `该银行卡${act}操作已完成。`
+  return `该银行卡${act}操作${({ pending:'待确认（未执行）', needs_verification:'需要强验证（未执行）', cancelled:'已取消', expired:'已过期', failed:'已失效' })[current.status] || current.status}。`
+}
+
+function subscriptionStatusReply(store, snapshot) {
+  if (!snapshot || !snapshot.ref_no) return null
+  const current = store.subscriptionOpByRef(snapshot.ref_no)
+  if (!current || current.status === snapshot.status) return null
+  const act = { pause:'暂停', resume:'恢复', cancel:'取消', change_source:'更换扣款账户' }[current.action] || current.action
+  if (current.status === 'completed') return `该订阅${act}操作已完成。`
+  return `该订阅${act}操作${({ pending:'待确认（未执行）', needs_verification:'需要强验证（未执行）', cancelled:'已取消', expired:'已过期', failed:'已失效' })[current.status] || current.status}。`
 }
 
 function transferStatusReply(store, snapshot) {
@@ -137,11 +178,50 @@ async function executeTool(state, client, userId, name, args, ctx) {
     return store().accounts()
   }
   if (name === 'get_monthly_analytics') {
-    const extra = Object.keys(args).filter((k) => k !== 'month')
+    const extra = Object.keys(args).filter((k) => !['month', 'account_id'].includes(k))
     if (extra.length) throw new ToolError(`get_monthly_analytics 不接受额外参数：${extra.join('、')}`)
     const parsed = parseMonth(args.month)
     if (!parsed) throw new ToolError('month 参数格式应为 YYYY-MM（月份 01-12）')
-    return store().analytics({ ...parsed, asOf: new Date().toISOString() })
+    let accountId
+    if (args.account_id !== undefined) {
+      if (typeof args.account_id !== 'number' || !Number.isSafeInteger(args.account_id) || args.account_id <= 0) throw new ToolError('account_id 必须为正整数')
+      if (!store().snapshot.accounts.some((a) => Number(a.id) === args.account_id)) throw new ToolError('未找到该账户或不属于当前用户')
+      accountId = args.account_id
+    }
+    return store().analytics({ ...parsed, asOf: new Date().toISOString(), accountId })
+  }
+  if (name === 'analyze_transactions_sandboxed') {
+    const extra = Object.keys(args).filter((k) => !['month', 'account_id', 'code'].includes(k))
+    if (extra.length) throw new ToolError(`analyze_transactions_sandboxed 不接受额外参数：${extra.join('、')}`)
+    const parsed = parseMonth(args.month)
+    if (!parsed) throw new ToolError('month 参数格式应为 YYYY-MM（月份 01-12）')
+    if (typeof args.code !== 'string' || !args.code.trim()) throw new ToolError('code 不能为空')
+    let accountId
+    if (args.account_id !== undefined) {
+      if (typeof args.account_id !== 'number' || !Number.isSafeInteger(args.account_id) || args.account_id <= 0) throw new ToolError('account_id 必须为正整数')
+      if (!store().snapshot.accounts.some((a) => Number(a.id) === args.account_id)) throw new ToolError('未找到该账户或不属于当前用户')
+      accountId = args.account_id
+    }
+    const { start, end } = shanghaiMonthRange(parsed.year, parsed.month)
+    const rows = store().snapshot.transactions.filter((t) => t.transaction_at >= start && t.transaction_at < end
+      && (!accountId || Number(t.account_id) === accountId)).slice(0, 5001)
+    if (rows.length > 5000) throw new ToolError('流水行数超过沙箱分析上限（5000）')
+    try {
+      const { result, summary } = await runSandboxedAnalysis(args.code, rows)
+      return { analysis: result, execution: summary, authoritative: false,
+        note: '沙箱结果仅为辅助分析，不是账户余额、流水事实或执行结果；关键事实必须以服务端工具结果为准。' }
+    } catch (e) {
+      throw new ToolError(`沙箱分析失败（${e.code || 'error'}）：${e.message}`)
+    }
+  }
+  if (name === 'plan_workflow') {
+    const extra = Object.keys(args).filter((k) => !['flow', 'params', 'steps'].includes(k))
+    if (extra.length) throw new ToolError(`plan_workflow 不接受额外参数：${extra.join('、')}`)
+    try {
+      return await ctx.workflow.create({ flow: args.flow, params: args.params || {}, steps: args.steps })
+    } catch (e) {
+      throw new ToolError(`计划创建失败：${e.message}`)
+    }
   }
   if (name === 'list_transfer_recipients') {
     if (Object.keys(args).length > 0) throw new ToolError('list_transfer_recipients 不接受额外参数')
@@ -459,6 +539,11 @@ async function runLoop(messages, state, client, userId, chatFn, ctx) {
     try {
       r = await chatFn({ messages, tools: TOOL_DEFS, maxTokens: REPLY_MAX_TOKENS })
     } catch (e) {
+      if (e && e.code === 'model_breaker') {
+        const ae = new AssistantError(e.message, 'breaker')
+        ae.retry_after_ms = e.retry_after_ms
+        throw ae
+      }
       if (e instanceof AiError) {
         const code = e.kind === 'quota' || e.kind === 'concurrency' ? 'ai_quota' : 'model'
         throw new AssistantError(e.message, code)
@@ -488,22 +573,33 @@ async function runLoop(messages, state, client, userId, chatFn, ctx) {
       toolExecutions += 1
       const id = typeof call?.id === 'string' && call.id ? call.id : `tool_${toolExecutions}`
       const name = typeof call?.function?.name === 'string' ? call.function.name : '(未知)'
+      const started = Date.now()
       let args
       try {
         args = parseToolArgs(call?.function?.arguments)
       } catch (e) {
         toolRecords.push({ name, args: null, status: 'error', queryTime: new Date().toISOString(), error: e.message })
         messages.push({ role: 'tool', tool_call_id: id, content: `错误：${e.message}` })
+        if (ctx.audit) await ctx.audit.record({ request_id: ctx.requestId, session_id: ctx.session.id,
+          tool_call_id: id, category: 'tool', action: name, result: 'error',
+          detail: { error: e.message, duration_ms: Date.now() - started } })
         continue
       }
       try {
         const data = await executeTool(state, client, userId, name, args, ctx)
         toolRecords.push({ name, args, status: 'ok', queryTime: new Date().toISOString(), data })
         messages.push({ role: 'tool', tool_call_id: id, content: JSON.stringify(data) })
+        if (ctx.audit) await ctx.audit.record({ request_id: ctx.requestId, session_id: ctx.session.id,
+          tool_call_id: id, operation_ref: data?.ref_no || data?.task_no || data?.plan_no || null,
+          risk_level: data?.risk_level || null, category: 'tool', action: name, result: 'ok',
+          detail: { args, operation_ref: data?.ref_no || data?.task_no || data?.plan_no || null, duration_ms: Date.now() - started } })
       } catch (e) {
         const msg = e instanceof ToolError ? e.message : '工具执行失败'
         toolRecords.push({ name, args, status: 'error', queryTime: new Date().toISOString(), error: msg })
         messages.push({ role: 'tool', tool_call_id: id, content: `错误：${msg}` })
+        if (ctx.audit) await ctx.audit.record({ request_id: ctx.requestId, session_id: ctx.session.id,
+          tool_call_id: id, category: 'tool', action: name, result: 'error',
+          detail: { args, error: msg, duration_ms: Date.now() - started } })
       }
     }
     if (stopped) break
@@ -512,14 +608,27 @@ async function runLoop(messages, state, client, userId, chatFn, ctx) {
   return { finalReply, toolRecords, incomplete, usage }
 }
 
-export function createCloudAssistant({ client, userId, chatFn = chatCompletions }) {
+export function createCloudAssistant({ client, userId, chatFn = chatCompletions, auditTrail = createCloudAuditTrail({ client, userId }), workflowService = null }) {
   const sessions = new Map()
   const load = () => loadCloudStore({ client, userId })
+  const workflow = workflowService || createWorkflowService({
+    store: createCloudWorkflowStore({ client, userId }), ops: createCloudWorkflowOps({ client, userId }), audit: auditTrail,
+  })
 
-  async function chat({ message, sessionId, selectedCardId = null }) {
+  async function chat({ message, sessionId, selectedCardId = null, requestId: requestIdIn = null }) {
+    const requestId = requestIdIn || newRequestId()
+    const messageSha256 = typeof message === 'string' ? createHash('sha256').update(message).digest('hex') : null
     if (typeof message !== 'string' || message.trim() === '') throw new AssistantError('消息不能为空')
     if (message.length > MAX_USER_MESSAGE_LEN) throw new AssistantError(`消息过长（最多 ${MAX_USER_MESSAGE_LEN} 字符）`)
-    if (detectCredential(message)) throw new AssistantError(CREDENTIAL_REJECTION_MESSAGE, 'credential_detected')
+    const credentialReason = detectCredential(message)
+    if (credentialReason) {
+      await auditTrail.record({
+        request_id: requestId, session_id: typeof sessionId === 'string' ? sessionId : null,
+        category: 'security', action: 'credential_input_blocked', result: 'blocked',
+        detail: { reason: credentialReason, message_sha256: messageSha256 },
+      })
+      throw new AssistantError(CREDENTIAL_REJECTION_MESSAGE, 'credential_detected')
+    }
 
     const snap = await load()
     if (selectedCardId !== null && selectedCardId !== undefined) {
@@ -549,7 +658,18 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions 
       }
       sessions.set(session.id, session)
     }
-    if (session.locked) throw new AssistantError('该会话正在处理上一个请求，请稍候再试', 'locked')
+    await auditTrail.record({
+      request_id: requestId, session_id: session.id,
+      category: 'assistant', action: 'request', result: 'received',
+      detail: { message_length: trimmed.length, message_sha256: messageSha256,
+        requested_session_id: typeof sessionId === 'string' ? sessionId : null,
+        selected_card_id: selectedCardId || null },
+    })
+    if (session.locked) {
+      await auditTrail.record({ request_id: requestId, session_id: session.id, category: 'security',
+        action: 'session_locked', result: 'blocked', detail: { reason: 'concurrent_request' } })
+      throw new AssistantError('该会话正在处理上一个请求，请稍候再试', 'locked')
+    }
     session.locked = true
     session.lastActiveAt = Date.now()
 
@@ -557,26 +677,44 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions 
       const history = scrubMessagesForModel(trimHistory(session.messages))
       const snapshotTransfer = resolveReferencedTransfer(snap, session.id, session)
       const snapshotRepayment = resolveReferencedRepayment(snap, session.id, session)
+      const snapshotCard = resolveReferencedCard(snap, session.id, session)
+      const snapshotSubscription = resolveReferencedSubscription(snap, session.id, session)
       const transferContext = snapshotTransfer ? buildTransferStatusText(snapshotTransfer) : ''
       const repaymentContext = snapshotRepayment ? buildRepaymentStatusText(snapshotRepayment) : ''
-      const messages = [buildSystemMessage(transferContext, repaymentContext), ...history, { role: 'user', content: trimmed }]
+      const cardContext = snapshotCard ? buildCardStatusText(snapshotCard) : ''
+      const subscriptionContext = snapshotSubscription ? buildSubscriptionStatusText(snapshotSubscription) : ''
+      const messages = [buildSystemMessage(transferContext, repaymentContext, cardContext, subscriptionContext), ...history, { role: 'user', content: trimmed }]
       const state = { store: snap }
       const messageState = {
         prepareTransferDone: false, prepareCardOpDone: false, prepareSubscriptionOpDone: false,
         startTaskDone: false, prepareRepaymentDone: false,
       }
-      const { finalReply, toolRecords, incomplete, usage } = await runLoop(
-        messages, state, client, userId, chatFn, { session, messageState, selectedCardId },
-      )
+      let loopResult
+      try {
+        loopResult = await runLoop(
+          messages, state, client, userId, chatFn,
+          { session, messageState, selectedCardId, audit: auditTrail, requestId, workflow },
+        )
+      } catch (e) {
+        await auditTrail.record({
+          request_id: requestId, session_id: session.id, category: 'assistant',
+          action: 'model_error', result: 'error', detail: { code: e.code || 'error' },
+        })
+        throw e
+      }
+      const { finalReply, toolRecords, incomplete, usage } = loopResult
 
       // 回复生成后复核本轮引用单的最新状态；变化时用服务端权威文案替换模型草稿。
       await load().then((fresh) => { state.store = fresh })
-      const authoritativeTransferReply = transferStatusReply(state.store, snapshotTransfer)
-      const authoritativeRepaymentReply = repaymentStatusReply(state.store, snapshotRepayment)
+      const authoritativeReplies = [
+        transferStatusReply(state.store, snapshotTransfer),
+        repaymentStatusReply(state.store, snapshotRepayment),
+        cardStatusReply(state.store, snapshotCard),
+        subscriptionStatusReply(state.store, snapshotSubscription),
+      ].filter((x) => x !== null)
       let reply = finalReply
-      const authoritativeReply = authoritativeTransferReply !== null ? authoritativeTransferReply : authoritativeRepaymentReply
-      if (authoritativeReply !== null) {
-        reply = authoritativeReply
+      if (authoritativeReplies.length) {
+        reply = [...new Set(authoritativeReplies)].join('\n')
         const lastMsg = messages[messages.length - 1]
         if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
       }
@@ -612,7 +750,14 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions 
         session.messages = saved.messages
       }
 
-      return { sessionId: session.id, reply, toolRecords, incomplete, usage }
+      await auditTrail.record({
+        request_id: requestId, session_id: session.id, category: 'assistant',
+        action: 'reply', result: incomplete ? 'incomplete' : 'ok',
+        detail: { reply_chars: reply.length, reply_sha256: createHash('sha256').update(reply).digest('hex'),
+          tool_calls: toolRecords.length, tool_errors: toolRecords.filter((t) => t.status === 'error').length,
+          intent: toolRecords.map((t) => t.name).join('>') || 'no_tool', incomplete },
+      })
+      return { sessionId: session.id, reply, toolRecords, incomplete, usage, request_id: requestId }
     } finally {
       session.locked = false
       session.lastActiveAt = Date.now()

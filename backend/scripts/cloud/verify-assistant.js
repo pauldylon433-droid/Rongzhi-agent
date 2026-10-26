@@ -46,6 +46,7 @@ function startStub() {
 
 function appFor(router) {
   const app = express()
+  app.set('trust proxy', 1)
   app.use(express.json())
   app.use('/api', router)
   return new Promise((resolve) => {
@@ -115,9 +116,10 @@ try {
     'get_card_operation_status', 'get_subscriptions', 'prepare_subscription_operation',
     'get_subscription_operation_status', 'start_subscription_review', 'get_credit_accounts',
     'get_statement', 'prepare_repayment', 'get_repayment_status',
+    'analyze_transactions_sandboxed', 'plan_workflow',
   ]
-  check('工具契约：恰好 17 个且名称完全一致',
-    Array.isArray(lastTools) && lastTools.length === 17
+  check('工具契约：恰好 19 个且名称完全一致',
+    Array.isArray(lastTools) && lastTools.length === 19
     && expectedTools.every((n) => lastTools.some((t) => t.function && t.function.name === n))
     && lastTools.every((t) => expectedTools.includes(t.function.name)))
 
@@ -303,6 +305,160 @@ try {
   check('信用卡查询：返回真实额度 / 账单', r.status === 200
     && r.json.data.toolRecords[0].data[0].credit_limit_cents === 500000
     && Array.isArray(r.json.data.toolRecords[0].data[0].statements))
+
+  // 沙箱工具：正常执行 + 宿主访问阻断
+  const sandboxCode = 'function analyze(rows){ let total=0; for(const r of rows){ if(r.status==="posted" && r.direction==="expense") total+=r.amount_cents; } return {total_cents:total}; }'
+  setScript(toolResp('analyze_transactions_sandboxed', { month, code: sandboxCode }), finalResp('沙箱分析完成'))
+  r = await post({ message: '用沙箱分析本月支出' })
+  check('沙箱工具：正常执行且标记非权威', r.status === 200
+    && r.json.data.toolRecords[0].status === 'ok'
+    && r.json.data.toolRecords[0].data.execution.sandbox === 'quickjs-wasm'
+    && r.json.data.toolRecords[0].data.authoritative === false, JSON.stringify(r.json?.data?.toolRecords?.[0]))
+  setScript(toolResp('analyze_transactions_sandboxed', { month, code: "function analyze(){ return require('fs').readFileSync('C:/Windows/win.ini'); }" }), finalResp('无法访问宿主'))
+  r = await post({ message: '尝试读取宿主文件' })
+  check('沙箱工具：宿主访问被阻断', r.status === 200
+    && r.json.data.toolRecords[0].status === 'error' && /沙箱分析失败/.test(r.json.data.toolRecords[0].error), JSON.stringify(r.json?.data?.toolRecords?.[0]))
+
+  // 受约束 DAG 工具 + 云端计划持久化
+  setScript(toolResp('plan_workflow', { flow: 'subscription_review', params: { month } }), finalResp('计划已创建'))
+  r = await post({ message: '创建订阅审查计划' })
+  const planNo = r.json?.data?.toolRecords?.[0]?.data?.plan_no
+  check('DAG 工具：创建云端订阅审查计划', r.status === 200 && planNo
+    && r.json.data.toolRecords[0].data.status === 'waiting_selection', JSON.stringify(r.json?.data?.toolRecords?.[0]))
+  r = await get(`/api/workflows/${planNo}`)
+  check('DAG 计划：云端 GET 可恢复计划', r.status === 200 && r.json.data.plan_no === planNo
+    && r.json.data.nodes.some((n) => n.key === 'analyze_month' && n.status === 'completed'))
+
+  // DAG 云端完整订阅链：选择 → 暂停确认 → 核验
+  {
+    const pv = r.json.data
+    const sub = (pv.selectable_subscriptions || [])[0]
+    let wx = await fetch(`${enabled.base}/api/workflows/${planNo}/select`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscription_id: sub.id, action: 'pause' }),
+    })
+    let wj = await wx.json()
+    check('DAG 计划：云端选择订阅生成暂停单', wx.status === 200 && wj.data.status === 'waiting_confirmation' && wj.data.op_ref,
+      JSON.stringify(wj.data?.status))
+    const opRef = wj.data.op_ref
+    wx = await fetch(`${enabled.base}/api/subscription-operations/${opRef}/confirm`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true }),
+    })
+    check('DAG 计划：云端确认暂停单', wx.status === 200)
+    wx = await fetch(`${enabled.base}/api/workflows/${planNo}`)
+    wj = await wx.json()
+    check('DAG 计划：云端核验完成', wx.status === 200 && wj.data.status === 'completed',
+      JSON.stringify(wj.data?.status))
+  }
+
+  // DAG 云端还款链：选择范围 / 付款账户 → 建单 → 取消（强验证另由本地链验证）
+  {
+    let wx = await fetch(`${enabled.base}/api/workflows`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ flow: 'repayment_review', params: {} }),
+    })
+    let wj = await wx.json()
+    const rpNo = wj.data?.plan_no
+    const dep = (wj.data?.selectable_deposit_accounts || [])[0]
+    const ca = (wj.data?.selectable_credit_accounts || [])[0]
+    check('DAG 还款计划：云端创建并完成只读节点', wx.status === 200 && rpNo
+      && wj.data.nodes.some((n) => n.key === 'list_statements' && n.status === 'completed'))
+    wx = await fetch(`${enabled.base}/api/workflows/${rpNo}/select`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'all_posted', from_account_id: dep.id, credit_account_id: ca.id }),
+    })
+    wj = await wx.json()
+    check('DAG 还款计划：云端生成强验证还款单', wx.status === 200 && wj.data.status === 'waiting_verification'
+      && wj.data.op && wj.data.op.status === 'needs_verification', JSON.stringify(wj.data?.status))
+    wx = await fetch(`${enabled.base}/api/workflows/${rpNo}/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    wj = await wx.json()
+    check('DAG 还款计划：云端取消未执行还款单', wx.status === 200 && wj.data.status === 'cancelled')
+  }
+
+  // 云卡片 / 订阅权威回执：模型生成期间外部确认
+  {
+    const card = (await snapshot()).cards.find((c) => c.card_type === '借记卡')
+    let cx = await fetch(`${enabled.base}/api/card-operations`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ card_id: card.id, action: 'freeze' }),
+    })
+    let cj = await cx.json()
+    const cardOp = cj.data.ref_no
+    await client.write('chat', 'save_turn', {
+      session_id: 'cloud-card-receipt', turn_id: 'cloud-card-1', base_version: 0,
+      messages: [], new_messages: [], pending_card_op_ref: cardOp,
+      user_text: '', reply: '', tool_records: [], incomplete: false, pointer_at_start: null,
+    }, USER_ID)
+    setScript(async () => {
+      await client.write('card', 'confirm', { ref_no: cardOp }, USER_ID)
+      return finalResp('该卡仍待确认')
+    })
+    r = await post({ message: '这张卡冻结了吗', sessionId: 'cloud-card-receipt' })
+    check('云回执：卡操作草稿被服务端完成状态替换', r.status === 200
+      && /冻结操作已完成/.test(r.json.data.reply) && !/待确认/.test(r.json.data.reply), JSON.stringify({status:r.status, body:r.json}))
+
+    const sub = (await snapshot()).subscriptions.find((x) => x.status === 'active')
+    let sx = await fetch(`${enabled.base}/api/subscription-operations`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subscription_id: sub.id, action: 'pause' }),
+    })
+    let sj = await sx.json()
+    const subOp = sj.data.ref_no
+    await client.write('chat', 'save_turn', {
+      session_id: 'cloud-sub-receipt', turn_id: 'cloud-sub-1', base_version: 0,
+      messages: [], new_messages: [], pending_subscription_op_ref: subOp,
+      user_text: '', reply: '', tool_records: [], incomplete: false, pointer_at_start: null,
+    }, USER_ID)
+    setScript(async () => {
+      await client.write('subscription', 'confirm', { ref_no: subOp }, USER_ID)
+      return finalResp('该订阅仍待确认')
+    })
+    r = await post({ message: '订阅暂停了吗', sessionId: 'cloud-sub-receipt' })
+    check('云回执：订阅草稿被服务端完成状态替换', r.status === 200
+      && /订阅暂停操作已完成/.test(r.json.data.reply) && !/待确认/.test(r.json.data.reply), JSON.stringify({status:r.status, body:r.json}))
+  }
+
+  // 云端可疑行为范围锁定
+  {
+    process.env.SECURITY_ANOMALY_ENABLED = '1'
+    process.env.SECURITY_ANOMALY_THRESHOLD = '3'
+    process.env.SECURITY_ANOMALY_WINDOW_SECONDS = '60'
+    process.env.SECURITY_ANOMALY_LOCK_SECONDS = '60'
+    const badBody = { recipient_id: 1, amount_cents: 10000, from_account_id: 1, extra: true }
+    let last
+    for (let i = 0; i < 3; i++) {
+      last = await fetch(`${enabled.base}/api/transfers`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '10.9.9.9' },
+        body: JSON.stringify(badBody),
+      })
+    }
+    check('云安全：前 3 次同 IP 非法请求返回 400', last.status === 400)
+    await new Promise((r) => setTimeout(r, 250))
+    const blocked = await fetch(`${enabled.base}/api/transfers`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '10.9.9.9' },
+      body: JSON.stringify(badBody),
+    })
+    const bj = await blocked.json()
+    check('云安全：第 4 次同 IP 请求返回 423', blocked.status === 423 && bj.code === 'suspicious_locked', `status=${blocked.status}`)
+    const other = await fetch(`${enabled.base}/api/transfers`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '10.9.9.10' },
+      body: JSON.stringify(badBody),
+    })
+    check('云安全：其他 IP 不受影响', other.status === 400)
+  }
+
+  // 审计时间线：受保护查询 + 关联编号
+  process.env.AUDIT_ACCESS_TOKEN = 'cloud-audit-token'
+  let ax = await fetch(`${enabled.base}/api/audit/timeline`)
+  check('云审计：未带令牌返回 401', ax.status === 401)
+  ax = await fetch(`${enabled.base}/api/audit/timeline`, { headers: { Authorization: 'Bearer cloud-audit-token' } })
+  let aj = await ax.json()
+  check('云审计：令牌正确可查询且含助手 / 工具事件', ax.status === 200
+    && aj.data.some((e) => e.category === 'assistant' && e.action === 'request')
+    && aj.data.some((e) => e.category === 'tool'), JSON.stringify(aj.data?.slice(0, 2)))
+  ax = await fetch(`${enabled.base}/api/audit/export`, { headers: { 'X-Audit-Token': 'cloud-audit-token' } })
+  check('云审计：可导出 JSON', ax.status === 200 && /attachment/.test(ax.headers.get('content-disposition') || ''))
+  delete process.env.AUDIT_ACCESS_TOKEN
+  ax = await fetch(`${enabled.base}/api/audit/timeline`)
+  check('云审计：未配置令牌时不暴露（404）', ax.status === 404)
 
   await new Promise((res) => enabled.server.close(res))
 } catch (e) {

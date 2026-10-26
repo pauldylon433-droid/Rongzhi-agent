@@ -72,10 +72,14 @@ try {
     'rongzhi_bank_card_write_v1(bigint,text,jsonb)', 'rongzhi_bank_sub_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_repay_write_v1(bigint,text,jsonb)', 'rongzhi_bank_chat_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_verification_write_v1(bigint,text,jsonb)', 'rongzhi_bank_task_write_v1(bigint,text,jsonb)',
+    'rongzhi_bank_audit_event_v1(bigint,text,jsonb)', 'rongzhi_bank_plan_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_seed_v1(bigint)',
   ]
   const sigs = fns.map((f) => f.sig.replace(/^public\./, ''))
   check('固定 RPC 白名单签名完整', required.every((s) => sigs.includes(s)), sigs.join(' | '))
+  const extraTables = await q(`SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='public' AND c.relkind='r' AND c.relname IN ('rongzhi_bank_audit_events','rongzhi_bank_workflow_plans')`)
+  check('审计 / 工作流计划表已创建', extraTables.length === 2, JSON.stringify(extraTables))
 
   // 权限：service_role 可执行，不能直接读写业务表；内部函数不可执行
   for (const [sig, label] of [['rongzhi_bank_snapshot_v1(bigint)', '快照'], ['rongzhi_bank_transfer_write_v1(bigint,text,jsonb)', '转账写']]) {
