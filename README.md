@@ -27,12 +27,23 @@
 | ---- | ---- |
 | 前端 | Vue 3 + Vite 8 |
 | 后端 | Node.js + Express 5（ES Modules） |
-| 数据库 | SQLite（better-sqlite3，WAL 模式） |
+| 数据库 | 本地默认 SQLite（better-sqlite3，WAL）；公网可选 CloudBase PostgreSQL 固定 RPC |
 | 助手文本渲染 | markdown-it + DOMPurify（严格白名单净化） |
 | 大模型 | DeepSeek（可选，仅自然语言助手使用） |
 
 > 图表库（ECharts 等）**未使用**：月度账单分析以「统计卡片 + 分类表格 + 本地 SVG 环形图」呈现
 > （分类占比由 `CategoryPieChart.vue` 用原生 SVG 绘制），不依赖第三方图表库，亦非部署前置条件，请勿将其列为缺项。
+
+### CloudBase 持久数据库模式（公网演示）
+
+- 本地默认 `DB_MODE=sqlite`，行为与验证脚本保持不变。
+- 公网设置 `DB_MODE=cloudbase`：业务数据只写 CloudBase PostgreSQL，通过后端 Service Role Key
+  调用 `rongzhi_bank_*` 固定 RPC；不依赖容器临时磁盘。
+- 安装 / 升级 / 回退 / 环境变量 / 验证命令见 **[docs/cloudbase-deployment.md](docs/cloudbase-deployment.md)**。
+- 本地 SQL / RPC 桩验证结果与证据边界见 **[docs/cloudbase-validation.md](docs/cloudbase-validation.md)**。
+- SQL 对象与版本化脚本见 **[cloudbase/sql/README.md](cloudbase/sql/README.md)**。
+- 公网 AI 默认关闭；显式开启且模型密钥 / 配额 / 并发配置齐全时，云端模式复用同一套系统提示与 17 个工具白名单，
+  通过固定 RPC 完成查询、准备操作单与订阅审查任务。助手仍无确认、扣款、验证凭据或任意 SQL 权限。
 
 ## 目录结构
 

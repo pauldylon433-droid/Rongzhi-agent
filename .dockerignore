@@ -1,0 +1,14 @@
+.git
+node_modules
+**/node_modules
+frontend/dist
+backend/data
+*.db
+*.db-wal
+*.db-shm
+*.log
+.env
+.env.*
+.verification-key
+docs
+*.zip

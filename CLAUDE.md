@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-银行 AI 智能体竞赛项目「融智 Agent」。前端 Vue 3 + Vite；后端 Node.js + Express 5（ESM）；数据库 SQLite（better-sqlite3，WAL）。单用户演示（张三），全部为模拟数据。
+银行 AI 智能体竞赛项目「融智 Agent」。前端 Vue 3 + Vite；后端 Node.js + Express 5（ESM）；数据库本地默认 SQLite（better-sqlite3，WAL），公网可选 CloudBase PostgreSQL 固定 RPC（`DB_MODE=cloudbase`）。单用户演示（张三），全部为模拟数据。
 
 ## 必要命令
 - 后端：`cd backend && npm run dev`（端口 3000）或 `npm start`
@@ -8,6 +8,8 @@
 - 初始化数据库：`cd backend && npm run db:init`
 - 前端构建：`cd frontend && npm run build`
 - 验证（均用独立临时库，不碰开发库）：`cd backend && node scripts/verify-*.js`；前端 `cd frontend && node scripts/verify-markdown.mjs`
+- CloudBase 适配验证（本地 PGlite / RPC 桩，不连云端）：`cd backend && npm run cloud:verify`（SQL + RPC 桩 + mock 模型助手）
+- CloudBase 初始化 / 绑定：`npm run cloud:init` / `npm run cloud:bind-verification`（需后端环境变量）
 
 ## 铁律
 - 不读取 / 打印 / 复制 `backend/.env` 真实密钥；`.verification-key` 严禁提交。

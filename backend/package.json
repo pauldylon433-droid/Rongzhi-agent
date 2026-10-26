@@ -9,7 +9,14 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "db:init": "node scripts/init-db.js",
-    "ai:check": "node scripts/ai-check.js"
+    "cloud:init": "node scripts/init-cloudbase.js",
+    "cloud:bind-verification": "node scripts/bind-verification-cloud.js",
+    "cloud:verify:sql": "node scripts/cloud/verify-sql.js",
+    "cloud:verify:api": "node scripts/cloud/verify-api.js",
+    "cloud:verify:assistant": "node scripts/cloud/verify-assistant.js",
+    "cloud:verify": "npm run cloud:verify:sql && npm run cloud:verify:races && npm run cloud:verify:api && npm run cloud:verify:assistant",
+    "ai:check": "node scripts/ai-check.js",
+    "cloud:verify:races": "node scripts/cloud/verify-races.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
@@ -17,6 +24,7 @@
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.11",
     "nodemon": "^3.1.14"
   },
   "engines": {
