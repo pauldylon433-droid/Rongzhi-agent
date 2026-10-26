@@ -1,4 +1,4 @@
-// CloudBase 持久库模式的 AI 助手：复用既有系统提示、17 个工具契约与白名单，
+// CloudBase 持久库模式的 AI 助手：复用既有系统提示、19 个工具契约与白名单，
 // 通过异步 CloudBase RPC 完成查询 / 准备操作单 / 任务启动；不确认、不扣款、不校验凭据、不执行 SQL。
 import { randomUUID, createHash } from 'node:crypto'
 import { chatCompletions, AiError } from '../lib/ai-client.js'
