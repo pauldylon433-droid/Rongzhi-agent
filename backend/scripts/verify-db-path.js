@@ -1,7 +1,8 @@
 // init-db.js 路径回归：显式 DB_PATH 必须被使用；空值 / 空白必须失败；默认开发库不得被创建或修改。
-// 只读核对默认库的文件元数据（存在性 / 大小 / mtime），不读取、不写入业务内容。
+// 默认库存在时只读核对文件元数据（存在性 / 大小 / mtime）；另在隔离副本中让副本默认库不存在，
+// 直接证明显式路径不会创建默认库。整个过程不读取、不写入真实默认库的业务内容。
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -77,6 +78,33 @@ try {
   const after3 = snapshot(DEFAULT_DB_PATH)
   check('空白 DB_PATH：默认库未被创建或修改',
     JSON.stringify(after3) === JSON.stringify(before), JSON.stringify({ before, after3 }))
+
+  // 4) 隔离副本：副本内的默认库初始不存在，显式 DB_PATH 时不得创建它。
+  //    真实工作区的默认库可能已存在（本轮误操作现场），仅靠元数据不变只能证明「未修改」；
+  //    副本场景直接证明「未创建」。副本放在 backend 下，以便复用 backend/node_modules。
+  const replica = mkdtempSync(join(BACKEND, '.db-path-replica-'))
+  try {
+    mkdirSync(join(replica, 'scripts'), { recursive: true })
+    cpSync(join(BACKEND, 'src'), join(replica, 'src'), { recursive: true })
+    cpSync(SCRIPT, join(replica, 'scripts', 'init-db.js'))
+    writeFileSync(join(replica, 'package.json'), '{"type":"module"}\n')
+    const replicaDefault = join(replica, 'data', 'rongzhi.db')
+    const replicaTemp = join(replica, 'isolated', 'temp-seed.db')
+    check('隔离副本：副本默认库初始不存在',
+      !existsSync(replicaDefault) && !existsSync(`${replicaDefault}-wal`) && !existsSync(`${replicaDefault}-shm`))
+    const r4 = spawnSync(process.execPath, [join(replica, 'scripts', 'init-db.js')], {
+      cwd: replica, env: { ...process.env, DB_PATH: replicaTemp }, encoding: 'utf8',
+    })
+    check('隔离副本：显式 DB_PATH 命令成功', r4.status === 0, (r4.stderr || '').slice(0, 200))
+    check('隔离副本：指定临时库已创建并写入种子', existsSync(replicaTemp))
+    check('隔离副本：默认库未被创建',
+      !existsSync(replicaDefault) && !existsSync(`${replicaDefault}-wal`) && !existsSync(`${replicaDefault}-shm`))
+  } finally {
+    rmSync(replica, { recursive: true, force: true })
+  }
+  const after4 = snapshot(DEFAULT_DB_PATH)
+  check('隔离副本：真实默认库未被创建或修改',
+    JSON.stringify(after4) === JSON.stringify(before), JSON.stringify({ before, after4 }))
 } finally {
   rmSync(work, { recursive: true, force: true })
 }

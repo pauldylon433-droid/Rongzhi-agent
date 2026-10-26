@@ -2963,6 +2963,7 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
   **不再静默回退 `DEFAULT_DB_PATH`**。未设置 `DB_PATH` 时保持原默认行为。
 - 新增 `scripts/verify-db-path.js`（`npm run verify:db-path`）：临时路径初始化成功且内容可读；
   显式路径下默认库的存在性 / 大小 / mtime 完全不变；空值与空白值均被拒绝且默认库不变。
+  另在隔离副本（副本默认库初始不存在）中验证显式路径不会创建默认库，覆盖「未创建」而不只是「未修改」。
 
 ### 二、误操作数据库归属（只读核对，保留现场）
 
@@ -2977,3 +2978,5 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 
 - `npm run verify:db-path`：全部通过。
 - 本地 `verify-*.js` 合计 **45 / 45**。
+- 2026-10-27 复验：`npm run verify:db-path` **14 / 14 PASS**（含隔离副本「默认库未被创建」）；
+  真实误操作库元数据前后一致（未创建、未修改、未删除）。
