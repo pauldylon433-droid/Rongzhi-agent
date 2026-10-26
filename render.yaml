@@ -27,6 +27,10 @@ services:
         value: "1"
       - key: PUBLIC_AI_ENABLED
         value: "0"
+      # 反向代理来源信任：Render 会在前面终止 TLS 并转发真实客户端 IP。
+      # 仅在确认前置代理可信时启用；本机直连部署保持不设置（默认 false）。
+      - key: TRUST_PROXY
+        value: "1"
       # 仅在 PUBLIC_AI_ENABLED=1 时使用；三项缺一不可，否则服务拒绝启动
       - key: PUBLIC_AI_RATE_LIMIT_PER_MIN
         value: "6"

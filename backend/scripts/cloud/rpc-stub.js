@@ -125,7 +125,8 @@ const server = http.createServer((req, res) => {
           [body.p_user_id, body.p_op, JSON.stringify(body.p_payload || {})])).rows
       } else if (fn === 'rongzhi_bank_seed_v1') {
         rows = (await db.query(`SELECT public.${fn}($1::bigint) r`, [body.p_user_id || 1])).rows
-      } else if (/^rongzhi_bank_(transfer|card|sub|repay|chat|verification|task|audit|plan)_write_v1$/.test(fn)) {
+      } else if (/^rongzhi_bank_(transfer|card|sub|repay|chat|verification|task|audit|plan|security)_write_v1$/.test(fn)
+        || fn === 'rongzhi_bank_audit_query_v1') {
         rows = (await db.query(`SELECT public.${fn}($1::bigint,$2::text,$3::jsonb) r`,
           [body.p_user_id, body.p_op, JSON.stringify(body.p_payload || {})])).rows
       } else {

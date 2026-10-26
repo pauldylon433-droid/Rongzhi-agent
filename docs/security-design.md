@@ -133,7 +133,8 @@
 - 订阅操作同样：多个订阅匹配或指向不明确时先澄清，不擅自选第一项；已取消订阅不可再操作，恢复需强验证，
   暂停 / 取消为普通确认。用户仅回复「确认」等文字不触发订阅状态变更，须在确认卡上明确操作。
 - 模型不能通过工具写库、传 `user_id`、SQL、文件路径、URL；未知工具 / 额外参数 / 非法参数均被拒。
-- `analyze_transactions_sandboxed` 只在 QuickJS WebAssembly 沙箱中处理脱敏流水；无网络 / 文件系统 / 宿主绑定，输出标记为非权威；`plan_workflow` 只创建受约束 DAG 计划，不确认 / 扣款 / 验证。
+- `analyze_transactions_sandboxed` 只在专用 Worker 中的 QuickJS WebAssembly 沙箱处理脱敏流水；无网络 / 文件系统 / 宿主绑定，
+  输出经 schema 与独立复算校验并标记为非权威；`plan_workflow` 只创建受约束 DAG 计划，不确认 / 扣款 / 验证。
 
 ### 聊天历史保留与模型上下文
 
@@ -193,6 +194,11 @@
 - `audit_events` 记录 `request_id` / `session_id` / `plan_id` / `tool_call_id` / `operation_ref` / category / action / result / risk / detail。
 - 助手记录请求（消息长度 / SHA-256，不落原文）、每次工具调用（脱敏参数、结果、耗时、操作单号）、回复摘要（不含思维链）；API 中间件记录状态变更请求；DAG 记录计划动作。
 - 密码 / 验证码 / TOTP 种子 / API Key / 加密密钥 / 哈希盐 / 沙箱代码原文不入审计；沙箱代码只记录长度与 SHA-256。
+  除按键名脱敏外，自由文本中的常见密钥格式与「密码是 …」「API Key: …」「Bearer …」等显式模式也会清理；
+  这不等于「识别所有任意未标注秘密」。
+- 计划动作、工具、操作单、确认 / 验证与只读刷新触发的核验共享请求上下文与 `operation_ref`；
+  异步请求追踪写入失败会重试两次并记录可核查的失败状态（本地 `audit_trace_failures` / 云端独立审计事件）。
+- 审计查询按数据库条件过滤 / 分页（CloudBase 使用固定 `audit_query_v1` RPC），不依赖快照最近 2000 条。
 - 业务成功审计仍在业务事务内（`audit_logs`）；安全失败 / 可疑行为事件独立提交，不随业务回滚丢失。
 - `/api/audit/timeline` 与 `/api/audit/export` 默认不暴露（未配置 `AUDIT_ACCESS_TOKEN` 返回 404），配置后必须 Bearer / `X-Audit-Token`。
 
@@ -201,26 +207,39 @@
 - 请求限流：内存令牌桶，按 IP / 接口返回 429，不修改持久业务状态。
 - 强验证锁定：`verification_failures` 行锁 + 5 次 / 15 分钟；晚到失败不清锁；业务提交在事务内复核锁定；跨实例以数据库行为准。
 - 可疑行为锁定：`security-guard` 基于服务端拒绝 / 工具拒绝事件计数，按 IP / 会话 scope 隔离；阈值 / 窗口 / 锁定时间由 `SECURITY_ANOMALY_*` 配置；锁定事件写入审计；不按提示词关键词判定。
-- 模型服务熔断：连续失败达到 `MODEL_BREAKER_THRESHOLD` 后在 `MODEL_BREAKER_COOLDOWN_MS` 内快速失败，返回 503 `model_breaker`；与配额 / 并发护栏分开。
+  计数 / 锁定 / 到期使用独立持久状态（本地 `security_scope_state`、云端 `rongzhi_bank_security_scope_state` + 固定 RPC），
+  不从审计最近 N 条推导，跨 scope 事件洪泛不会提前解锁；状态存储故障时敏感写操作返回 503（只读查询仍可用）。
+  代理来源必须显式配置 `TRUST_PROXY`（默认不信任 `X-Forwarded-For`）。
+- 模型服务熔断：本地与云端共用 `createModelBreaker`；连续真正模型故障达到 `MODEL_BREAKER_THRESHOLD` 后在
+  `MODEL_BREAKER_COOLDOWN_MS` 内快速失败，返回 503 `model_breaker`；配额 / 并发 / 请求限流拒绝发生在熔断之外，不计入提供方故障。
 - 单个 scope 锁定不会锁死整个共享服务；其他 IP / 访客不受影响。
 
 ## 十二、代码沙箱
 
-- `services/sandbox.js` 在独立 QuickJS WebAssembly 运行时执行模型生成的脱敏流水分析代码。
+- `services/sandbox.js` 在专用 `worker_threads` 中启动独立 QuickJS WebAssembly 运行时执行模型生成的脱敏流水分析代码；
+  主线程事件循环不被同步执行阻塞，父线程可独立超时并 `terminate` 执行单元。
 - 输入只含金额 / 方向 / 分类 / 状态 / 时间 / 商户哈希 / 账户哈希，不含账户余额、账户名、用户或密钥。
 - 无 Node `require` / `process` / `fetch` / `fs` 或任何宿主函数；无网络、无文件系统、无银行写接口。
-- 限制：2 秒墙钟、32 MB 堆、1 MB 栈、16 KB 输出、8000 字符代码；超限中断并丢弃整个 runtime。
-- 结果带 `sandbox=quickjs-wasm`、限制、耗时、退出状态与代码 SHA-256；标记 `authoritative:false`，不得作为余额 / 交易事实。
-- 边界：这是 WASM 运行时隔离，不是 OS 容器；若赛题强制要求容器级隔离，需部署 Docker / Firecracker 等额外后端。
+- 限制：2 秒执行墙钟（父线程另设 250ms 宽限）、32 MB 堆、1 MB 栈、16 KB 输出、8000 字符代码；
+  默认最多 2 个并发执行单元、20 个排队、排队超时 5 秒；超限中断并丢弃整个 runtime。
+- 结果必须符合可展示分析 schema（`total_cents` / 可选 `count` / `by_category` 等）；主线程按脱敏输入独立复算合计、
+  计数与分类，不一致或含额外指令字段 / 负数 / 非整数时标记 `analysis_unverified` 并拒绝。
+- 结果带 `sandbox=quickjs-wasm`、`execution_unit=worker_thread`、排队 / 执行耗时、资源限制、退出状态与代码 SHA-256；
+  仍标记 `authoritative:false`，不得作为余额 / 交易事实。
+- 边界：这是 Worker + WASM 运行时隔离，不是 OS 容器；若赛题强制要求容器级隔离，需部署 Docker / Firecracker 等额外后端。
 
 ## 十三、受约束 DAG 计划
 
 - 两条白名单链：`subscription_review`（月度分析→选择订阅→暂停/换来源→确认→核验）与 `repayment_review`（信用卡账单→选择范围/付款账户→建单→强验证→核验）。
-- 模型只能提交 flow / 参数 / 可选步骤依赖；服务端校验节点白名单、依赖存在、无环、最多 12 步、参数与归属。
-- 计划持久化到 SQLite `workflow_plans` / CloudBase `rongzhi_bank_workflow_plans`，版本 CAS 防覆盖。
+- 模型只能提交 flow / 参数 / 可选步骤依赖；服务端校验节点白名单、依赖与模板完全一致（不能删除 / 增加 / 重复 / 逆置业务边）、
+  无环、最多 12 步；参数按 flow / 阶段严格 schema 校验（非法枚举、额外字段、非法类型直接 400）。
+- 计划持久化到 SQLite `workflow_plans` / CloudBase `rongzhi_bank_workflow_plans`；建单与计划版本校验在同一事务
+  （本地 SQLite 事务 / 云端 plan RPC 行锁 + 版本 CAS），操作单编号确定性绑定计划与版本，失败不留孤单。
 - 支持等待选择、暂停、继续、取消、重试、修改未执行步骤、转人工；修改会取消旧待确认操作单并使原确认失效。
+- 只读节点失败会阻断选择；核验前必须先完成确认 / 强验证节点；计划完成要求所有节点 completed；
+  恢复 / 修改时重新查询只读节点并记录查询时间，查询失败在视图中显式返回。
 - 已完成操作只核验真实状态，不提供直接撤销；回退只重置未执行节点。
-- 当前新的通用计划卡尚未接入前端专用页面；现有订阅审查任务 UI 与操作单确认卡仍可用。
+- 「计划任务」页面已接入新版计划入口（与旧「最近任务」分开），复用订阅 / 还款操作单确认卡。
 
 ## 十四、尚未实现 / 未验证
 

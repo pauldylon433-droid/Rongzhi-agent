@@ -139,6 +139,143 @@ try {
   try { await service.modify(plan.plan_no, { from_account_id: a2 }) } catch (e) { completedModifyErr = e }
   check('计划：已完成计划拒绝修改（不伪装撤销已完成扣款）', completedModifyErr instanceof WorkflowError
     && completedModifyErr.code === 'bad_state', completedModifyErr?.code)
+  check('计划：完成时所有必需节点均已完成（R14）',
+    plan.nodes.every((n) => n.status === 'completed'), JSON.stringify(plan.nodes.map((n) => [n.key, n.status])))
+
+  // —— P1-04：严格参数 schema，非法枚举 / 额外字段 / 非法类型直接拒绝且无副作用 ——
+  {
+    const before = db.prepare('SELECT count(*) n FROM subscription_operations').get().n
+    let e1 = null
+    try { await service.create({ flow: 'subscription_review', params: { month, bogus: 1 } }) } catch (e) { e1 = e }
+    check('参数校验：create 额外字段被拒绝', e1 instanceof WorkflowError && e1.code === 'bad_params', e1?.message)
+    let e2 = null
+    try { await service.create({ flow: 'subscription_review', params: { month: '2026-13' } }) } catch (e) { e2 = e }
+    check('参数校验：非法月份被拒绝', e2 instanceof WorkflowError && e2.code === 'bad_params', e2?.message)
+    const p = await service.create({ flow: 'subscription_review', params: { month } })
+    let e3 = null
+    try { await service.select(p.plan_no, { subscription_id: subId, action: 'DELETE_EVERYTHING' }) } catch (e) { e3 = e }
+    check('参数校验：非法 action 被拒绝，不静默改为暂停（R13）', e3 instanceof WorkflowError && e3.code === 'bad_params', e3?.message)
+    let e4 = null
+    try { await service.select(p.plan_no, { subscription_id: String(subId), action: 'pause' }) } catch (e) { e4 = e }
+    check('参数校验：字符串账户 id 被拒绝', e4 instanceof WorkflowError && e4.code === 'bad_params', e4?.message)
+    let e5 = null
+    try { await service.select(p.plan_no, { subscription_id: subId, action: 'pause', extra: true }) } catch (e) { e5 = e }
+    check('参数校验：select 额外字段被拒绝', e5 instanceof WorkflowError && e5.code === 'bad_params', e5?.message)
+    let e6 = null
+    try { await service.select(p.plan_no, { subscription_id: -1, action: 'pause' }) } catch (e) { e6 = e }
+    check('参数校验：非正整数账户被拒绝', e6 instanceof WorkflowError && e6.code === 'bad_params', e6?.message)
+    check('参数校验：非法输入未产生操作单副作用',
+      db.prepare('SELECT count(*) n FROM subscription_operations').get().n === before)
+    let e7 = null
+    try { await service.modify(p.plan_no, { evil: 'x' }) } catch (e) { e7 = e }
+    check('参数校验：modify 复用同一 schema', e7 instanceof WorkflowError && e7.code === 'bad_params', e7?.message)
+    let e8 = null
+    try { await service.select(p.plan_no, { scope: 'all_posted', from_account_id: a1, credit_account_id: caId }) } catch (e) { e8 = e }
+    check('参数校验：订阅流程不接受还款参数', e8 instanceof WorkflowError && e8.code === 'bad_params', e8?.message)
+  }
+
+  // —— P1-03：依赖不能删除 / 反向 / 重复 / 额外，只读失败不得继续 ——
+  {
+    let d1 = null
+    try {
+      await service.create({ flow: 'subscription_review', params: { month }, steps: [
+        { key: 'analyze_month', depends_on: [] }, { key: 'list_subscriptions', depends_on: [] },
+        { key: 'choose_subscription', depends_on: [] },
+        { key: 'prepare_subscription', depends_on: ['choose_subscription'] },
+        { key: 'await_confirmation', depends_on: ['prepare_subscription'] },
+        { key: 'verify_result', depends_on: ['await_confirmation'] },
+        { key: 'summary', depends_on: ['verify_result'] },
+      ] })
+    } catch (e) { d1 = e }
+    check('DAG：删除必需依赖被拒绝（R4）', d1 instanceof WorkflowError && d1.code === 'bad_plan', d1?.message)
+    let d2 = null
+    try {
+      await service.create({ flow: 'subscription_review', params: { month }, steps: [
+        { key: 'analyze_month', depends_on: ['summary'] }, { key: 'list_subscriptions', depends_on: [] },
+        { key: 'choose_subscription', depends_on: ['analyze_month', 'list_subscriptions'] },
+        { key: 'prepare_subscription', depends_on: ['choose_subscription'] },
+        { key: 'await_confirmation', depends_on: ['prepare_subscription'] },
+        { key: 'verify_result', depends_on: ['await_confirmation'] },
+        { key: 'summary', depends_on: ['verify_result'] },
+      ] })
+    } catch (e) { d2 = e }
+    check('DAG：反向依赖被拒绝', d2 instanceof WorkflowError && d2.code === 'bad_plan', d2?.message)
+    let d3 = null
+    try {
+      await service.create({ flow: 'subscription_review', params: { month }, steps: [
+        { key: 'analyze_month', depends_on: [] }, { key: 'list_subscriptions', depends_on: [] },
+        { key: 'choose_subscription', depends_on: ['analyze_month', 'list_subscriptions', 'analyze_month'] },
+        { key: 'prepare_subscription', depends_on: ['choose_subscription'] },
+        { key: 'await_confirmation', depends_on: ['prepare_subscription'] },
+        { key: 'verify_result', depends_on: ['await_confirmation'] },
+        { key: 'summary', depends_on: ['verify_result'] },
+      ] })
+    } catch (e) { d3 = e }
+    check('DAG：重复依赖被拒绝', d3 instanceof WorkflowError && d3.code === 'bad_plan', d3?.message)
+    let d4 = null
+    try {
+      await service.create({ flow: 'subscription_review', params: { month }, steps: [
+        { key: 'analyze_month', depends_on: [], label: 'x' }, { key: 'list_subscriptions', depends_on: [] },
+        { key: 'choose_subscription', depends_on: ['analyze_month', 'list_subscriptions'] },
+        { key: 'prepare_subscription', depends_on: ['choose_subscription'] },
+        { key: 'await_confirmation', depends_on: ['prepare_subscription'] },
+        { key: 'verify_result', depends_on: ['await_confirmation'] },
+        { key: 'summary', depends_on: ['verify_result'] },
+      ] })
+    } catch (e) { d4 = e }
+    check('DAG：节点额外字段被拒绝', d4 instanceof WorkflowError && d4.code === 'bad_plan', d4?.message)
+
+    // 只读失败：分析抛错 → 节点 failed，选择入口拒绝且不建单
+    const failingOps = {
+      ...ops,
+      async analytics() { throw new Error('injected_analytics_failure') },
+      async subscriptions() { throw new Error('injected_subscriptions_failure') },
+    }
+    const failingService = createWorkflowService({ store, ops: failingOps })
+    const beforeOps = db.prepare('SELECT count(*) n FROM subscription_operations').get().n
+    const failed = await failingService.create({ flow: 'subscription_review', params: { month } })
+    const analyzeNode = failed.nodes.find((n) => n.key === 'analyze_month')
+    check('DAG：只读节点失败标记 failed 且不冒充空列表',
+      analyzeNode.status === 'failed' && /injected_analytics_failure/.test(analyzeNode.error), JSON.stringify(analyzeNode))
+    let d5 = null
+    try { await failingService.select(failed.plan_no, { subscription_id: subId, action: 'pause' }) } catch (e) { d5 = e }
+    check('DAG：前置只读失败时禁止选择 / 建单', d5 instanceof WorkflowError && d5.code === 'bad_state'
+      && db.prepare('SELECT count(*) n FROM subscription_operations').get().n === beforeOps, d5?.message)
+    const viewFailed = await failingService.get(failed.plan_no)
+    check('DAG：查询失败在视图中显式返回（不静默吞错）', viewFailed.errors && viewFailed.errors.subscriptions,
+      JSON.stringify(viewFailed.errors))
+  }
+
+  // —— P1-02：并发选择最多一个可确认关联单；审计失败不留孤单 ——
+  {
+    const cp = await service.create({ flow: 'subscription_review', params: { month } })
+    const beforeOps = db.prepare("SELECT count(*) n FROM subscription_operations WHERE ref_no LIKE ?").get(`wf-${cp.plan_no}-%`).n
+    const results = await Promise.allSettled([
+      service.select(cp.plan_no, { subscription_id: subId, action: 'pause' }),
+      service.select(cp.plan_no, { subscription_id: subId, action: 'pause' }),
+    ])
+    const okCount = results.filter((r) => r.status === 'fulfilled').length
+    const after = db.prepare("SELECT ref_no, status FROM subscription_operations WHERE ref_no LIKE ?").all(`wf-${cp.plan_no}-%`)
+    const current = await service.get(cp.plan_no)
+    check('并发：同一计划两次选择仅一个成功', okCount === 1 && after.length === beforeOps + 1,
+      JSON.stringify({ okCount, after }))
+    check('并发：计划只关联唯一操作单', current.op_ref === after[0]?.ref_no,
+      JSON.stringify({ op_ref: current.op_ref, after }))
+
+    const throwingAudit = { async record() { throw new Error('injected_audit_failure') } }
+    const auditedService = createWorkflowService({ store, ops, audit: throwingAudit })
+    const beforePlans = db.prepare('SELECT count(*) n FROM workflow_plans').get().n
+    const ap = await auditedService.create({ flow: 'subscription_review', params: { month } }).catch((e) => e)
+    const latest = db.prepare('SELECT plan_no FROM workflow_plans ORDER BY id DESC LIMIT 1').get()
+    const persisted = latest ? await store.get(latest.plan_no) : null
+    const linkedOps = persisted
+      ? db.prepare("SELECT count(*) n FROM subscription_operations WHERE ref_no LIKE ?").get(`wf-${persisted.plan_no}-%`).n
+      : 0
+    check('审计失败：不静默成功、计划可核查且无孤单操作单',
+      ap instanceof Error && db.prepare('SELECT count(*) n FROM workflow_plans').get().n === beforePlans + 1
+      && persisted && linkedOps === 0,
+      JSON.stringify({ err: ap?.message, persisted: !!persisted, linkedOps }))
+  }
 } catch (e) {
   failures += 1
   console.error('WORKFLOW TEST ERROR:', e.stack || e.message)

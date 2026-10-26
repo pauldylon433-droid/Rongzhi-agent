@@ -605,7 +605,9 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 
 ### 受约束 DAG 计划接口
 
-所有计划接口由服务端校验白名单节点、依赖、无环、步骤上限与参数；计划本身不执行确认 / 扣款 / 验证。
+所有计划接口由服务端校验白名单节点、依赖（必须与模板完全一致）、无环、步骤上限与严格参数 schema；
+非法枚举 / 额外字段 / 非法类型 / 非正整数返回 400，且不产生计划或操作单副作用。计划本身不执行确认 / 扣款 / 验证。
+建单与计划版本在单一事务内完成（本地 SQLite / 云端固定 RPC），并发选择最多一个成功。
 
 - `GET /api/workflows`：最近计划
 - `POST /api/workflows`：创建计划，body `{ flow, params, steps? }`
@@ -616,7 +618,8 @@ AI 助手对话接口：自然语言 → 模型工具调用 → 实际数据库�
 
 ### 受保护审计接口
 
-- `GET /api/audit/timeline`：查询事件；支持 `request_id` / `session_id` / `plan_id` / `operation_ref` / `category` / `status` / `limit` / `offset`
+- `GET /api/audit/timeline`：查询事件；支持 `event_id` / `request_id` / `session_id` / `plan_id` / `operation_ref` / `tool_call_id` / `category` / `status` / `limit` / `offset`；
+  CloudBase 模式按数据库条件查询（不依赖快照最近 2000 条）
 - `GET /api/audit/export`：导出 JSON（最多 500 条）
 - 未配置 `AUDIT_ACCESS_TOKEN` 时返回 404；配置后需 `Authorization: Bearer <token>` 或 `X-Audit-Token`；无 / 错令牌 401。
 - 审计只记录可观察业务决策，不记录模型思维链；密码 / 验证码 / 种子 / API Key / 沙箱代码原文已脱敏。

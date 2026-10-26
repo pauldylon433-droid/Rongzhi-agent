@@ -119,7 +119,9 @@ CREATE OR REPLACE FUNCTION public.rongzhi_bank_plan_write_v1(
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
-DECLARE v_plan public.rongzhi_bank_workflow_plans%ROWTYPE;
+DECLARE
+  v_plan public.rongzhi_bank_workflow_plans%ROWTYPE;
+  v_res jsonb;
 BEGIN
   IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
   p_payload := coalesce(p_payload, '{}'::jsonb);
@@ -141,6 +143,202 @@ BEGIN
     RETURNING * INTO v_plan;
     IF NOT FOUND THEN RETURN jsonb_build_object('conflict', true); END IF;
     RETURN to_jsonb(v_plan);
+
+  ELSIF p_op = 'select' THEN
+    -- 计划版本校验、操作单创建、计划保存：同一事务；任何一步失败整体回滚，不留孤单。
+    SELECT * INTO v_plan FROM public.rongzhi_bank_workflow_plans
+     WHERE plan_no = p_payload->>'plan_no' AND user_id = p_user_id FOR UPDATE;
+    IF NOT FOUND THEN RETURN jsonb_build_object('outcome','not_found'); END IF;
+    IF v_plan.version <> coalesce((p_payload->>'base_version')::bigint, -1) THEN
+      RETURN jsonb_build_object('conflict', true);
+    END IF;
+    IF v_plan.status <> 'waiting_selection' THEN
+      RETURN jsonb_build_object('outcome','bad_state');
+    END IF;
+    IF v_plan.flow = 'subscription_review' THEN
+      v_res := public.rongzhi_bank_sub_write_v1(p_user_id, 'create', coalesce(p_payload->'op_payload','{}'::jsonb));
+    ELSE
+      v_res := public.rongzhi_bank_repay_write_v1(p_user_id, 'create', coalesce(p_payload->'op_payload','{}'::jsonb));
+    END IF;
+    IF coalesce(v_res->>'outcome','') <> 'created' THEN
+      RAISE EXCEPTION 'plan_operation_not_created' USING ERRCODE = '22023';
+    END IF;
+    UPDATE public.rongzhi_bank_workflow_plans
+       SET status = p_payload->>'status', plan_json = coalesce(p_payload->'plan_json','{}'::jsonb),
+           version = version + 1, updated_at = clock_timestamp(), completed_at = NULL
+     WHERE id = v_plan.id
+    RETURNING * INTO v_plan;
+    RETURN to_jsonb(v_plan);
+
+  ELSIF p_op = 'transition' THEN
+    -- 生命周期变更 + 取消待确认单 + 计划版本 CAS：同一事务。
+    SELECT * INTO v_plan FROM public.rongzhi_bank_workflow_plans
+     WHERE plan_no = p_payload->>'plan_no' AND user_id = p_user_id FOR UPDATE;
+    IF NOT FOUND THEN RETURN jsonb_build_object('outcome','not_found'); END IF;
+    IF v_plan.version <> coalesce((p_payload->>'base_version')::bigint, -1) THEN
+      RETURN jsonb_build_object('conflict', true);
+    END IF;
+    IF nullif(p_payload->>'cancel_ref','') IS NOT NULL THEN
+      IF v_plan.flow = 'subscription_review' THEN
+        v_res := public.rongzhi_bank_sub_write_v1(p_user_id, 'cancel',
+          jsonb_build_object('ref_no', p_payload->>'cancel_ref'));
+      ELSE
+        v_res := public.rongzhi_bank_repay_write_v1(p_user_id, 'cancel',
+          jsonb_build_object('ref_no', p_payload->>'cancel_ref'));
+      END IF;
+      -- 若操作单已被确认完成，不取消任何东西，返回冲突让前端刷新后按真实状态核验。
+      IF coalesce(v_res->>'outcome','') = 'completed' THEN
+        RETURN jsonb_build_object('outcome','completed_conflict');
+      END IF;
+    END IF;
+    UPDATE public.rongzhi_bank_workflow_plans
+       SET status = p_payload->>'status', plan_json = coalesce(p_payload->'plan_json','{}'::jsonb),
+           version = version + 1, updated_at = clock_timestamp(),
+           completed_at = (p_payload->>'completed_at')::timestamptz
+     WHERE id = v_plan.id
+    RETURNING * INTO v_plan;
+    RETURN to_jsonb(v_plan);
+  END IF;
+  RAISE EXCEPTION 'unsupported_operation' USING ERRCODE = '22023';
+END;
+$$;
+
+-- 审计查询：按数据库条件过滤 / 分页，不依赖快照最近 N 条（旧事件仍可按编号查到）。
+CREATE OR REPLACE FUNCTION public.rongzhi_bank_audit_query_v1(
+  p_user_id bigint, p_op text, p_payload jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_limit integer;
+  v_offset integer;
+  v_rows jsonb;
+  v_total bigint;
+  v_event_id text;
+  v_request_id text;
+  v_session_id text;
+  v_plan_id text;
+  v_operation_ref text;
+  v_tool_call_id text;
+  v_category text;
+  v_result text;
+BEGIN
+  IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
+  IF p_op <> 'query' THEN RAISE EXCEPTION 'unsupported_operation' USING ERRCODE = '22023'; END IF;
+  p_payload := coalesce(p_payload, '{}'::jsonb);
+  v_limit := least(greatest(coalesce((p_payload->>'limit')::integer, 100), 1), 500);
+  v_offset := greatest(coalesce((p_payload->>'offset')::integer, 0), 0);
+  v_event_id := nullif(p_payload->>'event_id','');
+  v_request_id := nullif(p_payload->>'request_id','');
+  v_session_id := nullif(p_payload->>'session_id','');
+  v_plan_id := nullif(p_payload->>'plan_id','');
+  v_operation_ref := nullif(p_payload->>'operation_ref','');
+  v_tool_call_id := nullif(p_payload->>'tool_call_id','');
+  v_category := nullif(p_payload->>'category','');
+  v_result := nullif(p_payload->>'status','');
+
+  SELECT count(*) INTO v_total FROM public.rongzhi_bank_audit_events e
+   WHERE e.user_id = p_user_id
+     AND (v_event_id IS NULL OR e.event_id = v_event_id)
+     AND (v_request_id IS NULL OR e.request_id = v_request_id)
+     AND (v_session_id IS NULL OR e.session_id = v_session_id)
+     AND (v_plan_id IS NULL OR e.plan_id = v_plan_id)
+     AND (v_operation_ref IS NULL OR e.operation_ref = v_operation_ref)
+     AND (v_tool_call_id IS NULL OR e.tool_call_id = v_tool_call_id)
+     AND (v_category IS NULL OR e.category = v_category)
+     AND (v_result IS NULL OR e.result = v_result);
+
+  SELECT jsonb_agg(to_jsonb(x) ORDER BY x.id DESC) INTO v_rows FROM (
+    SELECT * FROM public.rongzhi_bank_audit_events e
+     WHERE e.user_id = p_user_id
+       AND (v_event_id IS NULL OR e.event_id = v_event_id)
+       AND (v_request_id IS NULL OR e.request_id = v_request_id)
+       AND (v_session_id IS NULL OR e.session_id = v_session_id)
+       AND (v_plan_id IS NULL OR e.plan_id = v_plan_id)
+       AND (v_operation_ref IS NULL OR e.operation_ref = v_operation_ref)
+       AND (v_tool_call_id IS NULL OR e.tool_call_id = v_tool_call_id)
+       AND (v_category IS NULL OR e.category = v_category)
+       AND (v_result IS NULL OR e.result = v_result)
+     ORDER BY id DESC
+     LIMIT v_limit OFFSET v_offset
+  ) x;
+
+  RETURN jsonb_build_object('rows', coalesce(v_rows, '[]'::jsonb), 'total', v_total);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.rongzhi_bank_security_write_v1(
+  p_user_id bigint, p_op text, p_payload jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_now_ms bigint := (extract(epoch from clock_timestamp()) * 1000)::bigint;
+  v_scope text;
+  v_kind text;
+  v_window bigint;
+  v_threshold integer;
+  v_lock bigint;
+  v_until bigint;
+  v_count integer;
+  v_any_until bigint;
+BEGIN
+  IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
+  p_payload := coalesce(p_payload, '{}'::jsonb);
+  v_scope := nullif(p_payload->>'scope_key','');
+  IF v_scope IS NULL OR length(v_scope) > 200 THEN RAISE EXCEPTION 'invalid scope_key' USING ERRCODE = '22023'; END IF;
+
+  IF p_op = 'check' THEN
+    SELECT max(locked_until_ms) INTO v_any_until FROM public.rongzhi_bank_security_scope_state WHERE scope_key = v_scope;
+    IF coalesce(v_any_until, 0) > v_now_ms THEN
+      RETURN jsonb_build_object('allowed', false,
+        'locked_until', to_char(to_timestamp(v_any_until / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'));
+    END IF;
+    RETURN jsonb_build_object('allowed', true);
+
+  ELSIF p_op = 'record' THEN
+    v_kind := nullif(p_payload->>'kind','');
+    IF v_kind IS NULL OR length(v_kind) > 60 THEN RAISE EXCEPTION 'invalid kind' USING ERRCODE = '22023'; END IF;
+    v_window := coalesce((p_payload->>'window_ms')::bigint, 300000);
+    v_threshold := coalesce((p_payload->>'threshold')::integer, 5);
+    v_lock := coalesce((p_payload->>'lock_ms')::bigint, 900000);
+    IF v_window <= 0 OR v_threshold <= 0 OR v_lock <= 0 THEN RAISE EXCEPTION 'invalid limits' USING ERRCODE = '22023'; END IF;
+
+    SELECT max(locked_until_ms) INTO v_any_until FROM public.rongzhi_bank_security_scope_state WHERE scope_key = v_scope;
+    IF coalesce(v_any_until, 0) > v_now_ms THEN
+      RETURN jsonb_build_object('locked', true, 'count', v_threshold,
+        'locked_until', to_char(to_timestamp(v_any_until / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'));
+    END IF;
+
+    INSERT INTO public.rongzhi_bank_security_scope_state
+      (scope_key, kind, window_start_ms, count, locked_until_ms, updated_at_ms)
+    VALUES (v_scope, v_kind, v_now_ms, 1, CASE WHEN v_threshold <= 1 THEN v_now_ms + v_lock ELSE NULL END, v_now_ms)
+    ON CONFLICT (scope_key, kind) DO UPDATE SET
+      window_start_ms = CASE
+        WHEN (rongzhi_bank_security_scope_state.locked_until_ms IS NOT NULL
+              AND rongzhi_bank_security_scope_state.locked_until_ms <= v_now_ms)
+          OR (v_now_ms - rongzhi_bank_security_scope_state.window_start_ms >= v_window)
+        THEN v_now_ms ELSE rongzhi_bank_security_scope_state.window_start_ms END,
+      count = CASE
+        WHEN (rongzhi_bank_security_scope_state.locked_until_ms IS NOT NULL
+              AND rongzhi_bank_security_scope_state.locked_until_ms <= v_now_ms)
+          OR (v_now_ms - rongzhi_bank_security_scope_state.window_start_ms >= v_window)
+        THEN 1 ELSE rongzhi_bank_security_scope_state.count + 1 END,
+      locked_until_ms = CASE
+        WHEN (CASE
+          WHEN (rongzhi_bank_security_scope_state.locked_until_ms IS NOT NULL
+                AND rongzhi_bank_security_scope_state.locked_until_ms <= v_now_ms)
+            OR (v_now_ms - rongzhi_bank_security_scope_state.window_start_ms >= v_window)
+          THEN 1 ELSE rongzhi_bank_security_scope_state.count + 1 END) >= v_threshold
+        THEN v_now_ms + v_lock ELSE NULL END,
+      updated_at_ms = v_now_ms
+    RETURNING count, locked_until_ms INTO v_count, v_until;
+
+    RETURN jsonb_build_object('locked', coalesce(v_until, 0) > v_now_ms, 'count', v_count,
+      'locked_until', CASE WHEN coalesce(v_until, 0) > v_now_ms
+        THEN to_char(to_timestamp(v_until / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') ELSE NULL END);
   END IF;
   RAISE EXCEPTION 'unsupported_operation' USING ERRCODE = '22023';
 END;
@@ -950,7 +1148,8 @@ BEGIN
     v_risk := CASE WHEN v_action IN ('resume','change_source') THEN 'red' ELSE 'yellow' END;
     v_status := CASE WHEN v_risk = 'red' THEN 'needs_verification' ELSE 'pending' END;
     v_now := clock_timestamp();
-    v_ref := gen_random_uuid()::text;
+    -- 计划建单使用确定性编号（计划号 + 计划版本 + 步骤），作为计划与操作单的幂等关联键。
+    v_ref := coalesce(nullif(p_payload->>'ref_no',''), gen_random_uuid()::text);
     INSERT INTO public.rongzhi_bank_subscription_operations
       (ref_no, user_id, subscription_id, merchant, amount_cents, billing_cycle, action,
        from_status, to_status, subscription_version,
@@ -1193,7 +1392,8 @@ BEGIN
 
     IF v_from.balance_cents < v_total THEN RAISE EXCEPTION '付款账户余额不足' USING ERRCODE = '22023'; END IF;
     v_now := clock_timestamp();
-    v_ref := gen_random_uuid()::text;
+    -- 计划建单使用确定性编号（计划号 + 计划版本 + 步骤），作为计划与操作单的幂等关联键。
+    v_ref := coalesce(nullif(p_payload->>'ref_no',''), gen_random_uuid()::text);
     v_statement_month := to_char(make_date(v_primary.statement_year, v_primary.statement_month, 1), 'YYYY-MM');
     INSERT INTO public.rongzhi_bank_repayment_operations
       (ref_no, user_id, session_id, scope, from_account_id, from_account_name,
@@ -2125,6 +2325,8 @@ DECLARE
     'rongzhi_bank_health_v1()',
     'rongzhi_bank_audit_event_v1(bigint,text,jsonb)',
     'rongzhi_bank_plan_write_v1(bigint,text,jsonb)',
+    'rongzhi_bank_security_write_v1(bigint,text,jsonb)',
+    'rongzhi_bank_audit_query_v1(bigint,text,jsonb)',
     'rongzhi_bank_transfer_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_card_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_sub_write_v1(bigint,text,jsonb)',

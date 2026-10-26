@@ -18,6 +18,7 @@ const ICONS = {
   cards: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/><path d="M6 15h4"/>',
   subscriptions: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>',
   tasks: '<path d="m9 11 3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  plan: '<rect x="3" y="4" width="6" height="5" rx="1"/><rect x="15" y="4" width="6" height="5" rx="1"/><rect x="9" y="15" width="6" height="5" rx="1"/><path d="M9 6.5h6M6 9v4h6M18 9v2.5h-3"/>',
 
   // 指标
   balance: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M16 12h.01M8 12h.01M12 16h.01"/>',

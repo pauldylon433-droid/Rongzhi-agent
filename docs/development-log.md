@@ -2902,3 +2902,78 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 
 验证：本地 `verify-*.js` 43/43；CloudBase SQL 28/28；定向竞态 28/28（3 项真实多连接 SKIP）；CloudBase API 63/63；CloudBase AI/DAG/审计/安全 48/48（mock 模型）；前端构建通过。
 未执行：真实 CloudBase 部署、真实模型、真实多连接并发、浏览器自动化；新通用计划卡暂无专用前端页面。
+
+---
+
+## 第五十六阶段：统一修正单 11 项整批修正（2026-10-26，本地隔离）
+
+依据《融智 Agent · 比赛补齐版本独立复核与统一修正单》P1-01 ~ P2-11，在 `feature/competition-requirements`
+分支继续未提交工作（上一轮已完成事实保护雏形、局部原子选择与确定性编号参数，本轮补齐并加回归）。
+
+### 一、权限 / 事务 / 状态（先修）
+
+- **P1-01 事实保护**：`fact-guard.js` 改为「结构化权威回执 + 显式冲突检测 + 查询失败降级」：
+  同状态陈旧声称、无单据成功声明、金额/流水号冲突、多对象解释保留、四类操作统一回执；
+  本地与云端在生成后统一应用，返回 / 持久化 / 前端展示同一文案。模型草稿不再原样返回（两个旧测试断言同步为权威回执）。
+- **P1-02 原子性**：本地 `selectAtomic`（事务内校验版本/状态、建单、关联、保存）与 `saveAtomic`
+  （生命周期变更 + 取消待确认单 + 版本 CAS 同事务）；确定性操作单编号 `wf-<plan_no>-v<version>-<step>`；
+  云端 `rongzhi_bank_plan_write_v1` 新增 `select` / `transition`，同一事务内建单/取消 + 版本 CAS。
+- **P1-03 DAG**：步骤依赖必须与模板完全一致（不能删边/加边/重复/逆置/带额外字段）；只读失败标记 failed 并阻断选择；
+  核验前先完成确认 / 强验证节点；计划完成要求全部节点 completed；恢复/修改强制重新查询只读节点并记录 `queried_at`；
+  视图显式返回查询错误，不再静默变成空列表。
+- **P1-04 参数 schema**：`validateParams` 按 flow/stage 严格校验 create/select/modify（AI、API、修改共用）；
+  非法枚举（如 `DELETE_EVERYTHING`）、额外字段、字符串 id、非正整数、非法月份返回 400 且无副作用。
+- **P1-05 锁定状态**：新增 `security_scope_state`（本地表 + 云端表/RPC），按 scope 原子计数/锁定/到期，
+  不再从审计最近 500 条推导；跨 scope 600 条事件洪泛、重启、存储故障均有回归；状态读取失败时写操作 503（只读降级）。
+  代理信任改为显式 `TRUST_PROXY`（默认 false；Render 蓝图设 1）。
+- **P1-06 路由顺序**：云端 `/workflows` 移到请求审计与安全检查之后；锁定 IP 访问返回 423 且带请求号。
+- **P2-11 熔断**：本地路由与云端共用 `createModelBreaker`；模型故障达阈值返回 503，冷却后恢复；
+  配额/并发护栏在熔断之外，429 不计入提供方故障。
+
+### 二、沙箱 / 审计 / 前端
+
+- **P1-07**：QuickJS 移入专用 `worker_threads`（`sandbox-worker.js` + `sandbox-core.js`），主线程不再同步执行；
+  有限并发（默认 2）、有界队列（20）、排队超时、父线程独立超时 terminate；摘要分别记录 `queue_ms` / `execution_ms` /
+  `worker_terminated`。实测死循环期间主线程 20ms 定时器正常触发。
+- **P2-08**：定义可展示分析 schema（total_cents / count / by_category 等），主线程按脱敏输入独立复算；
+  伪造合计、额外指令字段、负数、分类不闭合、非整数一律 `analysis_unverified` 拒绝；`authoritative:false` 不再等同于校验。
+- **P1-09**：审计自由文本按已知模式清理（sk-/AKIA/Bearer/「密码是 …」等），不再只按键名；
+  `audit_trace_failures` + 重试两次 + 失败状态记录；计划事件贯穿 request_id / session_id / plan_id / operation_ref，
+  只读 GET 触发核验时也建立请求号；CloudBase 新增 `audit_query_v1` 按数据库条件过滤/分页，超过 2000 条仍可按编号查到旧事件。
+- **P1-10**：新增「计划任务」页面与导航入口（与「最近任务」分开）：列表/详情、节点依赖与阻断原因、
+  选择、暂停/继续、取消、修改（旧单失效）、重试、转人工，复用订阅 / 还款确认卡；桌面与手机栅格自适应。
+
+### 三、验证（实际执行）
+
+- 本地 `verify-*.js` **44/44 通过**（新增 `verify-workflow-api.js`；扩充 receipts / audit / sandbox / security / workflows）。
+- 前端 `npm run build` 通过（`index-BNKePsq-.css` / `index-Dg0Ezgg1.js`）。
+- CloudBase 本地：SQL **35 PASS**；竞态 28 PASS / 3 SKIP；API 63 PASS；助手/DAG/审计/安全 **51 PASS**（mock）。
+- `npm run verify:competition` 6 个定向脚本全部通过。
+- 未执行：真实 CloudBase 多连接/部署、真实模型、浏览器自动化/手机实机、部署环境沙箱性能；未重启用户的 3000 / 5174。
+
+---
+
+## 第五十七阶段：源码复验交付准备（init-db 路径修复与误操作归因）
+
+日期：2026-10-26（本地隔离，未推送 / 未部署）
+
+### 一、`scripts/init-db.js` 显式路径修复
+
+- 显式设置 `DB_PATH` 时只使用该路径（`resolve` 后传入 `initDatabase`）；空字符串或仅空白直接失败并退出，
+  **不再静默回退 `DEFAULT_DB_PATH`**。未设置 `DB_PATH` 时保持原默认行为。
+- 新增 `scripts/verify-db-path.js`（`npm run verify:db-path`）：临时路径初始化成功且内容可读；
+  显式路径下默认库的存在性 / 大小 / mtime 完全不变；空值与空白值均被拒绝且默认库不变。
+
+### 二、误操作数据库归属（只读核对，保留现场）
+
+- 误操作数据库绝对路径：`C:\Users\HUAWEI123\Desktop\rongzhi-agent-cloudbase\backend\data\rongzhi.db`，
+  属 `feature/competition-requirements` 的 cloudbase worktree。
+- 3000 正在使用的数据库为另一文件：`C:\Users\HUAWEI123\Desktop\rongzhi-agent\backend\data\rongzhi.db`
+  （只读比对：3000 `/api/accounts` 返回 3 个账户及余额与 master 库完全一致；master 库 228 条流水、无本轮新增空表）。
+- 结论：两者不是同一文件；本轮误操作只在该 worktree 的开发库新增了两张空表（`security_scope_state`、
+  `audit_trace_failures`），未修改任何业务数据，也未触及 3000 正在使用的库。按要求未删除新增表、未回滚。
+
+### 三、验证
+
+- `npm run verify:db-path`：全部通过。
+- 本地 `verify-*.js` 合计 **45 / 45**。

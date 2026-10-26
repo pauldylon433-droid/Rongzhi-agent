@@ -73,6 +73,7 @@ try {
     'rongzhi_bank_repay_write_v1(bigint,text,jsonb)', 'rongzhi_bank_chat_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_verification_write_v1(bigint,text,jsonb)', 'rongzhi_bank_task_write_v1(bigint,text,jsonb)',
     'rongzhi_bank_audit_event_v1(bigint,text,jsonb)', 'rongzhi_bank_plan_write_v1(bigint,text,jsonb)',
+    'rongzhi_bank_security_write_v1(bigint,text,jsonb)', 'rongzhi_bank_audit_query_v1(bigint,text,jsonb)',
     'rongzhi_bank_seed_v1(bigint)',
   ]
   const sigs = fns.map((f) => f.sig.replace(/^public\./, ''))
@@ -129,6 +130,74 @@ try {
   await db.exec('RESET ROLE')
   await db.exec(`DROP TRIGGER __test_fail_audit ON public.rongzhi_bank_audit_logs;
     DROP FUNCTION public.__test_fail_audit(); SELECT set_config('test.fail_ref','',false);`)
+
+  // P1-09：审计查询按数据库条件过滤 / 分页，超过快照 2000 条的旧事件仍可按编号查到
+  await db.exec('RESET ROLE')
+  await db.query(`INSERT INTO public.rongzhi_bank_audit_events (event_id,user_id,request_id,category,action)
+                  VALUES ('old-marker',1,'req-marker','test','old_event')`)
+  await db.query(`INSERT INTO public.rongzhi_bank_audit_events (event_id,user_id,request_id,category,action)
+                  SELECT gen_random_uuid()::text || g, 1, 'req-flood', 'test', 'flood' FROM generate_series(1,2050) g`)
+  await db.exec('SET ROLE service_role')
+  const aqOld = (await one(`SELECT public.rongzhi_bank_audit_query_v1(1,'query',$1::jsonb) r`,
+    [JSON.stringify({ event_id: 'old-marker' })])).r
+  const aqFlood = (await one(`SELECT public.rongzhi_bank_audit_query_v1(1,'query',$1::jsonb) r`,
+    [JSON.stringify({ request_id: 'req-flood', limit: 5, offset: 0 })])).r
+  check('审计查询：超过 2000 条后仍可按 event_id 查到旧事件',
+    aqOld.total === 1 && aqOld.rows.length === 1 && aqOld.rows[0].event_id === 'old-marker', JSON.stringify(aqOld))
+  check('审计查询：按 request_id 过滤且分页正确（total=2050 / 返回 5）',
+    aqFlood.total === 2050 && aqFlood.rows.length === 5, JSON.stringify({ total: aqFlood.total, rows: aqFlood.rows.length }))
+
+  // P1-05：云端可疑锁定状态原子计数 / 到期判断（独立于审计列表）
+  const secRecord = async () => (await one(`SELECT public.rongzhi_bank_security_write_v1(1,'record',$1::jsonb) r`,
+    [JSON.stringify({ scope_key: 'ip-sql', kind: 'anomaly_test', window_ms: 60000, threshold: 2, lock_ms: 60000 })])).r
+  const s1 = await secRecord()
+  const s2 = await secRecord()
+  const sCheck = (await one(`SELECT public.rongzhi_bank_security_write_v1(1,'check',$1::jsonb) r`,
+    [JSON.stringify({ scope_key: 'ip-sql' })])).r
+  check('云端锁定：阈值内不锁定，达到阈值即锁定',
+    s1.locked === false && s1.count === 1 && s2.locked === true && s2.locked_until, JSON.stringify({ s1, s2 }))
+  check('云端锁定：check 在截止时间内返回禁止', sCheck.allowed === false && sCheck.locked_until, JSON.stringify(sCheck))
+  await db.exec('RESET ROLE')
+  await db.query(`UPDATE public.rongzhi_bank_security_scope_state SET locked_until_ms = 0, window_start_ms = 0 WHERE scope_key='ip-sql'`)
+  await db.exec('SET ROLE service_role')
+  const sAfter = (await one(`SELECT public.rongzhi_bank_security_write_v1(1,'check',$1::jsonb) r`,
+    [JSON.stringify({ scope_key: 'ip-sql' })])).r
+  check('云端锁定：到期后可恢复', sAfter.allowed === true, JSON.stringify(sAfter))
+
+  // P1-02：计划选择 / 生命周期变更在单事务内做版本 CAS + 建单 / 取消，失败不留孤单
+  {
+    const planNo = 'wf-sql-test-1'
+    const planJson = { plan_no: planNo, flow: 'subscription_review', status: 'waiting_selection',
+      params: { month: '2026-10' }, nodes: [], op_ref: null }
+    await db.exec('RESET ROLE')
+    const subRow = (await one(`SELECT id FROM public.rongzhi_bank_subscriptions WHERE user_id=1 AND status='active' ORDER BY id LIMIT 1`))
+    await db.exec('SET ROLE service_role')
+    await one(`SELECT public.rongzhi_bank_plan_write_v1(1,'create',$1::jsonb) r`,
+      [JSON.stringify({ plan_no: planNo, flow: 'subscription_review', status: 'waiting_selection', plan_json: planJson })])
+    const preview = { ...planJson, status: 'waiting_confirmation', op_ref: 'wf-sql-test-1-v0-sub',
+      nodes: [{ key: 'prepare_subscription', type: 'mutation', status: 'completed', depends_on: [],
+        result: { ref_no: 'wf-sql-test-1-v0-sub', status: 'pending' }, error: null }] }
+    const selPayload = { plan_no: planNo, base_version: 0, flow: 'subscription_review',
+      status: 'waiting_confirmation', plan_json: preview,
+      op_payload: { subscription_id: Number(subRow.id), action: 'pause', ref_no: 'wf-sql-test-1-v0-sub' } }
+    const sel1 = (await one(`SELECT public.rongzhi_bank_plan_write_v1(1,'select',$1::jsonb) r`, [JSON.stringify(selPayload)])).r
+    const sel2 = (await one(`SELECT public.rongzhi_bank_plan_write_v1(1,'select',$1::jsonb) r`, [JSON.stringify(selPayload)])).r
+    await db.exec('RESET ROLE')
+    const opCount = (await one(`SELECT count(*)::int n FROM public.rongzhi_bank_subscription_operations WHERE ref_no='wf-sql-test-1-v0-sub'`)).n
+    await db.exec('SET ROLE service_role')
+    check('云端计划：并发/重试选择由版本 CAS 拒绝，且只创建一个关联单',
+      sel1.version === 1 && sel2.conflict === true && opCount === 1, JSON.stringify({ sel1: sel1.version, sel2, opCount }))
+
+    const transPayload = { plan_no: planNo, base_version: 1, flow: 'subscription_review', status: 'paused',
+      plan_json: { ...preview, status: 'paused' }, completed_at: null, cancel_ref: 'wf-sql-test-1-v0-sub' }
+    const t1 = (await one(`SELECT public.rongzhi_bank_plan_write_v1(1,'transition',$1::jsonb) r`, [JSON.stringify(transPayload)])).r
+    const t2 = (await one(`SELECT public.rongzhi_bank_plan_write_v1(1,'transition',$1::jsonb) r`, [JSON.stringify(transPayload)])).r
+    await db.exec('RESET ROLE')
+    const opStatus = (await one(`SELECT status FROM public.rongzhi_bank_subscription_operations WHERE ref_no='wf-sql-test-1-v0-sub'`)).status
+    check('云端计划：生命周期变更与取消单同事务，重复请求因版本冲突被拒',
+      t1.version === 2 && t1.status === 'paused' && t2.conflict === true && opStatus === 'cancelled',
+      JSON.stringify({ t1: t1.version, t2, opStatus }))
+  }
 
   // anon / authenticated 不能执行 RPC 或访问业务表
   for (const role of ['anon', 'authenticated']) {

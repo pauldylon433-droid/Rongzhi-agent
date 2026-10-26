@@ -13,6 +13,7 @@ import AccountsView from './views/AccountsView.vue'
 import BillView from './views/BillView.vue'
 import CardsView from './views/CardsView.vue'
 import SubscriptionsView from './views/SubscriptionsView.vue'
+import PlansView from './views/PlansView.vue'
 import TasksView from './views/TasksView.vue'
 
 const { currentView } = useNavigation()
@@ -37,6 +38,7 @@ const viewMap = {
   bill: BillView,
   cards: CardsView,
   subscriptions: SubscriptionsView,
+  plans: PlansView,
   tasks: TasksView,
 }
 const currentComponent = computed(() => viewMap[currentView.value] || OverviewView)

@@ -55,4 +55,164 @@ CREATE TABLE IF NOT EXISTS public.rongzhi_bank_workflow_plans (
 CREATE INDEX IF NOT EXISTS rongzhi_bank_workflow_plans_user_idx ON public.rongzhi_bank_workflow_plans(user_id);
 CREATE INDEX IF NOT EXISTS rongzhi_bank_workflow_plans_status_idx ON public.rongzhi_bank_workflow_plans(status);
 
+-- 可疑行为范围锁定状态：按 scope 独立计数 / 锁定 / 到期，与审计事件列表解耦。
+CREATE TABLE IF NOT EXISTS public.rongzhi_bank_security_scope_state (
+  scope_key       text NOT NULL,
+  kind            text NOT NULL,
+  window_start_ms bigint NOT NULL,
+  count           integer NOT NULL,
+  locked_until_ms bigint,
+  updated_at_ms   bigint NOT NULL,
+  PRIMARY KEY (scope_key, kind)
+);
+CREATE INDEX IF NOT EXISTS rongzhi_bank_security_scope_locked_idx
+  ON public.rongzhi_bank_security_scope_state(scope_key, locked_until_ms);
+
+CREATE OR REPLACE FUNCTION public.rongzhi_bank_security_write_v1(
+  p_user_id bigint, p_op text, p_payload jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_now_ms bigint := (extract(epoch from clock_timestamp()) * 1000)::bigint;
+  v_scope text;
+  v_kind text;
+  v_window bigint;
+  v_threshold integer;
+  v_lock bigint;
+  v_until bigint;
+  v_count integer;
+  v_any_until bigint;
+BEGIN
+  IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
+  p_payload := coalesce(p_payload, '{}'::jsonb);
+  v_scope := nullif(p_payload->>'scope_key','');
+  IF v_scope IS NULL OR length(v_scope) > 200 THEN RAISE EXCEPTION 'invalid scope_key' USING ERRCODE = '22023'; END IF;
+
+  IF p_op = 'check' THEN
+    SELECT max(locked_until_ms) INTO v_any_until FROM public.rongzhi_bank_security_scope_state WHERE scope_key = v_scope;
+    IF coalesce(v_any_until, 0) > v_now_ms THEN
+      RETURN jsonb_build_object('allowed', false,
+        'locked_until', to_char(to_timestamp(v_any_until / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'));
+    END IF;
+    RETURN jsonb_build_object('allowed', true);
+
+  ELSIF p_op = 'record' THEN
+    v_kind := nullif(p_payload->>'kind','');
+    IF v_kind IS NULL OR length(v_kind) > 60 THEN RAISE EXCEPTION 'invalid kind' USING ERRCODE = '22023'; END IF;
+    v_window := coalesce((p_payload->>'window_ms')::bigint, 300000);
+    v_threshold := coalesce((p_payload->>'threshold')::integer, 5);
+    v_lock := coalesce((p_payload->>'lock_ms')::bigint, 900000);
+    IF v_window <= 0 OR v_threshold <= 0 OR v_lock <= 0 THEN RAISE EXCEPTION 'invalid limits' USING ERRCODE = '22023'; END IF;
+
+    SELECT max(locked_until_ms) INTO v_any_until FROM public.rongzhi_bank_security_scope_state WHERE scope_key = v_scope;
+    IF coalesce(v_any_until, 0) > v_now_ms THEN
+      RETURN jsonb_build_object('locked', true, 'count', v_threshold,
+        'locked_until', to_char(to_timestamp(v_any_until / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'));
+    END IF;
+
+    INSERT INTO public.rongzhi_bank_security_scope_state
+      (scope_key, kind, window_start_ms, count, locked_until_ms, updated_at_ms)
+    VALUES (v_scope, v_kind, v_now_ms, 1, CASE WHEN v_threshold <= 1 THEN v_now_ms + v_lock ELSE NULL END, v_now_ms)
+    ON CONFLICT (scope_key, kind) DO UPDATE SET
+      window_start_ms = CASE
+        WHEN (rongzhi_bank_security_scope_state.locked_until_ms IS NOT NULL
+              AND rongzhi_bank_security_scope_state.locked_until_ms <= v_now_ms)
+          OR (v_now_ms - rongzhi_bank_security_scope_state.window_start_ms >= v_window)
+        THEN v_now_ms ELSE rongzhi_bank_security_scope_state.window_start_ms END,
+      count = CASE
+        WHEN (rongzhi_bank_security_scope_state.locked_until_ms IS NOT NULL
+              AND rongzhi_bank_security_scope_state.locked_until_ms <= v_now_ms)
+          OR (v_now_ms - rongzhi_bank_security_scope_state.window_start_ms >= v_window)
+        THEN 1 ELSE rongzhi_bank_security_scope_state.count + 1 END,
+      locked_until_ms = CASE
+        WHEN (CASE
+          WHEN (rongzhi_bank_security_scope_state.locked_until_ms IS NOT NULL
+                AND rongzhi_bank_security_scope_state.locked_until_ms <= v_now_ms)
+            OR (v_now_ms - rongzhi_bank_security_scope_state.window_start_ms >= v_window)
+          THEN 1 ELSE rongzhi_bank_security_scope_state.count + 1 END) >= v_threshold
+        THEN v_now_ms + v_lock ELSE NULL END,
+      updated_at_ms = v_now_ms
+    RETURNING count, locked_until_ms INTO v_count, v_until;
+
+    RETURN jsonb_build_object('locked', coalesce(v_until, 0) > v_now_ms, 'count', v_count,
+      'locked_until', CASE WHEN coalesce(v_until, 0) > v_now_ms
+        THEN to_char(to_timestamp(v_until / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') ELSE NULL END);
+  END IF;
+  RAISE EXCEPTION 'unsupported_operation' USING ERRCODE = '22023';
+END;
+$$;
+
+-- 审计查询：按数据库条件过滤 / 分页，不依赖快照最近 N 条。
+CREATE OR REPLACE FUNCTION public.rongzhi_bank_audit_query_v1(
+  p_user_id bigint, p_op text, p_payload jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_limit integer;
+  v_offset integer;
+  v_rows jsonb;
+  v_total bigint;
+  v_event_id text;
+  v_request_id text;
+  v_session_id text;
+  v_plan_id text;
+  v_operation_ref text;
+  v_tool_call_id text;
+  v_category text;
+  v_result text;
+BEGIN
+  IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
+  IF p_op <> 'query' THEN RAISE EXCEPTION 'unsupported_operation' USING ERRCODE = '22023'; END IF;
+  p_payload := coalesce(p_payload, '{}'::jsonb);
+  v_limit := least(greatest(coalesce((p_payload->>'limit')::integer, 100), 1), 500);
+  v_offset := greatest(coalesce((p_payload->>'offset')::integer, 0), 0);
+  v_event_id := nullif(p_payload->>'event_id','');
+  v_request_id := nullif(p_payload->>'request_id','');
+  v_session_id := nullif(p_payload->>'session_id','');
+  v_plan_id := nullif(p_payload->>'plan_id','');
+  v_operation_ref := nullif(p_payload->>'operation_ref','');
+  v_tool_call_id := nullif(p_payload->>'tool_call_id','');
+  v_category := nullif(p_payload->>'category','');
+  v_result := nullif(p_payload->>'status','');
+
+  SELECT count(*) INTO v_total FROM public.rongzhi_bank_audit_events e
+   WHERE e.user_id = p_user_id
+     AND (v_event_id IS NULL OR e.event_id = v_event_id)
+     AND (v_request_id IS NULL OR e.request_id = v_request_id)
+     AND (v_session_id IS NULL OR e.session_id = v_session_id)
+     AND (v_plan_id IS NULL OR e.plan_id = v_plan_id)
+     AND (v_operation_ref IS NULL OR e.operation_ref = v_operation_ref)
+     AND (v_tool_call_id IS NULL OR e.tool_call_id = v_tool_call_id)
+     AND (v_category IS NULL OR e.category = v_category)
+     AND (v_result IS NULL OR e.result = v_result);
+
+  SELECT jsonb_agg(to_jsonb(x) ORDER BY x.id DESC) INTO v_rows FROM (
+    SELECT * FROM public.rongzhi_bank_audit_events e
+     WHERE e.user_id = p_user_id
+       AND (v_event_id IS NULL OR e.event_id = v_event_id)
+       AND (v_request_id IS NULL OR e.request_id = v_request_id)
+       AND (v_session_id IS NULL OR e.session_id = v_session_id)
+       AND (v_plan_id IS NULL OR e.plan_id = v_plan_id)
+       AND (v_operation_ref IS NULL OR e.operation_ref = v_operation_ref)
+       AND (v_tool_call_id IS NULL OR e.tool_call_id = v_tool_call_id)
+       AND (v_category IS NULL OR e.category = v_category)
+       AND (v_result IS NULL OR e.result = v_result)
+     ORDER BY id DESC
+     LIMIT v_limit OFFSET v_offset
+  ) x;
+
+  RETURN jsonb_build_object('rows', coalesce(v_rows, '[]'::jsonb), 'total', v_total);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.rongzhi_bank_audit_query_v1(bigint,text,jsonb) FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.rongzhi_bank_audit_query_v1(bigint,text,jsonb) TO service_role;
+REVOKE ALL ON FUNCTION public.rongzhi_bank_security_write_v1(bigint,text,jsonb) FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.rongzhi_bank_security_write_v1(bigint,text,jsonb) TO service_role;
+REVOKE ALL ON TABLE public.rongzhi_bank_security_scope_state FROM PUBLIC, anon, authenticated, service_role;
+
 COMMIT;

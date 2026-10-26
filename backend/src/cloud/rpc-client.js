@@ -93,10 +93,14 @@ export function createCloudRpcClient({ base, serviceKey, fetchImpl = fetch }) {
         task: 'rongzhi_bank_task_write_v1',
         audit: 'rongzhi_bank_audit_event_v1',
         plan: 'rongzhi_bank_plan_write_v1',
+        security: 'rongzhi_bank_security_write_v1',
       }[domain]
       if (!fn) throw new Error('不支持的云写入域')
       return call(fn, { p_user_id: userId, p_op: op, p_payload: payload || {} })
     },
+    queryAudit: (filters = {}, userId) => call('rongzhi_bank_audit_query_v1', {
+      p_user_id: userId, p_op: 'query', p_payload: filters || {},
+    }),
     seed: (userId) => call('rongzhi_bank_seed_v1', { p_user_id: userId }),
   }
 }

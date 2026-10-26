@@ -106,7 +106,8 @@ const demoUserId = u1
   const assistant = createAssistant({ db, demoUserId, chatFn: mock })
   const r = await assistant.chat({ message: '给李雷转100元，备注还饭钱' })
 
-  check('B.1 最终回复正确', r.reply === '已生成待确认转账单，请在下方确认。', r.reply)
+  // 事实保护：模型草稿中的业务声明行由服务端权威回执替换（不再原样返回模型文案）。
+  check('B.1 最终回复为服务端权威回执', r.reply === '该笔转账待确认（尚未扣款）。', r.reply)
   const searchRec = r.toolRecords.find((t) => t.name === 'search_transfer_recipients')
   const prepRec = r.toolRecords.find((t) => t.name === 'prepare_transfer')
   check('B.2 搜索与生成草稿均成功', searchRec?.status === 'ok' && prepRec?.status === 'ok')

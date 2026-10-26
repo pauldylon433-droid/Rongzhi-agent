@@ -70,8 +70,41 @@
 
 1. **真实 CloudBase 部署与真实多连接并发未执行**；三项竞态测试记 SKIP，不以单连接 PGlite 冒充。
 2. **真实模型未调用**；AI 行为仅用 mock 模型验证工具循环、注入拒绝与回执替换；真实模型抗注入需后续受控验证。
-3. **代码沙箱是 QuickJS WebAssembly 隔离**，不是 OS 容器 / Docker。它无网络、无文件系统、无 Node 宿主绑定，有内存 / 栈 / 时间 / 输出限制，并已实际跑通越权与资源耗尽测试；如赛题强制要求独立 OS 容器，需在部署环境补 Docker / Firecracker 级隔离。
-4. **新通用 DAG 计划暂无专用前端页面**：后端 API、AI 工具、订阅 / 还款操作单确认卡与现有任务 UI 可用；新计划卡的可视化入口尚未接入前端。现有「订阅审查」旧任务 UI 保持可用。
+3. **代码沙箱是专用 Worker 线程中的 QuickJS WebAssembly 隔离**，不是 OS 容器 / Docker。它无网络、无文件系统、无 Node 宿主绑定，有内存 / 栈 / 时间 / 输出限制，父线程可独立超时终止，并已实际跑通越权、资源耗尽、输出伪造与事件循环不阻塞测试；目标部署环境（CloudBase / Render）中的实际表现尚未实测。如赛题强制要求独立 OS 容器，需在部署环境补 Docker / Firecracker 级隔离。
+4. **「计划任务」页面已接入新版受约束 DAG 计划**（创建 / 选择 / 暂停 / 继续 / 取消 / 修改 / 重试 / 转人工 / 操作单确认卡），与旧「最近任务」入口分开；浏览器交互与手机布局尚未做自动化验收（本机无浏览器驱动，且未重启用户正在运行的 3000 / 5174 服务）。
 5. Dockerfile 已完成但本机无 Docker，未实际构建镜像。
 6. 浏览器交互未做自动化；本地 SQLite 与 CloudBase 的部分真实网关 / 令牌行为未验证。
 7. 本地与远端 main 不同，且远端网络不可达；未确认公网部署提交，未推送。
+
+## 统一修正单追踪（2026-10-26 第二轮复核）
+
+复核单：`融智Agent统一修正单与复现证据.zip / 统一修正单.txt`（11 项）。
+本轮在 `feature/competition-requirements` 独立分支实施；未推送、未部署、未执行云端 SQL、未调用收费模型。
+
+| 编号 | 实现位置 | 回归证据（实际执行） | 状态 |
+| ---- | ---- | ---- | ---- |
+| P1-01 业务事实保护 | `services/fact-guard.js`、`services/assistant.js`、`cloud/assistant.js` | `verify-authoritative-receipts.js`：R1 同状态陈旧回执、R2/R12 无依据成功声明、金额/流水号冲突、多对象保留解释、查询失败降级、四类回执、会话持久化一致 | PASS（mock；真实模型行为未验证） |
+| P1-02 建单与计划 CAS 原子 | `services/workflow-plans.js`（`selectAtomic` / `saveAtomic`）、`cloudbase/sql/002_functions_v1.sql`（plan select/transition）、确定性 op 编号 | `verify-workflows.js` 并发选择仅 1 单、审计失败无孤单；`cloud/verify-sql.js` 云端版本 CAS + 同事务取消；`verify-workflow-api.js` 修改旧单失效 | PASS（本地 SQLite + PGlite）；真实多连接未执行 |
+| P1-03 DAG 依赖与完成语义 | `workflow-plans.js` `validateSteps`（依赖必须与模板完全一致）、`refreshReadonly`（失败/查询时间）、`reconcile`（先确认后核验、完成需全部节点完成） | `verify-workflows.js`：删边/反向/重复/额外字段拒绝、只读失败阻断、查询错误显式返回、R14 全部节点 completed | PASS |
+| P1-04 计划参数严格校验 | `workflow-plans.js` `validateParams`（create/select/modify 共用）、`routes/workflows.js` | `verify-workflows.js`：非法枚举（R13）、额外字段、非法类型、非正整数、非法月份全部拒绝且无操作单副作用；HTTP 400 | PASS |
+| P1-05 可疑锁定独立持久状态 | `services/security-guard.js`、`db/schema.js`、`cloudbase/sql/001/002/010`、`routes/security.js`、`index.js`（TRUST_PROXY） | `verify-security-controls.js`：501/600 条跨 scope 洪泛不解锁（R5）、重启仍锁定、存储故障不静默放行；`cloud/verify-sql.js` 云端原子计数/到期 | PASS（本地 + PGlite）；真实多实例未执行 |
+| P1-06 /workflows 挂载顺序 | `routes/cloud.js` | `cloud/verify-assistant.js`：锁定 IP 访问 /workflows 返回 423 且带请求号（R9/R10）；未锁定 IP 进入业务路由 | PASS |
+| P1-07 沙箱执行隔离 | `services/sandbox.js`（Worker + 并发/队列/父线程超时）、`sandbox-core.js`、`sandbox-worker.js` | `verify-sandbox.js`：死循环期间主线程定时器 20ms 触发（R6）、父线程 terminate、内存/输出/代码上限 | PASS（本机）；部署环境未实测 |
+| P2-08 沙箱结果校验 | `services/sandbox.js` `validateAnalysisResult` + 独立复算 | `verify-sandbox.js`：伪造合计/额外指令字段（R7）、负数、分类不闭合、非整数类型全部拒绝 | PASS |
+| P1-09 审计完整性与脱敏 | `services/audit-trail.js`（自由文本清理/失败补偿）、`routes/audit.js`（重试 + 失败记录）、`workflow-plans.js`（request_id 贯穿）、`cloudbase/sql/002/010` audit query RPC | `verify-audit.js`：R8 虚构 Key/密码/Bearer 清理、event_id 查询、失败重试记录；`cloud/verify-sql.js`：超过 2000 条仍按 event_id 查到；`verify-workflow-api.js`：计划事件 request_id 串起操作单 | PASS |
+| P1-10 计划前端入口 | `frontend/src/views/PlansView.vue`、`api/index.js`、`App.vue`、`NavSidebar.vue`、`AppIcon.vue` | `npm run build` 通过；`verify-workflow-api.js` 覆盖页面所用 HTTP 契约（创建/选择/修改/暂停/继续/取消/重试/转人工/还款强验证/刷新恢复） | PASS（构建 + API 契约）；浏览器/手机布局未自动化 |
+| P2-11 本地模型熔断 | `routes/assistant.js`（与云端共用 `createModelBreaker`）、`services/assistant.js`（breaker 错误映射） | `verify-security-controls.js`：阈值前 502、达阈值起 503、冷却后恢复且提供方调用次数不增加；配额/并发护栏位于熔断之外 | PASS |
+
+### 本轮验证汇总（实际执行）
+
+- 本地 SQLite `verify-*.js`：**45 / 45**（原 43 + `verify-workflow-api.js` + `verify-db-path.js`）。
+- 前端 `npm run build`：通过（`index-BNKePsq-.css` / `index-Dg0Ezgg1.js`）。
+- CloudBase 本地：SQL 35 PASS；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 / DAG / 审计 / 安全 51 PASS（mock 模型）。
+- `npm run verify:competition`：6 个定向脚本全部通过。
+- 未执行：真实 CloudBase 多连接与部署、真实模型、浏览器自动化 / 手机布局实机验收、目标部署环境沙箱性能。
+
+### 保持的边界
+
+- 未修改开发库业务数据、真实密钥或强验证绑定；测试均使用独立临时库 / 内存库 / PGlite。
+- 未重启或终止用户正在运行的 3000 / 5174 进程；本地后端需重启后才会加载新路由与前端构建。
+- 未推送 Git、未部署、未执行云端 SQL、未调用收费模型。

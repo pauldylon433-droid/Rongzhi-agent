@@ -17,14 +17,15 @@ import { createAuditRouter, auditRequestMiddleware } from './audit.js'
 import { createAuditTrail } from '../services/audit-trail.js'
 import { createWorkflowsRouter } from './workflows.js'
 import { createWorkflowService, createLocalWorkflowOps, createLocalWorkflowStore } from '../services/workflow-plans.js'
-import { createSecurityGuard } from '../services/security-guard.js'
+import { createSecurityGuard, createLocalSecurityState } from '../services/security-guard.js'
 import { securityGuardMiddleware } from './security.js'
 
 export function createApiRouter(db, demoUserId, auditTrail = createAuditTrail(db)) {
   const router = Router()
+  const securityState = createLocalSecurityState(db)
   router.use(auditRequestMiddleware(auditTrail))
   router.use(securityGuardMiddleware((scope) => createSecurityGuard({
-    auditTrail, listEvents: (filters) => auditTrail.list(filters), scopeKey: scope,
+    stateStore: securityState, auditTrail, scopeKey: scope,
   })))
   router.use('/accounts', createAccountsRouter(db, demoUserId))
   router.use('/transactions', createTransactionsRouter(db, demoUserId))

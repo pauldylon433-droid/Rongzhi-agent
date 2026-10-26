@@ -9,6 +9,7 @@ import { migrate } from '../src/db/migrate.js'
 import { createAssistant } from '../src/services/assistant.js'
 import { createCardOperation, confirmCardOperation } from '../src/services/card-operations.js'
 import { createSubscriptionOperation, confirmSubscriptionOperation } from '../src/services/subscription-operations.js'
+import { applyFactGuard } from '../src/services/fact-guard.js'
 
 const DB_PATH = join(tmpdir(), 'rongzhi-receipts-test.db')
 for (const p of [DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm']) {
@@ -80,6 +81,58 @@ try {
   check('订阅操作：模型草稿被服务端完成状态替换', /订阅暂停操作已完成/.test(subRes.reply) && !/待确认/.test(subRes.reply), subRes.reply)
   const subVisible = db.prepare("SELECT text FROM chat_messages WHERE session_id='sess-sub' AND role='assistant' ORDER BY id DESC LIMIT 1").get()
   check('订阅操作：持久化回复与返回内容一致', subVisible && subVisible.text === subRes.reply)
+
+  // —— P1-01：相同状态下的冲突 / 无依据成功声明 / 金额与流水号冲突 / 多对象 / 查询失败 ——
+  const completedTransfer = { kind: 'transfer', ref_no: 't1', status: 'completed', amount_cents: 100, transaction_id: 59 }
+  // R1：数据库 completed，模型仍说「待确认」
+  const g1 = applyFactGuard('该笔转账仍待确认，尚未扣款。', [completedTransfer])
+  check('事实保护 R1：相同状态下的陈旧「待确认」被权威回执替换',
+    /已完成/.test(g1.reply) && !/待确认/.test(g1.reply), g1.reply)
+  // R2 / R12：没有调用任何工具却声称成功
+  const g2 = applyFactGuard('已扣款 888 元，流水编号 FAKE-123。', [])
+  check('事实保护 R2/R12：无单据依据的成功声明被拒绝',
+    !/888|FAKE-123/.test(g2.reply) && /无法依据当前服务端数据确认/.test(g2.reply), g2.reply)
+  // 金额 / 流水号冲突：行内声称错误金额与编号 → 整行替换为权威回执
+  const g3 = applyFactGuard('该笔转账已完成，金额 888.00 元，流水编号 FAKE-999。', [completedTransfer])
+  check('事实保护：金额 / 流水号冲突被权威回执替换',
+    /1\.00 元/.test(g3.reply) && !/888|FAKE-999/.test(g3.reply)
+    && g3.reason === 'claim_fact_conflict', JSON.stringify({ reply: g3.reply, reason: g3.reason, conflicts: g3.conflicts }))
+  // 多对象 / 旧单：只替换声明行，保留无关解释
+  const g4 = applyFactGuard('已扣款。\n注意：以上仅为状态说明，不涉及其他账户。', [
+    completedTransfer,
+    { kind: 'subscription', ref_no: 's1', status: 'pending', action: 'pause', amount_cents: 1500, merchant: '测试会员' },
+  ])
+  check('事实保护：多对象回执 + 保留解释行',
+    /该笔转账已完成/.test(g4.reply) && /该订阅暂停操作待确认/.test(g4.reply)
+    && /不涉及其他账户/.test(g4.reply), g4.reply)
+  // 查询失败：明确降级，不返回确定性成功
+  const g5 = applyFactGuard('已扣款 100.00 元。', [], { queryFailed: true })
+  check('事实保护：查询失败明确降级为未核验',
+    !/已扣款/.test(g5.reply) && /查询失败|尚未核验/.test(g5.reply), g5.reply)
+  // 无业务声明：不改写
+  const g6 = applyFactGuard('这是关于转账流程的普通解释，不涉及具体操作单。', [])
+  check('事实保护：无业务声明不改写普通回答', g6.changed === false)
+
+  // 四类操作事实输出均使用结构化回执
+  const kinds = applyFactGuard('已执行。', [
+    completedTransfer,
+    { kind: 'repayment', ref_no: 'r1', status: 'completed', amount_cents: 5000, statement_month: '2026-10' },
+    { kind: 'card', ref_no: 'c1', status: 'completed', action: 'freeze' },
+    { kind: 'subscription', ref_no: 's1', status: 'cancelled', action: 'cancel' },
+  ])
+  check('事实保护：四类操作均输出结构化权威回执',
+    /该笔转账已完成/.test(kinds.reply) && /该笔信用卡还款已完成/.test(kinds.reply)
+    && /该银行卡冻结操作已完成/.test(kinds.reply) && /该订阅取消操作已取消/.test(kinds.reply), kinds.reply)
+
+  // 会话层面：模型无视工具直接声称成功 → 返回拒绝文案并持久化一致
+  const unsupported = async () => ({ content: '已扣款 888 元，流水编号 FAKE-999。', toolCalls: [], usage: { total_tokens: 1 } })
+  const ua = createAssistant({ db, demoUserId: userId, chatFn: unsupported })
+  const ur = await ua.chat({ message: '刚才那笔转账到账了吗？' })
+  const uPersist = db.prepare('SELECT text FROM chat_messages WHERE session_id = ? AND role = ? ORDER BY id DESC LIMIT 1')
+    .get(ur.sessionId, 'assistant')
+  check('事实保护：会话层拒绝无依据成功声明并持久化同一文案',
+    !/888|FAKE-999/.test(ur.reply) && /无法依据/.test(ur.reply)
+    && uPersist && uPersist.text === ur.reply, ur.reply)
 } catch (e) {
   failures += 1
   console.error('RECEIPT TEST ERROR:', e.stack || e.message)

@@ -33,6 +33,7 @@ import { runSandboxedAnalysis } from './sandbox.js'
 import { detectCredential, scrubMessagesForModel, CREDENTIAL_REJECTION_MESSAGE } from './credential-guard.js'
 import { createAuditTrail, newRequestId } from './audit-trail.js'
 import { createWorkflowService, createLocalWorkflowOps, createLocalWorkflowStore } from './workflow-plans.js'
+import { applyFactGuard, refsFromToolRecords, refsFromMessages } from './fact-guard.js'
 
 export const MAX_MODEL_CALLS = 4 // 每条用户消息最多 4 轮模型请求
 export const MAX_TOOL_CALLS = 6 // 每条用户消息最多 6 次工具执行
@@ -853,7 +854,8 @@ async function executeTool(db, demoUserId, name, args, ctx) {
     const extra = Object.keys(args).filter((k) => !['flow', 'params', 'steps'].includes(k))
     if (extra.length) throw new ToolError(`plan_workflow 不接受额外参数：${extra.join('、')}`)
     try {
-      return await ctx.workflow.create({ flow: args.flow, params: args.params || {}, steps: args.steps })
+      return await ctx.workflow.create({ flow: args.flow, params: args.params || {}, steps: args.steps },
+        { requestId: ctx.requestId || null, sessionId: ctx.session?.id || null })
     } catch (e) {
       throw new ToolError(`计划创建失败：${e.message}`)
     }
@@ -1276,6 +1278,12 @@ async function runLoop(messages, db, demoUserId, chatFn, ctx) {
     try {
       r = await chatFn({ messages, tools: TOOL_DEFS, maxTokens: REPLY_MAX_TOKENS })
     } catch (e) {
+      if (e && e.code === 'model_breaker') {
+        // 真正的模型提供方故障（熔断打开）：由路由返回 503，不混同为业务错误。
+        const ae = new AssistantError('模型服务暂时熔断，请稍后重试', 'breaker')
+        ae.retry_after_ms = e.retry_after_ms
+        throw ae
+      }
       if (e instanceof AiError) {
         // 公网护栏的配额 / 并发限制转为明确错误码，由路由返回 429；其余模型错误保持原处理
         const code = e.kind === 'quota' || e.kind === 'concurrency' ? 'ai_quota' : 'model'
@@ -1370,6 +1378,39 @@ async function runLoop(messages, db, demoUserId, chatFn, ctx) {
   messages.push({ role: 'assistant', content: finalReply })
 
   return { finalReply, toolRecords, incomplete, usage }
+}
+
+// 只按本轮 / 会话明确引用的操作单构造事实，不扫描全部历史。
+export function collectLocalFacts(db, userId, refs) {
+  const facts = new Map()
+  for (const ref of refs) {
+    if (typeof ref !== 'string' || !ref) continue
+    const t = db.prepare('SELECT * FROM transfer_operations WHERE ref_no = ? AND user_id = ?').get(ref, userId)
+    if (t) {
+      const v = viewTransfer(db, t)
+      facts.set(`transfer:${ref}`, { kind: 'transfer', ref_no: ref, status: t.status, amount_cents: t.amount_cents,
+        transaction_id: v.transaction_id ?? null })
+      continue
+    }
+    const c = getCardOpRow(db, ref)
+    if (c && c.user_id === userId) {
+      facts.set(`card:${ref}`, { kind: 'card', ref_no: ref, status: c.status, action: c.action,
+        card_masked: c.card_masked })
+      continue
+    }
+    const sub = getSubscriptionOpRow(db, ref)
+    if (sub && sub.user_id === userId) {
+      facts.set(`subscription:${ref}`, { kind: 'subscription', ref_no: ref, status: sub.status, action: sub.action,
+        amount_cents: sub.amount_cents, merchant: sub.merchant })
+      continue
+    }
+    const r = getRepaymentOpRow(db, ref)
+    if (r && r.user_id === userId) {
+      facts.set(`repayment:${ref}`, { kind: 'repayment', ref_no: ref, status: r.status, action: 'repay',
+        amount_cents: r.amount_cents, statement_month: r.statement_month })
+    }
+  }
+  return [...facts.values()]
 }
 
 // 创建助手实例（会话持久化到 SQLite，刷新 / 后端重启可恢复当前对话）。chatFn 可注入以做单元测试（默认真实调用）。
@@ -1633,6 +1674,26 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, audi
         if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
       }
 
+      // 事实保护：只使用本轮工具 / 会话待确认引用 / 最近历史引用对应的服务端操作单；
+      // 声明与权威事实冲突时替换为确定性回执，无事实依据的成功声明直接拒绝。
+      const toolRefs = refsFromToolRecords(toolRecords)
+      const pendingRefs = new Set([session.pendingTransferRef, session.pendingCardOpRef,
+        session.pendingSubscriptionOpRef, session.pendingRepaymentRef].filter(Boolean))
+      const historyRefs = refsFromMessages(session.messages)
+      let factRefs
+      if (toolRefs.size) factRefs = toolRefs
+      else if (pendingRefs.size) factRefs = pendingRefs
+      else factRefs = new Set([...historyRefs].slice(-1))
+      const authoritativeFacts = collectLocalFacts(db, demoUserId, factRefs)
+      const statusToolFailed = toolRecords.some((t) => t.status === 'error'
+        && /_status$/.test(String(t.name || '')))
+      const guarded = applyFactGuard(reply, authoritativeFacts, { queryFailed: statusToolFailed })
+      if (guarded.changed) {
+        reply = guarded.reply
+        const lastMsg = messages[messages.length - 1]
+        if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
+      }
+
       // 保存本轮新增消息（去掉 system 与原有 history），再裁剪
       session.messages.push(...messages.slice(1 + history.length))
       session.messages = trimHistory(session.messages)
@@ -1661,6 +1722,8 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, audi
         incomplete,
         usage,
         request_id: requestId,
+        authoritative_facts: authoritativeFacts,
+        fact_guard: { changed: guarded.changed, reason: guarded.reason },
       }
     } finally {
       session.locked = false

@@ -223,7 +223,7 @@ export function finalizeSubscriptionOperation(db, userId, row, now, expectedStat
 // change_source（更换扣款账户，需 toAccountId）。服务端校验订阅归属与合法状态转换；
 // 风险级别由后端判定；cancelled 为终态不可再操作，未知状态拒绝。
 // 更换扣款账户不改变订阅状态、不扣款、不产生收支流水；仅冻结原/新来源快照与订阅版本。
-export function createSubscriptionOperation(db, userId, { subscriptionId, action, toAccountId }, now = new Date()) {
+export function createSubscriptionOperation(db, userId, { subscriptionId, action, toAccountId, refNo: providedRefNo = null }, now = new Date()) {
   if (!['pause', 'resume', 'cancel', 'change_source'].includes(action)) {
     throw new SubscriptionOpError('不支持的订阅操作（仅支持 pause / resume / cancel / change_source）', 'bad_action')
   }
@@ -289,7 +289,8 @@ export function createSubscriptionOperation(db, userId, { subscriptionId, action
   const isRed = action === 'resume' || action === 'change_source'
   const riskLevel = isRed ? 'red' : 'yellow'
   const status = isRed ? 'needs_verification' : 'pending'
-  const refNo = randomUUID()
+  // 计划建单传入「计划号 + 版本 + 步骤」确定性编号；独立接口仍用随机 UUID。
+  const refNo = typeof providedRefNo === 'string' && providedRefNo ? providedRefNo : randomUUID()
   const createdAt = now.toISOString()
   const expiresAt = new Date(now.getTime() + SUB_OP_EXPIRY_MS).toISOString()
 

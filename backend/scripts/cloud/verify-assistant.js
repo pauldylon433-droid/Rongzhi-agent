@@ -349,6 +349,11 @@ try {
     wj = await wx.json()
     check('DAG 计划：云端核验完成', wx.status === 200 && wj.data.status === 'completed',
       JSON.stringify(wj.data?.status))
+    const planAudit = await client.queryAudit({ plan_id: planNo }, 1)
+    check('云审计：计划事件带 request_id，可串起创建 / 选择 / 完成（R11）',
+      planAudit.rows.length >= 3 && planAudit.rows.every((e) => e.request_id)
+      && planAudit.rows.some((e) => e.action === 'create') && planAudit.rows.some((e) => e.action === 'select'),
+      JSON.stringify(planAudit.rows.map((e) => [e.action, e.request_id, e.operation_ref])))
   }
 
   // DAG 云端还款链：选择范围 / 付款账户 → 建单 → 取消（强验证另由本地链验证）
@@ -443,6 +448,21 @@ try {
       body: JSON.stringify(badBody),
     })
     check('云安全：其他 IP 不受影响', other.status === 400)
+
+    // P1-06：/workflows 与其它敏感写入口挂载在同一审计 / 锁定中间件之后
+    const wfLocked = await fetch(`${enabled.base}/api/workflows/wf-nonexistent/select`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '10.9.9.9' },
+      body: JSON.stringify({}),
+    })
+    check('云安全：锁定的 IP 访问 /workflows 同样返回 423 且带请求号（R9/R10）',
+      wfLocked.status === 423 && Boolean(wfLocked.headers.get('x-request-id')),
+      JSON.stringify({ status: wfLocked.status, requestId: wfLocked.headers.get('x-request-id') }))
+    const wfOther = await fetch(`${enabled.base}/api/workflows/wf-nonexistent/select`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '10.9.9.10' },
+      body: JSON.stringify({}),
+    })
+    check('云安全：未锁定 IP 的 /workflows 进入业务路由（404 而非绕过中间件）',
+      wfOther.status === 404 && Boolean(wfOther.headers.get('x-request-id')), `status=${wfOther.status}`)
   }
 
   // 审计时间线：受保护查询 + 关联编号

@@ -18,6 +18,7 @@ const NAV_ITEMS = [
   { key: 'bill', label: '月度账单', icon: 'bill' },
   { key: 'cards', label: '银行卡', icon: 'cards' },
   { key: 'subscriptions', label: '订阅与代扣', icon: 'subscriptions' },
+  { key: 'plans', label: '计划任务', icon: 'plan' },
   { key: 'tasks', label: '最近任务', icon: 'tasks' },
 ]
 

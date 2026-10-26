@@ -27,7 +27,7 @@ function requireAuditAccess(req, res, next) {
 
 function parseFilters(req) {
   const filters = {}
-  for (const key of ['request_id', 'session_id', 'plan_id', 'operation_ref', 'category', 'status']) {
+  for (const key of ['event_id', 'request_id', 'session_id', 'plan_id', 'operation_ref', 'tool_call_id', 'category', 'status']) {
     const v = req.query[key]
     if (v !== undefined) {
       if (typeof v !== 'string' || v.length > 120) return { error: `${key} 参数不合法` }
@@ -66,6 +66,21 @@ export function createAuditRouter(source) {
   return router
 }
 
+// 可恢复的请求追踪：失败重试一次；仍失败则写入可核查的失败记录（本地表 / 云端独立审计事件）。
+export async function recordTracedEvent(trail, event) {
+  let last = null
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try { await trail.record(event); return true } catch (e) { last = e }
+  }
+  try {
+    if (typeof trail.recordFailure === 'function') await trail.recordFailure(event, last, 2)
+  } catch (e) {
+    console.error('[审计] 请求追踪失败补偿记录也失败：', e && e.message ? e.message : e)
+  }
+  console.error('[审计] 请求追踪写入失败（重试 2 次）：', last && last.message ? last.message : last)
+  return false
+}
+
 // Express 中间件：为状态变更请求记录请求级审计；不读取 / 记录请求体中的凭据。
 export function auditRequestMiddleware(trail) {
   return (req, res, next) => {
@@ -79,7 +94,7 @@ export function auditRequestMiddleware(trail) {
     res.on('finish', () => {
       const sid = req.body && typeof req.body.sessionId === 'string' ? req.body.sessionId : null
       const opRef = req.params?.refNo || req.params?.taskNo || null
-      trail.record({
+      recordTracedEvent(trail, {
         request_id: id || null, session_id: sid, operation_ref: opRef,
         category: 'api', action: `${req.method} ${(req.baseUrl + req.path).replace(/\/+$/, '') || '/'}`,
         result: String(res.statusCode),

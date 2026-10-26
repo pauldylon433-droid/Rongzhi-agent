@@ -22,7 +22,9 @@
     "verify:sandbox": "node scripts/verify-sandbox.js",
     "verify:security": "node scripts/verify-security-controls.js",
     "verify:workflows": "node scripts/verify-workflows.js",
-    "verify:competition": "npm run verify:receipts && npm run verify:audit && npm run verify:sandbox && npm run verify:security && npm run verify:workflows"
+    "verify:competition": "npm run verify:receipts && npm run verify:audit && npm run verify:sandbox && npm run verify:security && npm run verify:workflows && npm run verify:workflows-api",
+    "verify:workflows-api": "node scripts/verify-workflow-api.js",
+    "verify:db-path": "node scripts/verify-db-path.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

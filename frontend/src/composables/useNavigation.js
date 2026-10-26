@@ -1,7 +1,7 @@
 import { ref } from 'vue'
 
 // 页面导航单例：左侧导航、总览「展开工作区」、AI 工作区「返回总览」共用同一份当前视图状态。
-const VIEW_KEYS = ['overview', 'assistant', 'accounts', 'bill', 'cards', 'subscriptions', 'tasks']
+const VIEW_KEYS = ['overview', 'assistant', 'accounts', 'bill', 'cards', 'subscriptions', 'plans', 'tasks']
 
 const currentView = ref('overview')
 

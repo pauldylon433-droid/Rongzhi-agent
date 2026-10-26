@@ -144,7 +144,16 @@ if (dbMode === 'cloudbase') {
 }
 
 const app = express()
-app.set('trust proxy', 1) // Render 等反向代理下取真实客户端 IP（用于 AI 请求限流）
+// 代理来源必须显式配置：默认不信任 X-Forwarded-For（本机直连按 socket 地址）。
+// 反向代理部署（Render / CloudBase 网关）需设置 TRUST_PROXY=1，才能用于限流 / 可疑锁定 scope。
+const trustProxyRaw = String(process.env.TRUST_PROXY || '').trim()
+if (trustProxyRaw === '1' || trustProxyRaw.toLowerCase() === 'true') {
+  app.set('trust proxy', 1)
+} else if (/^\d+$/.test(trustProxyRaw)) {
+  app.set('trust proxy', Math.max(0, Number(trustProxyRaw)))
+} else {
+  app.set('trust proxy', false)
+}
 app.use(express.json())
 
 // 健康检查（公网访问口令例外；不泄露任何配置 / 环境变量）

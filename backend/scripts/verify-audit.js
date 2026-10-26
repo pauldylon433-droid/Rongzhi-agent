@@ -9,6 +9,7 @@ import { migrate } from '../src/db/migrate.js'
 import { createAssistant } from '../src/services/assistant.js'
 import { createAuditTrail } from '../src/services/audit-trail.js'
 import { createApiRouter } from '../src/routes/index.js'
+import { recordTracedEvent } from '../src/routes/audit.js'
 
 const DB_PATH = join(tmpdir(), 'rongzhi-audit-test.db')
 for (const p of [DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm']) { try { rmSync(p, { force: true }) } catch {} }
@@ -108,6 +109,39 @@ const op = createTransfer(db, userId, { recipientId: 1, amountCents: 1000, fromA
 confirmTransfer(db, userId, op.ref_no)
 const bizAudit = db.prepare("SELECT * FROM audit_logs WHERE operation_ref=? AND action='confirm'").get(op.ref_no)
 check('审计：成功确认写入业务原子审计', Boolean(bizAudit))
+
+// —— P1-09：自由文本脱敏、按编号查询旧事件、追踪写入失败的可核查补偿 ——
+{
+  const ev = await trail.record({
+    request_id: 'req-redaction', category: 'tool', action: 'test_redaction',
+    detail: {
+      args: { remark: 'API Key: sk-FAKE-REVIEW-SENTINEL' },
+      error: '交易密码是 FAKE-REVIEW-PASS',
+      note: 'Bearer abcdefghijklmnop',
+    },
+  })
+  const back = trail.list({ event_id: ev.event_id })[0]
+  const serialized = JSON.stringify(back.detail)
+  check('审计脱敏：自由文本中的虚构 API Key / 密码 / Bearer 被清理（R8）',
+    !serialized.includes('sk-FAKE') && !serialized.includes('FAKE-REVIEW-PASS')
+    && !serialized.includes('abcdefghijklmnop') && /REDACTED/.test(serialized), serialized)
+  check('审计查询：可按 event_id 精确读取（不依赖列表窗口）',
+    back && back.event_id === ev.event_id)
+  const byReq = trail.list({ request_id: 'req-redaction' })
+  check('审计查询：可按 request_id 串起请求', byReq.length === 1 && byReq[0].action === 'test_redaction')
+
+  let captured = null
+  const brokenTrail = {
+    async record() { throw new Error('injected_trace_write_failure') },
+    async recordFailure(event, error, attempts) { captured = { event, error, attempts } },
+  }
+  const okWrite = await recordTracedEvent(brokenTrail, {
+    request_id: 'req-fail', category: 'api', action: 'POST /api/test', result: '200', detail: {},
+  })
+  check('审计补偿：追踪写入失败重试后记录失败状态（不静默丢失）',
+    okWrite === false && captured && captured.attempts === 2
+    && /injected_trace_write_failure/.test(captured.error.message), JSON.stringify({ okWrite, attempts: captured?.attempts }))
+}
 
 db.close()
 console.log(`\n== 结构化审计验证：${failures === 0 ? '全部通过 ✅' : '存在失败 ❌'} ==`)

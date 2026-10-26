@@ -49,23 +49,30 @@ export function parseChatBody(body) {
   }
 }
 
-export function createAssistantRouter(db, demoUserId) {
+export function createAssistantRouter(db, demoUserId, { chatFn = chatCompletions } = {}) {
   const publicDemo = isPublicDemo()
   const publicCfg = getPublicDemoConfig()
   // 公网演示：AI 默认关闭；显式开启时所有模型调用（含工具循环）经过配额 / 并发护栏，
   // 并对 /chat 做按 IP 的请求限流。本地模式保持原行为（无限流、无配额）。
   let assistant
   let chatLimiter = null
+  // 本地与云端共用同一套模型熔断包装：只对真正的模型提供方故障计数。
+  // 配额 / 并发 / 限流拒绝在进入模型调用前发生，不会触发熔断。
+  const breaker = createModelBreaker({
+    threshold: Number(process.env.MODEL_BREAKER_THRESHOLD) > 0 ? Number(process.env.MODEL_BREAKER_THRESHOLD) : 3,
+    cooldownMs: Number(process.env.MODEL_BREAKER_COOLDOWN_MS) > 0 ? Number(process.env.MODEL_BREAKER_COOLDOWN_MS) : 60000,
+  })
+  const baseChatFn = (args) => breaker.call(chatFn, args)
   if (publicDemo && publicCfg.aiEnabled) {
     const guard = createAiGuard({
-      chatFn: chatCompletions,
+      chatFn: baseChatFn,
       dailyCallQuota: publicCfg.aiDailyCallQuota,
       maxConcurrency: publicCfg.aiMaxConcurrency,
     })
     assistant = createAssistant({ db, demoUserId, chatFn: guard.chatFn })
     chatLimiter = createRateLimiter({ windowMs: 60 * 1000, max: publicCfg.aiRateLimitPerMin })
   } else {
-    assistant = createAssistant({ db, demoUserId })
+    assistant = createAssistant({ db, demoUserId, chatFn: baseChatFn })
   }
   const router = Router()
 
@@ -116,6 +123,10 @@ export function createAssistantRouter(db, demoUserId) {
         if (e.code === 'model') {
           console.error('[助手] 模型调用失败（脱敏）：', e.message)
           return res.status(502).json({ success: false, message: '模型服务暂不可用，请稍后重试' })
+        }
+        if (e.code === 'breaker') {
+          if (e.retry_after_ms) res.set('Retry-After', String(Math.ceil(e.retry_after_ms / 1000)))
+          return res.status(503).json({ success: false, code: 'model_breaker', message: e.message })
         }
       }
       console.error('[助手] 未预期错误：', e && e.message ? e.message : e)

@@ -372,7 +372,7 @@ export function getRepaymentOpRow(db, refNo) {
 //   按「已出账优先、旧账期优先」分配；待入账占用不计入。未出账账单允许提前还款，
 //   冲抵写入该账单的 paid_cents，出账后保留（new_charges 不变、剩余 = 消费 − 已还）。
 // 恒为红色强验证；冻结期间允许还款：不校验信用账户 / 卡片状态，仅校验付款账户（活期、active、余额充足）。
-export function createRepaymentOperation(db, userId, { statementId, fromAccountId, sessionId = null, scope = 'statement', creditAccountId }, now = new Date()) {
+export function createRepaymentOperation(db, userId, { statementId, fromAccountId, sessionId = null, scope = 'statement', creditAccountId, refNo: providedRefNo = null }, now = new Date()) {
   if (scope !== 'statement' && scope !== 'all_posted') throw new CreditError('还款模式不合法', 'bad_scope')
   if (typeof fromAccountId !== 'number' || !Number.isSafeInteger(fromAccountId) || fromAccountId <= 0) {
     throw new CreditError('付款账户不合法', 'bad_account')
@@ -431,7 +431,8 @@ export function createRepaymentOperation(db, userId, { statementId, fromAccountI
   if (fromAcct.balance_cents < total) throw new CreditError('付款账户余额不足', 'insufficient_balance')
 
   const primary = allocations[0].statement
-  const refNo = randomUUID()
+  // 计划建单传入「计划号 + 版本 + 步骤」确定性编号；独立接口仍用随机 UUID。
+  const refNo = typeof providedRefNo === 'string' && providedRefNo ? providedRefNo : randomUUID()
   const createdAt = now.toISOString()
   const expiresAt = new Date(now.getTime() + REPAYMENT_EXPIRY_MS).toISOString()
   const statementMonth = `${String(primary.statement_year).padStart(4, '0')}-${String(primary.statement_month).padStart(2, '0')}`

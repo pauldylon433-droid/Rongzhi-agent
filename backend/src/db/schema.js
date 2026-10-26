@@ -120,6 +120,28 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_plan_id     ON audit_events(plan_id)
 CREATE INDEX IF NOT EXISTS idx_audit_events_operation   ON audit_events(operation_ref);
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at  ON audit_events(created_at);
 
+-- 可疑行为范围锁定的独立持久状态：按可信 scope 索引计数 / 锁定 / 到期，不依赖审计列表分页。
+CREATE TABLE IF NOT EXISTS security_scope_state (
+  scope_key       TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  window_start_ms INTEGER NOT NULL,
+  count           INTEGER NOT NULL,
+  locked_until_ms INTEGER,
+  updated_at_ms   INTEGER NOT NULL,
+  PRIMARY KEY (scope_key, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_security_scope_locked ON security_scope_state(scope_key, locked_until_ms);
+
+-- 请求追踪异步写入失败的可核查记录（不静默丢失）。
+CREATE TABLE IF NOT EXISTS audit_trace_failures (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id   TEXT,
+  payload_json TEXT,
+  error        TEXT,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 受约束 DAG 计划：白名单节点、依赖、参数、版本与进度全部持久化。
 CREATE TABLE IF NOT EXISTS workflow_plans (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -17,6 +17,7 @@ import { shanghaiMonthRange } from '../lib/shanghai.js'
 import { runSandboxedAnalysis } from '../services/sandbox.js'
 import { detectCredential, scrubMessagesForModel, CREDENTIAL_REJECTION_MESSAGE } from '../services/credential-guard.js'
 import { createCloudAuditTrail, newRequestId } from '../services/audit-trail.js'
+import { applyFactGuard, refsFromToolRecords, refsFromMessages } from '../services/fact-guard.js'
 import { createWorkflowService, createCloudWorkflowStore, createCloudWorkflowOps } from '../services/workflow-plans.js'
 
 function trimHistory(messages) {
@@ -218,7 +219,8 @@ async function executeTool(state, client, userId, name, args, ctx) {
     const extra = Object.keys(args).filter((k) => !['flow', 'params', 'steps'].includes(k))
     if (extra.length) throw new ToolError(`plan_workflow 不接受额外参数：${extra.join('、')}`)
     try {
-      return await ctx.workflow.create({ flow: args.flow, params: args.params || {}, steps: args.steps })
+      return await ctx.workflow.create({ flow: args.flow, params: args.params || {}, steps: args.steps },
+        { requestId: ctx.requestId || null, sessionId: ctx.session?.id || null })
     } catch (e) {
       throw new ToolError(`计划创建失败：${e.message}`)
     }
@@ -608,6 +610,30 @@ async function runLoop(messages, state, client, userId, chatFn, ctx) {
   return { finalReply, toolRecords, incomplete, usage }
 }
 
+export function collectCloudFacts(store, refs) {
+  const snap = store.snapshot || {}
+  const facts = new Map()
+  for (const ref of refs) {
+    if (typeof ref !== 'string' || !ref) continue
+    const t = (snap.transfer_operations || []).find((o) => o.ref_no === ref)
+    if (t) {
+      const v = store.transferOp(ref)
+      facts.set(`transfer:${ref}`, { kind: 'transfer', ref_no: ref, status: t.status, amount_cents: t.amount_cents,
+        transaction_id: v ? v.transaction_id ?? null : null })
+      continue
+    }
+    const c = (snap.card_operations || []).find((o) => o.ref_no === ref)
+    if (c) { facts.set(`card:${ref}`, { kind: 'card', ref_no: ref, status: c.status, action: c.action, card_masked: c.card_masked }); continue }
+    const sub = (snap.subscription_operations || []).find((o) => o.ref_no === ref)
+    if (sub) { facts.set(`subscription:${ref}`, { kind: 'subscription', ref_no: ref, status: sub.status, action: sub.action,
+      amount_cents: sub.amount_cents, merchant: sub.merchant }); continue }
+    const r = (snap.repayment_operations || []).find((o) => o.ref_no === ref)
+    if (r) { facts.set(`repayment:${ref}`, { kind: 'repayment', ref_no: ref, status: r.status, action: 'repay',
+      amount_cents: r.amount_cents, statement_month: r.statement_month }) }
+  }
+  return [...facts.values()]
+}
+
 export function createCloudAssistant({ client, userId, chatFn = chatCompletions, auditTrail = createCloudAuditTrail({ client, userId }), workflowService = null }) {
   const sessions = new Map()
   const load = () => loadCloudStore({ client, userId })
@@ -719,6 +745,24 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
         if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
       }
 
+      const toolRefs = refsFromToolRecords(toolRecords)
+      const pendingRefs = new Set([session.pendingTransferRef, session.pendingCardOpRef,
+        session.pendingSubscriptionOpRef, session.pendingRepaymentRef].filter(Boolean))
+      const historyRefs = refsFromMessages(session.messages)
+      let factRefs
+      if (toolRefs.size) factRefs = toolRefs
+      else if (pendingRefs.size) factRefs = pendingRefs
+      else factRefs = new Set([...historyRefs].slice(-1))
+      const authoritativeFacts = collectCloudFacts(state.store, factRefs)
+      const statusToolFailed = toolRecords.some((t) => t.status === 'error'
+        && /_status$/.test(String(t.name || '')))
+      const guarded = applyFactGuard(reply, authoritativeFacts, { queryFailed: statusToolFailed })
+      if (guarded.changed) {
+        reply = guarded.reply
+        const lastMsg = messages[messages.length - 1]
+        if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
+      }
+
       const newMessages = messages.slice(1 + history.length)
       session.messages.push(...newMessages)
       session.messages = trimHistory(session.messages)
@@ -757,7 +801,8 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
           tool_calls: toolRecords.length, tool_errors: toolRecords.filter((t) => t.status === 'error').length,
           intent: toolRecords.map((t) => t.name).join('>') || 'no_tool', incomplete },
       })
-      return { sessionId: session.id, reply, toolRecords, incomplete, usage, request_id: requestId }
+      return { sessionId: session.id, reply, toolRecords, incomplete, usage, request_id: requestId,
+        authoritative_facts: authoritativeFacts, fact_guard: { changed: guarded.changed, reason: guarded.reason } }
     } finally {
       session.locked = false
       session.lastActiveAt = Date.now()

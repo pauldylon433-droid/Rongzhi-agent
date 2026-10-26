@@ -6,7 +6,7 @@ import { loadCloudStore } from '../cloud/store.js'
 import { CloudRpcError } from '../cloud/rpc-client.js'
 import { verifyCredentialsCloud } from '../cloud/verification.js'
 import { createCloudAuditTrail } from '../services/audit-trail.js'
-import { createSecurityGuard, isSuspiciousError } from '../services/security-guard.js'
+import { createSecurityGuard, createCloudSecurityState, isSuspiciousError } from '../services/security-guard.js'
 import { createWorkflowsRouter } from './workflows.js'
 import { createWorkflowService, createCloudWorkflowStore, createCloudWorkflowOps } from '../services/workflow-plans.js'
 import { securityGuardMiddleware } from './security.js'
@@ -95,33 +95,19 @@ export function createCloudRouter({ client, demoUserId, assistant = null }) {
     store: createCloudWorkflowStore({ client, userId: demoUserId }),
     ops: createCloudWorkflowOps({ client, userId: demoUserId }), audit: auditTrail,
   })
-  router.use('/workflows', createWorkflowsRouter(workflowService))
-  const listAuditEvents = async (filters = {}) => {
-    const snap = await load()
-    let rows = (snap.snapshot.audit_events || []).slice()
-    if (filters.category) rows = rows.filter((r) => r.category === filters.category)
-    rows.sort((a, b) => Number(b.id) - Number(a.id))
-    return rows.slice(0, Math.min(Math.max(Number(filters.limit) || 100, 1), 500))
-  }
+  // 先请求上下文 / 审计、再安全检查、最后业务路由：/workflows 与其它敏感写入口保护一致。
+  const securityState = createCloudSecurityState({ client, userId: demoUserId })
   router.use(auditRequestMiddleware(auditTrail))
   router.use(securityGuardMiddleware((scope) => createSecurityGuard({
-    auditTrail, listEvents: listAuditEvents, scopeKey: scope,
+    stateStore: securityState, auditTrail, scopeKey: scope,
   })))
+  router.use('/workflows', createWorkflowsRouter(workflowService))
   const write = (domain, op, payload = {}) => client.write(domain, op, payload, demoUserId)
 
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 
-  // —— 受保护审计时间线（CloudBase 快照中的 audit_events）——
-  router.use('/audit', createAuditRouter(async (filters) => {
-    const snap = await load()
-    let rows = (snap.snapshot.audit_events || []).slice()
-    for (const key of ['request_id', 'session_id', 'plan_id', 'operation_ref', 'category']) {
-      if (filters[key]) rows = rows.filter((r) => r[key] === filters[key])
-    }
-    if (filters.status) rows = rows.filter((r) => String(r.result) === filters.status)
-    rows.sort((a, b) => Number(b.id) - Number(a.id))
-    return rows.slice(filters.offset || 0, (filters.offset || 0) + (filters.limit || 100))
-  }))
+  // —— 受保护审计时间线：按数据库条件过滤 / 分页（不依赖快照最近 2000 条）——
+  router.use('/audit', createAuditRouter((filters) => auditTrail.query(filters)))
 
   // —— 只读：账户 / 流水 / 银行卡 / 订阅 / 统计 ——
   router.get('/accounts', wrap(async (req, res) => {

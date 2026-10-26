@@ -6,6 +6,23 @@ import { createHash, randomUUID } from 'node:crypto'
 const SECRET_KEY = /(password|passwd|totp|secret|api[_-]?key|access[_-]?key|authorization|credential|salt|hash|token)/i
 const SENSITIVE_KEY = /(card_number|masked_card_number|account_number|id_card|phone|email)/i
 
+// 不依赖键名的自由文本脱敏：常见的密钥格式与「标签 = 值」写法直接替换。
+// 这不是「识别所有任意秘密」的承诺，只是对已知敏感模式的显式清理。
+const TEXT_PATTERNS = [
+  [/\bsk-[A-Za-z0-9_-]{6,}\b/g, '[REDACTED:api-key]'],
+  [/\b(?:AKIA|ASIA)[0-9A-Z]{12,}\b/g, '[REDACTED:access-key]'],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, '[REDACTED:token]'],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]'],
+  [/((?:api[ _-]?key|access[ _-]?key|secret|token|password|passwd|密码|口令|验证码|动态码|totp|种子)(?:[^\S\r\n]{0,6})(?::|：|=|是|为|is)(?:[^\S\r\n]{0,6}))([^\s,，;；。]{3,})/gi,
+    '$1[REDACTED]'],
+]
+
+export function scrubFreeText(text) {
+  let out = String(text)
+  for (const [re, replacement] of TEXT_PATTERNS) out = out.replace(re, replacement)
+  return out
+}
+
 function sanitizeValue(value, key = '', depth = 0) {
   if (depth > 4) return '[depth-limit]'
   if (value == null) return value
@@ -15,7 +32,8 @@ function sanitizeValue(value, key = '', depth = 0) {
       return `[sandbox-code sha256=${createHash('sha256').update(value).digest('hex')} chars=${value.length}]`
     }
     if (SENSITIVE_KEY.test(key)) return '[REDACTED]'
-    return value.length > 300 ? `${value.slice(0, 300)}…` : value
+    const scrubbed = scrubFreeText(value)
+    return scrubbed.length > 300 ? `${scrubbed.slice(0, 300)}…` : scrubbed
   }
   if (typeof value === 'number' || typeof value === 'boolean') return value
   if (Array.isArray(value)) return value.slice(0, 20).map((v) => sanitizeValue(v, key, depth + 1))
@@ -59,7 +77,20 @@ export function createAuditTrail(db) {
        category, action, result, risk_level, detail_json, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
+  const insertFailure = db.prepare(
+    `INSERT INTO audit_trace_failures (request_id, payload_json, error, attempts, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  )
   return {
+    // 异步请求追踪写入失败时的可核查补偿记录（本地库）。不改变业务事务。
+    async recordFailure(event, error, attempts = 1) {
+      const e = normalizeEvent(event && event.user_id, event || {})
+      insertFailure.run(
+        e.request_id || null, JSON.stringify(e, (k, v) => (k === 'detail' ? sanitizeDetail(v) : v)),
+        String(error && error.message ? error.message : error).slice(0, 500), attempts,
+        new Date().toISOString(),
+      )
+    },
     async record(event) {
       const e = normalizeEvent(event.user_id, event)
       const createdAt = new Date().toISOString()
@@ -69,9 +100,11 @@ export function createAuditTrail(db) {
       )
       return { ...e, created_at: createdAt }
     },
-    list({ request_id, session_id, plan_id, operation_ref, category, status, limit = 100, offset = 0 } = {}) {
+    list({ event_id, request_id, session_id, plan_id, operation_ref, tool_call_id, category, status, limit = 100, offset = 0 } = {}) {
       const where = []
       const params = []
+      if (event_id) { where.push('event_id = ?'); params.push(event_id) }
+      if (tool_call_id) { where.push('tool_call_id = ?'); params.push(tool_call_id) }
       if (request_id) { where.push('request_id = ?'); params.push(request_id) }
       if (session_id) { where.push('session_id = ?'); params.push(session_id) }
       if (plan_id) { where.push('plan_id = ?'); params.push(plan_id) }
@@ -94,9 +127,24 @@ export function createAuditTrail(db) {
   }
 }
 
-// CloudBase 实现：固定 RPC audit/event；读取由 snapshot 提供。
+// CloudBase 实现：固定 RPC audit/event；读取使用按条件的 audit/query RPC（不再依赖快照最近 2000 条）。
 export function createCloudAuditTrail({ client, userId }) {
   return {
+    async query(filters = {}) {
+      const r = await client.queryAudit(filters, userId)
+      return (r && Array.isArray(r.rows)) ? r.rows : []
+    },
+    // 云端没有独立的本地文件可写：补偿写入一条独立的追踪失败审计事件；
+    // 若审计通道本身不可用，只能记录脱敏日志（见调用方）。
+    async recordFailure(event, error, attempts = 1) {
+      const e = normalizeEvent(userId, event || {})
+      await client.write('audit', 'event', {
+        request_id: e.request_id, session_id: e.session_id,
+        category: 'audit_trace', action: 'write_failed', result: 'error',
+        detail: { attempts, error: String(error && error.message ? error.message : error).slice(0, 200),
+          original_action: e.action, original_category: e.category },
+      }, userId)
+    },
     async record(event) {
       const e = normalizeEvent(userId, event)
       await client.write('audit', 'event', {

@@ -338,3 +338,39 @@ export async function fetchActivity({ type, status, limit = 50, offset = 0 } = {
   const body = await request(`/api/activity?${params.toString()}`)
   return { rows: body.data, total: body.meta.total }
 }
+
+// —— 受约束 DAG 计划（新版计划任务；与旧「最近任务」列表分开）——
+
+export async function fetchWorkflowPlans(limit = 30) {
+  const body = await request(`/api/workflows?limit=${encodeURIComponent(limit)}`)
+  return body.data
+}
+
+export async function fetchWorkflowPlan(planNo) {
+  const body = await request(`/api/workflows/${encodeURIComponent(planNo)}`)
+  return body.data
+}
+
+export async function createWorkflowPlan({ flow, params, steps = null }) {
+  const payload = { flow, params }
+  if (steps !== null && steps !== undefined) payload.steps = steps
+  const body = await postJson('/api/workflows', payload)
+  return body.data
+}
+
+export async function selectWorkflowPlan(planNo, params) {
+  const body = await postJson(`/api/workflows/${encodeURIComponent(planNo)}/select`, params)
+  return body.data
+}
+
+export async function workflowPlanAction(planNo, action) {
+  const allowed = ['pause', 'resume', 'cancel', 'retry', 'manual']
+  if (!allowed.includes(action)) throw new Error('不支持的计划操作')
+  const body = await postJson(`/api/workflows/${encodeURIComponent(planNo)}/${action}`, {})
+  return body.data
+}
+
+export async function modifyWorkflowPlan(planNo, params) {
+  const body = await postJson(`/api/workflows/${encodeURIComponent(planNo)}/modify`, { params })
+  return body.data
+}
