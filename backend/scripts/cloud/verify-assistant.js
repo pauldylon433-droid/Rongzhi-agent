@@ -480,6 +480,24 @@ try {
   ax = await fetch(`${enabled.base}/api/audit/timeline`)
   check('云审计：未配置令牌时不暴露（404）', ax.status === 404)
 
+  // 事实块：云端助手同样不能用模型草稿展示未核验业务事实。
+  setScript(toolResp('get_accounts', {}), finalResp('您的账户余额为987654.32元。'))
+  const cf1 = await assistant.chat({ message: '查余额' })
+  check('云端事实块：错误余额被服务端账户块替换',
+    cf1.reply.includes('账户信息（服务端核验）') && !cf1.reply.includes('987654.32')
+      && (cf1.reply_blocks || []).some((b) => b.kind === 'accounts' && b.source?.call_id), cf1.reply)
+  setScript(finalResp('汇款已经办妥，600元资金已经到账。'))
+  const cf2 = await assistant.chat({ message: '给李雷转600元' })
+  check('云端事实块：无依据成功声明被拒绝原样展示',
+    /无法依据当前服务端数据确认/.test(cf2.reply) && !cf2.reply.includes('已经到账'), cf2.reply)
+  setScript(
+    toolResp('prepare_transfer', { recipient_id: 1, amount_yuan: '1', account_id: account1.id }),
+    finalResp('| 项目 | 内容 |\n|---|---|\n| 金额 | 888.00 元 |\n| 状态 | 待确认 |'),
+  )
+  const cf3 = await assistant.chat({ message: '给李雷转1元' })
+  check('云端事实块：错误表格金额被服务端操作单块替换',
+    cf3.reply.includes('转账操作单（服务端核验）') && cf3.reply.includes('1.00 元') && !cf3.reply.includes('888.00'), cf3.reply)
+
   await new Promise((res) => enabled.server.close(res))
 } catch (e) {
   fail++

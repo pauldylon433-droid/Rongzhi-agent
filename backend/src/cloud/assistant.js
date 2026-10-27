@@ -17,7 +17,7 @@ import { shanghaiMonthRange } from '../lib/shanghai.js'
 import { runSandboxedAnalysis } from '../services/sandbox.js'
 import { detectCredential, scrubMessagesForModel, CREDENTIAL_REJECTION_MESSAGE } from '../services/credential-guard.js'
 import { createCloudAuditTrail, newRequestId } from '../services/audit-trail.js'
-import { applyFactGuard, refsFromToolRecords, refsFromMessages } from '../services/fact-guard.js'
+import { applyFactGuard, buildReplyBlocks, refsFromToolRecords, refsFromMessages } from '../services/fact-guard.js'
 import { createWorkflowService, createCloudWorkflowStore, createCloudWorkflowOps } from '../services/workflow-plans.js'
 
 function trimHistory(messages) {
@@ -580,7 +580,7 @@ async function runLoop(messages, state, client, userId, chatFn, ctx) {
       try {
         args = parseToolArgs(call?.function?.arguments)
       } catch (e) {
-        toolRecords.push({ name, args: null, status: 'error', queryTime: new Date().toISOString(), error: e.message })
+        toolRecords.push({ name, call_id: id, args: null, status: 'error', queryTime: new Date().toISOString(), error: e.message })
         messages.push({ role: 'tool', tool_call_id: id, content: `错误：${e.message}` })
         if (ctx.audit) await ctx.audit.record({ request_id: ctx.requestId, session_id: ctx.session.id,
           tool_call_id: id, category: 'tool', action: name, result: 'error',
@@ -589,7 +589,7 @@ async function runLoop(messages, state, client, userId, chatFn, ctx) {
       }
       try {
         const data = await executeTool(state, client, userId, name, args, ctx)
-        toolRecords.push({ name, args, status: 'ok', queryTime: new Date().toISOString(), data })
+        toolRecords.push({ name, call_id: id, args, status: 'ok', queryTime: new Date().toISOString(), data })
         messages.push({ role: 'tool', tool_call_id: id, content: JSON.stringify(data) })
         if (ctx.audit) await ctx.audit.record({ request_id: ctx.requestId, session_id: ctx.session.id,
           tool_call_id: id, operation_ref: data?.ref_no || data?.task_no || data?.plan_no || null,
@@ -597,7 +597,7 @@ async function runLoop(messages, state, client, userId, chatFn, ctx) {
           detail: { args, operation_ref: data?.ref_no || data?.task_no || data?.plan_no || null, duration_ms: Date.now() - started } })
       } catch (e) {
         const msg = e instanceof ToolError ? e.message : '工具执行失败'
-        toolRecords.push({ name, args, status: 'error', queryTime: new Date().toISOString(), error: msg })
+        toolRecords.push({ name, call_id: id, args, status: 'error', queryTime: new Date().toISOString(), error: msg })
         messages.push({ role: 'tool', tool_call_id: id, content: `错误：${msg}` })
         if (ctx.audit) await ctx.audit.record({ request_id: ctx.requestId, session_id: ctx.session.id,
           tool_call_id: id, category: 'tool', action: name, result: 'error',
@@ -756,7 +756,14 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
       const authoritativeFacts = collectCloudFacts(state.store, factRefs)
       const statusToolFailed = toolRecords.some((t) => t.status === 'error'
         && /_status$/.test(String(t.name || '')))
-      const guarded = applyFactGuard(reply, authoritativeFacts, { queryFailed: statusToolFailed })
+      // 与本地助手同一套结构化块：只使用本轮工具结果 / 当前待确认单，业务事实由服务端渲染。
+      const blockFacts = authoritativeFacts.filter((f) => toolRefs.has(f.ref_no) || pendingRefs.has(f.ref_no))
+      const replyBlocks = buildReplyBlocks({ toolRecords, facts: blockFacts })
+      const guarded = applyFactGuard(reply, authoritativeFacts, {
+        blocks: replyBlocks,
+        queryFailed: statusToolFailed,
+        authoritative: authoritativeReplies.length > 0,
+      })
       if (guarded.changed) {
         reply = guarded.reply
         const lastMsg = messages[messages.length - 1]
@@ -802,7 +809,9 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
           intent: toolRecords.map((t) => t.name).join('>') || 'no_tool', incomplete },
       })
       return { sessionId: session.id, reply, toolRecords, incomplete, usage, request_id: requestId,
-        authoritative_facts: authoritativeFacts, fact_guard: { changed: guarded.changed, reason: guarded.reason } }
+        authoritative_facts: authoritativeFacts, reply_blocks: replyBlocks,
+        fact_guard: { changed: guarded.changed, reason: guarded.reason,
+          conflicts: guarded.conflicts || [], removed_lines: (guarded.removed || []).length } }
     } finally {
       session.locked = false
       session.lastActiveAt = Date.now()

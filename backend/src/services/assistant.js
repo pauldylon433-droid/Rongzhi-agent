@@ -33,7 +33,7 @@ import { runSandboxedAnalysis } from './sandbox.js'
 import { detectCredential, scrubMessagesForModel, CREDENTIAL_REJECTION_MESSAGE } from './credential-guard.js'
 import { createAuditTrail, newRequestId } from './audit-trail.js'
 import { createWorkflowService, createLocalWorkflowOps, createLocalWorkflowStore } from './workflow-plans.js'
-import { applyFactGuard, refsFromToolRecords, refsFromMessages } from './fact-guard.js'
+import { applyFactGuard, buildReplyBlocks, refsFromToolRecords, refsFromMessages } from './fact-guard.js'
 
 export const MAX_MODEL_CALLS = 4 // 每条用户消息最多 4 轮模型请求
 export const MAX_TOOL_CALLS = 6 // 每条用户消息最多 6 次工具执行
@@ -1329,6 +1329,7 @@ async function runLoop(messages, db, demoUserId, chatFn, ctx) {
       } catch (e) {
         toolRecords.push({
           name,
+          call_id: id,
           args: null,
           status: 'error',
           queryTime: new Date().toISOString(),
@@ -1347,7 +1348,7 @@ async function runLoop(messages, db, demoUserId, chatFn, ctx) {
 
       try {
         const data = await executeTool(db, demoUserId, name, args, ctx)
-        toolRecords.push({ name, args, status: 'ok', queryTime: new Date().toISOString(), data })
+        toolRecords.push({ name, call_id: id, args, status: 'ok', queryTime: new Date().toISOString(), data })
         messages.push({ role: 'tool', tool_call_id: id, content: JSON.stringify(data) })
         if (ctx.audit) {
           await ctx.audit.record({
@@ -1360,7 +1361,7 @@ async function runLoop(messages, db, demoUserId, chatFn, ctx) {
         }
       } catch (e) {
         const msg = e instanceof ToolError ? e.message : '工具执行失败'
-        toolRecords.push({ name, args, status: 'error', queryTime: new Date().toISOString(), error: msg })
+        toolRecords.push({ name, call_id: id, args, status: 'error', queryTime: new Date().toISOString(), error: msg })
         messages.push({ role: 'tool', tool_call_id: id, content: `错误：${msg}` })
         if (ctx.audit) {
           await ctx.audit.record({
@@ -1687,7 +1688,15 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, audi
       const authoritativeFacts = collectLocalFacts(db, demoUserId, factRefs)
       const statusToolFailed = toolRecords.some((t) => t.status === 'error'
         && /_status$/.test(String(t.name || '')))
-      const guarded = applyFactGuard(reply, authoritativeFacts, { queryFailed: statusToolFailed })
+      // 结构化块只从本轮工具结果 / 当前待确认操作单的事实生成；不把历史操作单塞进无关提问。
+      // 回复中的金额、编号、状态必须能在块中找到来源，否则删除未核验声明并由服务端块渲染。
+      const blockFacts = authoritativeFacts.filter((f) => toolRefs.has(f.ref_no) || pendingRefs.has(f.ref_no))
+      const replyBlocks = buildReplyBlocks({ toolRecords, facts: blockFacts })
+      const guarded = applyFactGuard(reply, authoritativeFacts, {
+        blocks: replyBlocks,
+        queryFailed: statusToolFailed,
+        authoritative: authoritativeReplies.length > 0,
+      })
       if (guarded.changed) {
         reply = guarded.reply
         const lastMsg = messages[messages.length - 1]
@@ -1723,7 +1732,9 @@ export function createAssistant({ db, demoUserId, chatFn = chatCompletions, audi
         usage,
         request_id: requestId,
         authoritative_facts: authoritativeFacts,
-        fact_guard: { changed: guarded.changed, reason: guarded.reason },
+        reply_blocks: replyBlocks,
+        fact_guard: { changed: guarded.changed, reason: guarded.reason,
+          conflicts: guarded.conflicts || [], removed_lines: (guarded.removed || []).length },
       }
     } finally {
       session.locked = false

@@ -2980,3 +2980,50 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 - 本地 `verify-*.js` 合计 **45 / 45**。
 - 2026-10-27 复验：`npm run verify:db-path` **14 / 14 PASS**（含隔离副本「默认库未被创建」）；
   真实误操作库元数据前后一致（未创建、未修改、未删除）。
+
+---
+
+## 第五十八阶段：三块收口（A 事实块 / B 云端 DAG 前置 / C 计划表单联动）
+
+日期：2026-10-27（本地隔离，未推送 / 未部署）
+
+### 一、A：事实输出改为来源绑定的结构化块
+
+- 新增 `fact-guard.js` 的结构化回复块：`buildReplyBlocks` 只从本轮工具结果 / 当前待确认操作单的数据库事实生成
+  账户、账单统计、订阅、银行卡、信用卡额度、账单详情、四类操作单、状态查询与收款人块；每块带
+  `source.call_id` 或 `source.ref_no`、账户范围 / 月份范围与状态，由服务端渲染为 Markdown 表格。
+- `renderVerifiedReply` 不再以“命中关键词才替换整行”为防线：回复中出现金额 / 编号 / 状态时，
+  未绑定服务端来源的行与整张 Markdown 表格会被删除，业务事实统一由服务端块展示；无来源时使用明确的
+  未核验 / 查询失败兜底。纯解释与澄清问题保留原文。
+- 本地与 CloudBase 两种助手共用同一套块；`toolRecords` 增加 `call_id`，返回新增 `reply_blocks` 与
+  `fact_guard.conflicts / removed_lines`。可见聊天文本与返回文案一致。
+- 覆盖：中文 / 英文成功同义句、无依据余额、错误表格 / JSON 金额、账户余额、信用卡额度、聚合与单笔混合、
+  状态查询失败、四类操作单。新增 `scripts/verify-fact-blocks.js`（21 项）并扩充云端助手验证（54 项）。
+
+### 二、B：云端计划 select 前置节点
+
+- `createCloudWorkflowStore.selectAtomic` 在 RPC 前按已存计划节点检查 `choose_subscription` / `choose_repayment`
+  的依赖是否全部 completed；与本地 `selectLocalSync` 一致，失败返回 `bad_state`。
+- `rongzhi_bank_plan_write_v1` 的 select 分支在行锁 + 版本校验之后、建单之前，从数据库 `plan_json` 读取
+  选择节点的 `depends_on` 并逐项验证；不信任请求 preview，失败返回
+  `{"outcome":"bad_state","reason":"dependency_not_completed"}`，不建单、不改计划。
+- 订阅 / 还款两条链、服务层 / SQL 双路径均有回归；成功路径原子性与版本 CAS 保持。
+
+### 三、C：计划参数修改与页面联动
+
+- `PlansView.applySelectDefaults` 恢复已保存且仍有效的订阅 / 动作 / 新扣款账户 / 还款范围 / 账单 / 付款账户；
+  已保存但失效的值置空并提示重选，不再静默换成第一项。刷新、暂停恢复、修改后均保留意图。
+- 指定账单下拉只列 `issued=true` 且剩余 > 0 的账单；未出账账单只由「结清全部已入账欠款」承接。
+  无可选账单时显示空态并禁用提交。
+- `validateParams` modify 分支先按目标动作 / 范围归一化，再校验完整目标参数：change_source → pause、
+  statement → all_posted 可清理旧模式字段；显式提交与目标模式不兼容的字段仍返回 `bad_params`，
+  不会静默换动作。新增后端与 JSDOM 回归。
+
+### 四、验证（实际执行）
+
+- 后端本地 `verify-*.js`：**46 / 46**；`verify:fact-blocks` 21 / 21；`verify:db-path` 14 / 14。
+- CloudBase 本地：SQL **36 PASS**；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 **54 PASS**；
+  `cloud:verify:deps` **5 PASS**（本机 PGlite / RPC 桩）。
+- 前端：`verify:plans-form` **5 / 5**；`npm run build` 通过（`index-CSTpLXAW.css` / `index-B5aMdmaj.js`）。
+- 未执行：真实 CloudBase 多连接 / 部署、真实模型、Chromium / 手机实机、部署环境沙箱资源；未推送、未部署、
+  未执行云端 SQL、未调用收费模型。误操作数据库现场未删除 / 未回滚。

@@ -276,6 +276,46 @@ try {
       && persisted && linkedOps === 0,
       JSON.stringify({ err: ap?.message, persisted: !!persisted, linkedOps }))
   }
+
+  // —— P1-04/P1-10：修改参数先按目标动作 / 范围归一化；旧模式字段清理，显式不兼容字段仍拒绝 ——
+  {
+    const currentSource = db.prepare('SELECT account_id FROM subscriptions WHERE id = ?').get(subId).account_id
+    const changeTarget = [a1, a2].find((id) => id !== currentSource)
+    const mp = await service.create({ flow: 'subscription_review', params: { month } })
+    await service.select(mp.plan_no, { subscription_id: subId, action: 'change_source', to_account_id: changeTarget })
+    let modPause = null; let modErr = null
+    try { modPause = await service.modify(mp.plan_no, { action: 'pause' }) } catch (e) { modErr = e }
+    check('修改：change_source → pause 允许并清理旧 to_account_id',
+      !!modPause && modPause.params.action === 'pause' && modPause.params.to_account_id === undefined && !modErr,
+      JSON.stringify({ err: modErr?.message, params: modPause?.params }))
+    let missingTo = null
+    try { await service.modify(mp.plan_no, { action: 'change_source' }) } catch (e) { missingTo = e }
+    check('修改：切回 change_source 仍要求 to_account_id', missingTo?.code === 'bad_params', missingTo?.message)
+    let extraField = null
+    try { await service.modify(mp.plan_no, { action: 'pause', to_account_id: changeTarget }) } catch (e) { extraField = e }
+    check('修改：显式提交与目标动作不兼容的字段被拒绝', extraField?.code === 'bad_params', extraField?.message)
+  }
+  {
+    // 前面的还款用例可能已结清原账单；这里新建一张仍有剩余的已出账账单，专门验证参数归一化。
+    const repaymentStatementId = Number(db.prepare(`INSERT INTO statements
+      (user_id, credit_account_id, statement_year, statement_month, period_start, period_end, issued_on, issued_at, due_on, new_charges_cents, paid_cents, version)
+      VALUES (?, ?, 2027, 1, '2026-12-31T16:00:00.000Z', '2027-01-31T16:00:00.000Z',
+              '2027-01-31T16:00:00.000Z', '2027-01-31T16:00:00.000Z', '2027-02-24T16:00:00.000Z', 50000, 0, 1)`)
+      .run(userId, caId).lastInsertRowid)
+    const rp = await service.create({ flow: 'repayment_review', params: {} })
+    await service.select(rp.plan_no, { scope: 'statement', statement_id: repaymentStatementId, from_account_id: a1 })
+    let modAll = null; let modAllErr = null
+    try { modAll = await service.modify(rp.plan_no, { scope: 'all_posted' }) } catch (e) { modAllErr = e }
+    check('修改：statement → all_posted 允许并清理旧 statement_id',
+      !!modAll && modAll.params.scope === 'all_posted' && modAll.params.statement_id === undefined && !modAllErr,
+      JSON.stringify({ err: modAllErr?.message, params: modAll?.params }))
+    let missingStatement = null
+    try { await service.modify(rp.plan_no, { scope: 'statement' }) } catch (e) { missingStatement = e }
+    check('修改：切回 statement 仍要求 statement_id', missingStatement?.code === 'bad_params', missingStatement?.message)
+    let extraStatement = null
+    try { await service.modify(rp.plan_no, { scope: 'all_posted', statement_id: repaymentStatementId }) } catch (e) { extraStatement = e }
+    check('修改：all_posted 显式提交 statement_id 被拒绝', extraStatement?.code === 'bad_params', extraStatement?.message)
+  }
 } catch (e) {
   failures += 1
   console.error('WORKFLOW TEST ERROR:', e.stack || e.message)

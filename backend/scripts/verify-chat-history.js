@@ -147,8 +147,9 @@ check('7.1 列表与打开不调用模型', mockReadonly.calls === 0, String(moc
   const viewA = assistant.getConversation(rA.sessionId)
   const transferRec = viewA.messages[1] && viewA.messages[1].toolRecords && viewA.messages[1].toolRecords.find((t) => t.name === 'prepare_transfer')
   // 事实保护：持久化内容与返回内容一致，且业务声明使用服务端权威回执。
-  check('8.3 A 回复已持久化（权威回执）', viewA.messages.length === 2
-    && viewA.messages[1].text === '该笔转账待确认（尚未扣款）。')
+  check('8.3 A 回复已持久化（权威回执 + 结构化块）', viewA.messages.length === 2
+    && viewA.messages[1].text.startsWith('该笔转账待确认（尚未扣款）。')
+    && viewA.messages[1].text.includes('转账操作单（服务端核验）'))
   check('8.4 A 结果卡含业务单引用 ref_no', !!transferRec && typeof transferRec.data.ref_no === 'string' && transferRec.data.ref_no.length > 0)
   const opRow = transferRec ? db.prepare('SELECT ref_no FROM transfer_operations WHERE ref_no = ?').get(transferRec.data.ref_no) : null
   check('8.5 业务单已入库且可回读', !!opRow)

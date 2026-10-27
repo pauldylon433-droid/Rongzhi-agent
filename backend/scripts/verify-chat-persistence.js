@@ -90,8 +90,9 @@ const demoUserId = u1
   const cur = assistant.getCurrent()
   check('1.1 当前会话标识等于最近会话', cur.sessionId === r1.sessionId && cur.sessionId === r2.sessionId)
   check('1.2 恢复 4 条消息（2 用户 + 2 助手）', cur.messages.length === 4, String(cur.messages.length))
-  check('1.3 顺序与角色正确', cur.messages[0].role === 'user' && cur.messages[0].text === '我的余额是多少？' &&
-    cur.messages[1].role === 'assistant' && cur.messages[1].text === '您的账户余额为 5000.00 元。' &&
+  check('1.3 顺序与角色正确（余额由服务端账户块渲染）', cur.messages[0].role === 'user' && cur.messages[0].text === '我的余额是多少？' &&
+    cur.messages[1].role === 'assistant' && cur.messages[1].text.includes('账户信息（服务端核验）')
+      && cur.messages[1].text.includes('5000.00 元') &&
     cur.messages[2].role === 'user' && cur.messages[2].text === '再问一次' &&
     cur.messages[3].role === 'assistant' && cur.messages[3].text === '这是第二次回答。')
   check('1.4 助手消息含工具展示记录', Array.isArray(cur.messages[1].toolRecords) && cur.messages[1].toolRecords[0]?.name === 'get_accounts')

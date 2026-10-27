@@ -145,20 +145,33 @@ function validateParams(flow, stage, params, existing = null) {
     }
   }
   if (stage === 'modify' && existing) {
-    // 修改后的合并参数必须保持自洽，但只校验修改涉及的字段。
-    const merged = { ...existing, ...out }
+    // 先按目标动作/范围归一化，再校验完整目标参数：
+    // 旧模式专用字段（如 change_source 的 to_account_id、statement 的 statement_id）在切换动作时可以
+    // 由服务端清理，但请求本身显式提交不兼容字段仍按 bad_params 拒绝，避免静默换动作。
     if (flow === 'subscription_review') {
-      if (merged.action !== undefined) {
-        if (!['pause', 'change_source'].includes(merged.action)) throw new WorkflowError('参数 action 仅支持：pause / change_source', 'bad_params')
-        if (merged.action === 'change_source' && merged.to_account_id === undefined) {
-          throw new WorkflowError('更换扣款账户需要 to_account_id', 'bad_params')
-        }
+      const targetAction = out.action !== undefined ? out.action : existing.action
+      if (targetAction !== undefined && !['pause', 'change_source'].includes(targetAction)) {
+        throw new WorkflowError('参数 action 仅支持：pause / change_source', 'bad_params')
       }
-      if (merged.to_account_id !== undefined && merged.action !== 'change_source') {
+      if (out.to_account_id !== undefined && targetAction !== 'change_source') {
         throw new WorkflowError('仅在更换扣款账户时接受 to_account_id', 'bad_params')
       }
-    } else if (merged.scope !== undefined && !['statement', 'all_posted'].includes(merged.scope)) {
-      throw new WorkflowError('参数 scope 仅支持：statement / all_posted', 'bad_params')
+      const targetToAccount = out.to_account_id !== undefined ? out.to_account_id : existing.to_account_id
+      if (targetAction === 'change_source' && targetToAccount === undefined) {
+        throw new WorkflowError('更换扣款账户需要 to_account_id', 'bad_params')
+      }
+    } else {
+      const targetScope = out.scope !== undefined ? out.scope : (existing.scope || 'statement')
+      if (!['statement', 'all_posted'].includes(targetScope)) {
+        throw new WorkflowError('参数 scope 仅支持：statement / all_posted', 'bad_params')
+      }
+      if (out.statement_id !== undefined && targetScope === 'all_posted') {
+        throw new WorkflowError('结清全部欠款模式不接受 statement_id', 'bad_params')
+      }
+      const targetStatement = out.statement_id !== undefined ? out.statement_id : existing.statement_id
+      if (targetScope === 'statement' && targetStatement === undefined) {
+        throw new WorkflowError('指定账单模式需要 statement_id', 'bad_params')
+      }
     }
   }
   return out
@@ -412,6 +425,12 @@ export function createCloudWorkflowStore({ client, userId }) {
     async selectAtomic(planNo, params) {
       const plan = await get(planNo)
       if (!plan) throw new WorkflowError('计划不存在', 'not_found')
+      // 服务层与本地一致：先按已存计划节点状态检查必需前置节点；数据库函数在行锁内再做一次权威检查。
+      if (plan.status !== 'waiting_selection') throw new WorkflowError('当前计划状态不可选择', 'bad_state')
+      const selectKey = plan.flow === 'subscription_review' ? 'choose_subscription' : 'choose_repayment'
+      if (!node(plan, selectKey) || !depsDone(plan, selectKey)) {
+        throw new WorkflowError('前置节点未完成或失败，不能选择', 'bad_state')
+      }
       const opRef = `wf-${plan.plan_no}-v${plan._version}-${plan.flow === 'subscription_review' ? 'sub' : 'repay'}`
       const preview = selectPreview(plan, params, opRef)
       const opPayload = plan.flow === 'subscription_review'

@@ -245,7 +245,9 @@ const demoUserId = u1
   const r2 = await assistant.chat({ message: '上个月呢？', sessionId: r1.sessionId })
 
   check('7.1 追问后工具查 9 月', r2.toolRecords[0]?.name === 'get_monthly_analytics' && r2.toolRecords[0]?.data?.month === '2026-09', JSON.stringify(r2.toolRecords[0]?.data?.month))
-  check('7.2 追问回复正确', r2.reply === '上月支出 1500 元。', r2.reply)
+  check('7.2 追问回复由服务端账单块渲染（不采用模型 1500 元）',
+    r2.reply.includes('2026-09 账单统计（服务端核验）') && r2.reply.includes('-15.00 元')
+      && !r2.reply.includes('1500 元'), r2.reply)
 
   const thirdMsgs = mock.calls[2].messages
   const hasPriorUser = thirdMsgs.some((m) => m.role === 'user' && m.content === '这个月花了多少？')

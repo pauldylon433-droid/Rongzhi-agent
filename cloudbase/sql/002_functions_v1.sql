@@ -122,6 +122,8 @@ AS $$
 DECLARE
   v_plan public.rongzhi_bank_workflow_plans%ROWTYPE;
   v_res jsonb;
+  v_select_key text;
+  v_deps jsonb;
 BEGIN
   IF p_user_id IS NULL OR p_user_id <= 0 THEN RAISE EXCEPTION 'invalid_parameters: user' USING ERRCODE = '22023'; END IF;
   p_payload := coalesce(p_payload, '{}'::jsonb);
@@ -154,6 +156,35 @@ BEGIN
     END IF;
     IF v_plan.status <> 'waiting_selection' THEN
       RETURN jsonb_build_object('outcome','bad_state');
+    END IF;
+    -- 必需前置节点检查：只读取数据库已存的 plan_json，不信任请求里的 preview。
+    -- 订阅链检查 choose_subscription 的依赖（analyze_month / list_subscriptions），
+    -- 还款链检查 choose_repayment 的依赖（list_credit_accounts / list_statements）；任一未完成即拒绝。
+    v_select_key := CASE v_plan.flow
+      WHEN 'subscription_review' THEN 'choose_subscription'
+      WHEN 'repayment_review' THEN 'choose_repayment'
+      ELSE NULL
+    END;
+    IF v_select_key IS NULL THEN
+      RETURN jsonb_build_object('outcome','bad_state','reason','unknown_flow');
+    END IF;
+    SELECT n->'depends_on' INTO v_deps
+      FROM jsonb_array_elements(coalesce(v_plan.plan_json->'nodes','[]'::jsonb)) AS n
+     WHERE n->>'key' = v_select_key
+     LIMIT 1;
+    IF v_deps IS NULL THEN
+      RETURN jsonb_build_object('outcome','bad_state','reason','selection_node_missing');
+    END IF;
+    IF EXISTS (
+      SELECT 1
+        FROM jsonb_array_elements_text(v_deps) AS d(dep_key)
+       WHERE NOT EXISTS (
+         SELECT 1
+           FROM jsonb_array_elements(coalesce(v_plan.plan_json->'nodes','[]'::jsonb)) AS n
+          WHERE n->>'key' = d.dep_key AND n->>'status' = 'completed'
+       )
+    ) THEN
+      RETURN jsonb_build_object('outcome','bad_state','reason','dependency_not_completed');
     END IF;
     IF v_plan.flow = 'subscription_review' THEN
       v_res := public.rongzhi_bank_sub_write_v1(p_user_id, 'create', coalesce(p_payload->'op_payload','{}'::jsonb));

@@ -14,7 +14,8 @@
     "cloud:verify:sql": "node scripts/cloud/verify-sql.js",
     "cloud:verify:api": "node scripts/cloud/verify-api.js",
     "cloud:verify:assistant": "node scripts/cloud/verify-assistant.js",
-    "cloud:verify": "npm run cloud:verify:sql && npm run cloud:verify:races && npm run cloud:verify:api && npm run cloud:verify:assistant",
+    "cloud:verify": "npm run cloud:verify:sql && npm run cloud:verify:races && npm run cloud:verify:api && npm run cloud:verify:assistant && npm run cloud:verify:deps",
+    "cloud:verify:deps": "node scripts/cloud/verify-plan-deps.js",
     "ai:check": "node scripts/ai-check.js",
     "cloud:verify:races": "node scripts/cloud/verify-races.js",
     "verify:receipts": "node scripts/verify-authoritative-receipts.js",
@@ -24,7 +25,8 @@
     "verify:workflows": "node scripts/verify-workflows.js",
     "verify:competition": "npm run verify:receipts && npm run verify:audit && npm run verify:sandbox && npm run verify:security && npm run verify:workflows && npm run verify:workflows-api",
     "verify:workflows-api": "node scripts/verify-workflow-api.js",
-    "verify:db-path": "node scripts/verify-db-path.js"
+    "verify:db-path": "node scripts/verify-db-path.js",
+    "verify:fact-blocks": "node scripts/verify-fact-blocks.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

@@ -168,7 +168,12 @@ try {
   {
     const planNo = 'wf-sql-test-1'
     const planJson = { plan_no: planNo, flow: 'subscription_review', status: 'waiting_selection',
-      params: { month: '2026-10' }, nodes: [], op_ref: null }
+      params: { month: '2026-10' }, op_ref: null, nodes: [
+        { key: 'analyze_month', type: 'readonly', status: 'completed', depends_on: [], result: {}, error: null },
+        { key: 'list_subscriptions', type: 'readonly', status: 'completed', depends_on: [], result: [], error: null },
+        { key: 'choose_subscription', type: 'selection', status: 'pending', depends_on: ['analyze_month', 'list_subscriptions'], result: null, error: null },
+        { key: 'prepare_subscription', type: 'mutation', status: 'pending', depends_on: ['choose_subscription'], result: null, error: null },
+      ] }
     await db.exec('RESET ROLE')
     const subRow = (await one(`SELECT id FROM public.rongzhi_bank_subscriptions WHERE user_id=1 AND status='active' ORDER BY id LIMIT 1`))
     await db.exec('SET ROLE service_role')
@@ -197,6 +202,38 @@ try {
     check('云端计划：生命周期变更与取消单同事务，重复请求因版本冲突被拒',
       t1.version === 2 && t1.status === 'paused' && t2.conflict === true && opStatus === 'cancelled',
       JSON.stringify({ t1: t1.version, t2, opStatus }))
+  }
+
+  // P1-03 云端：已存计划的前置节点失败时，select 必须在同一 RPC 事务内拒绝且不建单。
+  // 请求里的 preview 故意把所有节点涂成 completed，验证服务端只信数据库已存 plan_json。
+  {
+    const planNo = 'wf-sql-test-dep-failed'
+    const planJson = { plan_no: planNo, flow: 'subscription_review', status: 'waiting_selection',
+      params: { month: '2026-10' }, op_ref: null, nodes: [
+        { key: 'analyze_month', type: 'readonly', status: 'failed', depends_on: [], result: null, error: 'analytics unavailable' },
+        { key: 'list_subscriptions', type: 'readonly', status: 'completed', depends_on: [], result: [], error: null },
+        { key: 'choose_subscription', type: 'selection', status: 'pending', depends_on: ['analyze_month', 'list_subscriptions'], result: null, error: null },
+        { key: 'prepare_subscription', type: 'mutation', status: 'pending', depends_on: ['choose_subscription'], result: null, error: null },
+      ] }
+    const subRow = (await one(`SELECT id FROM public.rongzhi_bank_subscriptions WHERE user_id=1 AND status='active' ORDER BY id LIMIT 1`))
+    await db.exec('SET ROLE service_role')
+    await one(`SELECT public.rongzhi_bank_plan_write_v1(1,'create',$1::jsonb) r`,
+      [JSON.stringify({ plan_no: planNo, flow: 'subscription_review', status: 'waiting_selection', plan_json: planJson })])
+    const tamperedPreview = { ...planJson, status: 'waiting_confirmation', op_ref: 'wf-sql-test-dep-failed-v0-sub',
+      nodes: planJson.nodes.map((n) => ({ ...n, status: 'completed' })) }
+    const res = (await one(`SELECT public.rongzhi_bank_plan_write_v1(1,'select',$1::jsonb) r`, [JSON.stringify({
+      plan_no: planNo, base_version: 0, flow: 'subscription_review', status: 'waiting_confirmation',
+      plan_json: tamperedPreview,
+      op_payload: { subscription_id: Number(subRow.id), action: 'pause', ref_no: 'wf-sql-test-dep-failed-v0-sub' },
+    })])).r
+    await db.exec('RESET ROLE')
+    const opCount = (await one(`SELECT count(*)::int n FROM public.rongzhi_bank_subscription_operations WHERE ref_no='wf-sql-test-dep-failed-v0-sub'`)).n
+    const planStatus = (await one(`SELECT status FROM public.rongzhi_bank_workflow_plans WHERE plan_no=$1`, [planNo])).status
+    await db.exec('SET ROLE service_role')
+    check('云端计划：已存前置节点失败时 select 返回 bad_state 且不建单 / 不改计划',
+      res.outcome === 'bad_state' && res.reason === 'dependency_not_completed'
+        && opCount === 0 && planStatus === 'waiting_selection',
+      JSON.stringify({ res, opCount, planStatus }))
   }
 
   // anon / authenticated 不能执行 RPC 或访问业务表

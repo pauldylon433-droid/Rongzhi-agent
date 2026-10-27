@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify:plans-form": "node scripts/verify-plans-form.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.17",

@@ -24,6 +24,7 @@ const createMonth = ref(currentShanghaiYearMonth())
 const selectForm = ref(defaultSelectForm())
 const modifyOpen = ref(false)
 const modifyForm = ref({})
+const paramNotice = ref('')
 
 const STATUS_LABEL = {
   waiting_selection: '等待选择', waiting_confirmation: '等待确认', waiting_verification: '等待强验证',
@@ -55,8 +56,9 @@ function nodeStatusText(s) { return NODE_STATUS_LABEL[s] || s }
 
 const statements = computed(() => {
   const accounts = detail.value?.selectable_credit_accounts || []
+  // 「指定已出账账单全额」只列已出账且仍有剩余的账单；未出账账单由 all_posted 模式承接。
   return accounts.flatMap((a) => (a.statements || [])
-    .filter((s) => (s.remaining_due_cents ?? 0) > 0)
+    .filter((s) => s.issued === true && (s.remaining_due_cents ?? 0) > 0)
     .map((s) => ({ ...s, label: `${a.account_name} · ${s.statement_month} 账单（剩余 ${formatCentsToYuan(s.remaining_due_cents)}）` })))
 })
 const deposits = computed(() => detail.value?.selectable_deposit_accounts || [])
@@ -122,26 +124,78 @@ async function loadDetail(planNo) {
   }
 }
 
+function byId(list, id) {
+  return (list || []).find((x) => Number(x.id) === Number(id)) || null
+}
+
 function applySelectDefaults(d) {
+  const saved = d.params || {}
+  const has = (v) => v !== undefined && v !== null
+  const invalid = []
+  // 已保存值仍有效则恢复；已保存但失效则置空并提示，绝不静默改成第一个候选。
+  const pick = (list, savedValue, label, fallbackFirst = true) => {
+    if (!has(savedValue)) return fallbackFirst ? (list[0]?.id ?? null) : null
+    const found = byId(list, savedValue)
+    if (found) return found.id
+    invalid.push(label)
+    return null
+  }
+
   const next = defaultSelectForm()
+  let action = 'pause'
+  let scope = 'statement'
   if (d.flow === 'subscription_review') {
-    next.subscription_id = subscriptions.value[0]?.id ?? null
-    next.to_account_id = deposits.value[0]?.id ?? null
+    if (has(saved.action)) {
+      if (['pause', 'change_source'].includes(saved.action)) action = saved.action
+      else invalid.push('操作')
+    }
+    next.action = action
+    next.subscription_id = pick(subscriptions.value, saved.subscription_id, '订阅')
+    next.to_account_id = action === 'change_source'
+      ? pick(deposits.value, saved.to_account_id, '新扣款账户')
+      : null
   } else {
-    next.statement_id = statements.value[0]?.id ?? null
-    next.from_account_id = deposits.value[0]?.id ?? null
-    next.credit_account_id = credits.value[0]?.id ?? null
+    if (has(saved.scope)) {
+      if (['statement', 'all_posted'].includes(saved.scope)) scope = saved.scope
+      else invalid.push('还款范围')
+    }
+    next.scope = scope
+    next.statement_id = scope === 'statement' ? pick(statements.value, saved.statement_id, '账单') : null
+    next.from_account_id = pick(deposits.value, saved.from_account_id, '付款账户')
+    next.credit_account_id = scope === 'all_posted' ? pick(credits.value, saved.credit_account_id, '信用卡') : null
   }
   selectForm.value = next
+
+  const mAction = (() => {
+    if (!has(saved.action)) return 'pause'
+    if (['pause', 'change_source'].includes(saved.action)) return saved.action
+    invalid.push('操作')
+    return 'pause'
+  })()
+  const mScope = (() => {
+    if (!has(saved.scope)) return 'statement'
+    if (['statement', 'all_posted'].includes(saved.scope)) return saved.scope
+    invalid.push('还款范围')
+    return 'statement'
+  })()
   modifyForm.value = {
-    month: d.params?.month || currentShanghaiYearMonth(),
-    action: d.params?.action || 'pause',
-    to_account_id: d.params?.to_account_id ?? deposits.value[0]?.id ?? null,
-    scope: d.params?.scope || 'statement',
-    statement_id: d.params?.statement_id ?? statements.value[0]?.id ?? null,
-    from_account_id: d.params?.from_account_id ?? deposits.value[0]?.id ?? null,
-    credit_account_id: d.params?.credit_account_id ?? credits.value[0]?.id ?? null,
+    month: saved.month || currentShanghaiYearMonth(),
+    action: mAction,
+    to_account_id: mAction === 'change_source' ? pick(deposits.value, saved.to_account_id, '新扣款账户') : null,
+    scope: mScope,
+    statement_id: mScope === 'statement' ? pick(statements.value, saved.statement_id, '账单') : null,
+    from_account_id: pick(deposits.value, saved.from_account_id, '付款账户'),
+    credit_account_id: mScope === 'all_posted' ? pick(credits.value, saved.credit_account_id, '信用卡') : null,
   }
+
+  const notes = [...new Set(invalid)].map((label) => `原计划中的${label}已失效或不可用，请重新选择。`)
+  if (d.flow === 'repayment_review' && scope === 'statement' && !next.statement_id) {
+    notes.push('暂无可选的已出账账单；如要提前还清全部已入账欠款，请切换到「结清全部已入账欠款」。')
+  }
+  if (d.flow === 'subscription_review' && !next.subscription_id) {
+    notes.push('暂无可选的生效订阅，请先确认订阅状态。')
+  }
+  paramNotice.value = notes.join(' ')
 }
 
 async function choose(planNo) {
@@ -308,6 +362,7 @@ onMounted(() => loadList({ keepSelection: false }))
           <div v-if="modifyOpen" class="plans-panel">
             <h3 class="plans-panel-title">修改计划参数（未执行步骤）</h3>
             <p class="plans-note">修改会取消原待确认操作单并回到等待选择；已完成的扣款不会被撤销。</p>
+            <p v-if="paramNotice" class="plans-note">{{ paramNotice }}</p>
             <div v-if="detail.flow === 'subscription_review'" class="plans-form">
               <label>月份 <input v-model="modifyForm.month" class="plans-input" type="month" /></label>
               <label>操作
@@ -331,6 +386,7 @@ onMounted(() => loadList({ keepSelection: false }))
               </label>
               <label v-if="modifyForm.scope === 'statement'">账单
                 <select v-model.number="modifyForm.statement_id" class="select">
+                  <option v-if="!statements.length" :value="null" disabled>暂无可选的已出账账单</option>
                   <option v-for="s in statements" :key="s.id" :value="s.id">{{ s.label }}</option>
                 </select>
               </label>
@@ -341,13 +397,17 @@ onMounted(() => loadList({ keepSelection: false }))
               </label>
             </div>
             <div class="plans-form-actions">
-              <button class="btn btn-sm" :disabled="busy" @click="submitModify">保存修改</button>
+              <button class="btn btn-sm" :disabled="busy
+                || (detail.flow === 'subscription_review'
+                  ? (modifyForm.action === 'change_source' && !modifyForm.to_account_id)
+                  : (modifyForm.scope === 'statement' && !modifyForm.statement_id))" @click="submitModify">保存修改</button>
               <button class="btn-ghost btn-sm" @click="modifyOpen = false">取消</button>
             </div>
           </div>
 
           <div v-if="detail.status === 'waiting_selection'" class="plans-panel">
             <h3 class="plans-panel-title">选择下一步业务参数</h3>
+            <p v-if="paramNotice" class="plans-note">{{ paramNotice }}</p>
             <div v-if="detail.flow === 'subscription_review'" class="plans-form">
               <label>订阅
                 <select v-model.number="selectForm.subscription_id" class="select">
@@ -375,6 +435,7 @@ onMounted(() => loadList({ keepSelection: false }))
               </label>
               <label v-if="selectForm.scope === 'statement'">账单
                 <select v-model.number="selectForm.statement_id" class="select">
+                  <option v-if="!statements.length" :value="null" disabled>暂无可选的已出账账单</option>
                   <option v-for="s in statements" :key="s.id" :value="s.id">{{ s.label }}</option>
                 </select>
               </label>
@@ -390,7 +451,10 @@ onMounted(() => loadList({ keepSelection: false }))
               </label>
             </div>
             <div class="plans-form-actions">
-              <button class="btn btn-sm" :disabled="busy" @click="submitSelect">选择并生成操作单</button>
+              <button class="btn btn-sm" :disabled="busy
+                || (detail.flow === 'subscription_review'
+                  ? (!selectForm.subscription_id || (selectForm.action === 'change_source' && !selectForm.to_account_id))
+                  : (selectForm.scope === 'statement' && !selectForm.statement_id))" @click="submitSelect">选择并生成操作单</button>
             </div>
           </div>
 
