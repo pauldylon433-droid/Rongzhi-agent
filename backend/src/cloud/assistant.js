@@ -8,6 +8,7 @@ import {
   AssistantError, ToolError, TOOL_DEFS, buildSystemMessage, parseToolArgs,
   refTail, centsToYuan, buildTransferStatusText, buildRepaymentStatusText, buildCardStatusText, buildSubscriptionStatusText,
   buildTransferNotice, buildCardOpNotice, buildSubscriptionOpNotice, buildRepaymentNotice,
+  factsFromStatusSnapshots, statusReplyRelevant,
   TRANSFER_STATUS_TEXT, REPAYMENT_STATUS_TEXT,
   MAX_MODEL_CALLS, MAX_TOOL_CALLS, MAX_TURNS, MAX_USER_MESSAGE_LEN, REPLY_MAX_TOKENS,
 } from '../services/assistant.js'
@@ -17,7 +18,7 @@ import { shanghaiMonthRange } from '../lib/shanghai.js'
 import { runSandboxedAnalysis } from '../services/sandbox.js'
 import { detectCredential, scrubMessagesForModel, CREDENTIAL_REJECTION_MESSAGE } from '../services/credential-guard.js'
 import { createCloudAuditTrail, newRequestId } from '../services/audit-trail.js'
-import { applyFactGuard, buildReplyBlocks, refsFromToolRecords, refsFromMessages } from '../services/fact-guard.js'
+import { buildReplyBlocks, buildTrustedReply, refsFromToolRecords, refsFromMessages } from '../services/fact-guard.js'
 import { createWorkflowService, createCloudWorkflowStore, createCloudWorkflowOps } from '../services/workflow-plans.js'
 
 function trimHistory(messages) {
@@ -733,18 +734,11 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
       // 回复生成后复核本轮引用单的最新状态；变化时用服务端权威文案替换模型草稿。
       await load().then((fresh) => { state.store = fresh })
       const authoritativeReplies = [
-        transferStatusReply(state.store, snapshotTransfer),
-        repaymentStatusReply(state.store, snapshotRepayment),
-        cardStatusReply(state.store, snapshotCard),
-        subscriptionStatusReply(state.store, snapshotSubscription),
+        statusReplyRelevant('transfer', trimmed, toolRecords) ? transferStatusReply(state.store, snapshotTransfer) : null,
+        statusReplyRelevant('repayment', trimmed, toolRecords) ? repaymentStatusReply(state.store, snapshotRepayment) : null,
+        statusReplyRelevant('card', trimmed, toolRecords) ? cardStatusReply(state.store, snapshotCard) : null,
+        statusReplyRelevant('subscription', trimmed, toolRecords) ? subscriptionStatusReply(state.store, snapshotSubscription) : null,
       ].filter((x) => x !== null)
-      let reply = finalReply
-      if (authoritativeReplies.length) {
-        reply = [...new Set(authoritativeReplies)].join('\n')
-        const lastMsg = messages[messages.length - 1]
-        if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
-      }
-
       const toolRefs = refsFromToolRecords(toolRecords)
       const pendingRefs = new Set([session.pendingTransferRef, session.pendingCardOpRef,
         session.pendingSubscriptionOpRef, session.pendingRepaymentRef].filter(Boolean))
@@ -756,19 +750,28 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
       const authoritativeFacts = collectCloudFacts(state.store, factRefs)
       const statusToolFailed = toolRecords.some((t) => t.status === 'error'
         && /_status$/.test(String(t.name || '')))
-      // 与本地助手同一套结构化块：只使用本轮工具结果 / 当前待确认单，业务事实由服务端渲染。
-      const blockFacts = authoritativeFacts.filter((f) => toolRefs.has(f.ref_no) || pendingRefs.has(f.ref_no))
+      // 与本地助手同一套受信输出：块是唯一事实来源，模型 content 只接受结构化信封。
+      const prepareToolByKind = { transfer: 'prepare_transfer', repayment: 'prepare_repayment',
+        card: 'prepare_card_operation', subscription: 'prepare_subscription_operation' }
+      const snapshotFacts = factsFromStatusSnapshots({
+        transfer: snapshotTransfer, repayment: snapshotRepayment,
+        card: snapshotCard, subscription: snapshotSubscription,
+      }, trimmed).filter((f) => !toolRecords.some((r) => r.status === 'ok' && r.name === prepareToolByKind[f.kind]))
+      const blockFacts = [...authoritativeFacts.filter((f) => toolRefs.has(f.ref_no) || pendingRefs.has(f.ref_no)),
+        ...snapshotFacts].filter((f, i, arr) => arr.findIndex((x) => `${x.kind}:${x.ref_no}` === `${f.kind}:${f.ref_no}`) === i)
       const replyBlocks = buildReplyBlocks({ toolRecords, facts: blockFacts })
-      const guarded = applyFactGuard(reply, authoritativeFacts, {
+      const trusted = buildTrustedReply({
+        content: finalReply,
         blocks: replyBlocks,
+        toolRecords,
         queryFailed: statusToolFailed,
         authoritative: authoritativeReplies.length > 0,
+        statusTexts: authoritativeReplies,
+        context: { accounts: (state.store.snapshot?.accounts || []) },
       })
-      if (guarded.changed) {
-        reply = guarded.reply
-        const lastMsg = messages[messages.length - 1]
-        if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
-      }
+      const reply = trusted.reply
+      const lastMsg = messages[messages.length - 1]
+      if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = reply
 
       const newMessages = messages.slice(1 + history.length)
       session.messages.push(...newMessages)
@@ -809,9 +812,9 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
           intent: toolRecords.map((t) => t.name).join('>') || 'no_tool', incomplete },
       })
       return { sessionId: session.id, reply, toolRecords, incomplete, usage, request_id: requestId,
-        authoritative_facts: authoritativeFacts, reply_blocks: replyBlocks,
-        fact_guard: { changed: guarded.changed, reason: guarded.reason,
-          conflicts: guarded.conflicts || [], removed_lines: (guarded.removed || []).length } }
+        authoritative_facts: authoritativeFacts, reply_blocks: trusted.blocks,
+        fact_guard: { changed: reply !== finalReply, reason: trusted.reason,
+          protocol: trusted.protocol, trust: trusted.trust, dropped_raw: trusted.dropped_raw } }
     } finally {
       session.locked = false
       session.lastActiveAt = Date.now()

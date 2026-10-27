@@ -3027,3 +3027,43 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 - 前端：`verify:plans-form` **5 / 5**；`npm run build` 通过（`index-CSTpLXAW.css` / `index-B5aMdmaj.js`）。
 - 未执行：真实 CloudBase 多连接 / 部署、真实模型、Chromium / 手机实机、部署环境沙箱资源；未推送、未部署、
   未执行云端 SQL、未调用收费模型。误操作数据库现场未删除 / 未回滚。
+
+---
+
+## 第五十九阶段：A 事实输出通道收口（原始草稿全量关闭）
+
+日期：2026-10-27（本地隔离，未推送 / 未部署；B/C 保留不再重做）
+
+### 一、关闭原始模型草稿透传
+
+- 本地与 CloudBase 助手最终输出统一走 `buildTrustedReply`：模型 `content` 只接受结构化信封
+  `{"kind":"answer"}` / `{"kind":"clarification","code":"..."}` / `{"kind":"explanation","code":"..."}`；
+  自由文本、伪 JSON 块、未知枚举、带 `text/message` 的参数一律视为未受信草稿并丢弃，不再以“未命中正则”放行。
+- 银行事实只由来源绑定块渲染：账户、账单统计、订阅、银行卡、信用卡额度、账单详情、四类操作单、
+  状态查询、收款人；每块带 `source.call_id` / `source.ref_no`。成功查询无论模型草稿是什么都渲染服务端块。
+- 追问 / 解释只使用有限枚举码 + 服务端模板：`need_recipient`、`need_amount`、`need_payment_account`、
+  `ambiguous_recipient`、`ambiguous_subscription`、`need_object`、`need_confirmation`、
+  `need_strong_verification`、`query_failed`、`unsupported`、`object_not_found`、`no_data`；
+  解释码 `readonly_only`、`transfer_requires_confirmation`、`repayment_requires_verification`、
+  `no_direct_execution`、`general_ack`、`greeting`。候选对象 / 付款账户只取自已验证工具结果或服务端账户列表，
+  非法 id 不回显。
+- 工具错误与多候选对象可生成服务端受信追问；无来源 / 查询失败 / 未知结构统一兜底。
+  运行上限与“模型未返回有效回答”是服务端受信通知，单独保留。
+- 会话关联的已完成操作：用户明确问到时用服务端快照块展示真实状态，未受信否定文案不能覆盖；
+  本轮已新建操作单时不再混入旧快照，避免旧单覆盖不相关的问题。
+- 返回 `reply`、`reply_blocks`、可见聊天与续聊最终 assistant 消息使用同一受信文本；
+  `fact_guard` 增加 `protocol / trust / dropped_raw`。
+
+### 二、验证（实际执行）
+
+- 本地后端 `verify-*.js`：**46 / 46**；`verify:fact-blocks` **48 / 48**（新增架构级未受信草稿矩阵：
+  无金额、中文大写、无单位数字、英文、表格、伪 JSON 块、合法 answer 无来源、未知枚举、自由文本参数；
+  另含成功查询必渲染块、已完成转账否定覆盖、持久化 / 续聊一致、候选 id 校验）。
+- CloudBase 本地：SQL 36 PASS；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 **54 PASS**；
+  `cloud:verify:deps` 5 PASS（本机 PGlite / RPC 桩）。
+- 前端 `verify:plans-form` 5 / 5；`npm run build` 通过（`index-CSTpLXAW.css` / `index-B5aMdmaj.js`）。
+- 独立复核包 `remaining-fact-probe`：6 项全部不再原样展示（`unchanged:false`、`persisted:false`、
+  `wrong_text_retained:false`、正确余额块可见、已完成转账块可见）。
+  `cloud-recheck`：R12 与云端 A 剩余项均被服务端兜底 / 块替换，B 故障注入仍 `operation_created:false`。
+- 未执行：真实 CloudBase 多连接 / 部署、真实模型、Chromium / 手机实机、部署环境沙箱资源；
+  未推送、未部署、未执行云端 SQL、未调用收费模型；未修改现有业务库 / 密钥 / 绑定。

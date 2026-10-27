@@ -81,7 +81,7 @@ const demoUserId = u1
   const mock = makeScriptedMock([
     { toolCalls: [tc('c1', 'get_accounts', {})] },
     { content: '您的账户余额为 5000.00 元。' },
-    { content: '这是第二次回答。' },
+    { content: '{"kind":"explanation","code":"general_ack"}' },
   ])
   const assistant = createAssistant({ db, demoUserId, chatFn: mock })
   const r1 = await assistant.chat({ message: '我的余额是多少？' })
@@ -94,7 +94,7 @@ const demoUserId = u1
     cur.messages[1].role === 'assistant' && cur.messages[1].text.includes('账户信息（服务端核验）')
       && cur.messages[1].text.includes('5000.00 元') &&
     cur.messages[2].role === 'user' && cur.messages[2].text === '再问一次' &&
-    cur.messages[3].role === 'assistant' && cur.messages[3].text === '这是第二次回答。')
+    cur.messages[3].role === 'assistant' && cur.messages[3].text === '好的，我已记录您的问题。')
   check('1.4 助手消息含工具展示记录', Array.isArray(cur.messages[1].toolRecords) && cur.messages[1].toolRecords[0]?.name === 'get_accounts')
 }
 

@@ -98,7 +98,8 @@
 ### 本轮验证汇总（实际执行）
 
 - 本地 SQLite `verify-*.js`：**46 / 46**（原 43 + `verify-workflow-api.js` + `verify-db-path.js` + `verify-fact-blocks.js`）。
-- 前端 `npm run build`：通过（`index-BNKePsq-.css` / `index-Dg0Ezgg1.js`）。
+  A 事实通道：`verify-fact-blocks.js` **48 / 48**（结构化协议；未受信草稿矩阵、成功查询必渲染块、已完成状态不被否定覆盖、持久化 / 续聊一致）。
+- 前端 `npm run build`：通过（本环境 `index-CSTpLXAW.css` / `index-B5aMdmaj.js`；构建哈希随工具链环境变化，不作为业务判定依据）。
 - CloudBase 本地：SQL 36 PASS；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 / DAG / 审计 / 安全 54 PASS（mock 模型）；计划前置节点 5 PASS（本机 PGlite 桩）。
 - 前端计划表单 JSDOM：5 PASS（`npm run verify:plans-form`），另有 `npm run build` 通过。
 - `npm run verify:competition`：6 个定向脚本全部通过。

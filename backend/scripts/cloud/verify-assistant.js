@@ -131,7 +131,8 @@ try {
     && r.json.data.toolRecords[0].name === 'get_accounts'
     && r.json.data.toolRecords[0].status === 'ok'
     && r.json.data.toolRecords[0].data.length === 3, JSON.stringify(r.json?.data?.toolRecords))
-  check('查询：回复与工具记录返回', /3 个/.test(r.json.data.reply))
+  check('查询：回复由服务端账户块渲染', r.json.data.reply.includes('账户信息（服务端核验）')
+    && r.json.data.reply_blocks?.some((b) => b.kind === 'accounts' && b.fields?.items?.length === 3))
   let cur = await get('/api/assistant/current')
   check('会话：当前对话已持久化', cur.status === 200 && cur.json.data.sessionId === querySession
     && cur.json.data.messages.length === 2)
@@ -141,7 +142,7 @@ try {
   r = await post({ message: '继续', sessionId: querySession })
   const seen = JSON.stringify(calls[0] || [])
   check('续聊：模型输入包含上一轮用户与助手消息', r.status === 200
-    && seen.includes('查询我的账户') && seen.includes('账户共 3 个'))
+    && seen.includes('查询我的账户') && seen.includes('账户信息（服务端核验）'))
 
   // 模拟进程重启：新助手实例从 CloudBase 会话快照加载历史
   const assistant2 = createCloudAssistant({ client, userId: USER_ID, chatFn: mockChat })
@@ -153,15 +154,16 @@ try {
   }).then(async (res) => ({ status: res.status, json: await res.json() }))
   const reloadedSeen = JSON.stringify(calls[0] || [])
   check('续聊：新助手实例从数据库恢复历史', r.status === 200
-    && reloadedSeen.includes('查询我的账户') && reloadedSeen.includes('账户共 3 个'))
+    && reloadedSeen.includes('查询我的账户') && reloadedSeen.includes('账户信息（服务端核验）'))
   await new Promise((res) => reloaded.server.close(res))
 
   // 多轮补充信息后建单 + 歧义追问
-  setScript(finalResp('请选择付款账户：1 日常活期，2 储蓄活期'))
+  setScript(finalResp('{"kind":"clarification","code":"need_payment_account"}'))
   r = await post({ message: '给李雷转 100 元' })
   const createSession = r.json?.data?.sessionId
   check('歧义：多付款账户时先追问，不建单', r.status === 200
-    && r.json.data.toolRecords.length === 0 && /付款账户/.test(r.json.data.reply))
+    && r.json.data.toolRecords.length === 0 && /付款账户/.test(r.json.data.reply),
+    JSON.stringify({ status: r.status, reply: r.json?.data?.reply, message: r.json?.message, tools: r.json?.data?.toolRecords?.length }))
   const beforeTransfer = (await snapshot()).accounts.find((a) => Number(a.id) === Number(account1.id)).balance_cents
   setScript(
     toolResp('prepare_transfer', { recipient_id: 1, amount_yuan: '100.00', account_id: account1.id }),

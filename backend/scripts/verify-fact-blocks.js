@@ -5,6 +5,7 @@ import { initDatabase } from '../src/db/index.js'
 import { createAssistant } from '../src/services/assistant.js'
 import { buildReplyBlocks } from '../src/services/fact-guard.js'
 import { listCreditAccounts } from '../src/services/credit.js'
+import { createTransfer, confirmTransfer } from '../src/services/transfers.js'
 
 let failures = 0
 const check = (name, cond, detail = '') => {
@@ -131,7 +132,7 @@ try {
       chatFn: async () => (++n === 1 ? tool('get_transfer_status', { ref_no: 'not-exist' }, 'c-status') : fin('该笔转账已扣款 100.00 元。')),
     })
     const r = await a.chat({ message: '查一下转账状态' })
-    check('A：状态查询失败降级未核验', /查询失败|尚未核验/.test(r.reply) && !r.reply.includes('已扣款'), r.reply)
+    check('A：状态查询失败降级未核验', /查询失败|尚未核验|未找到对应的业务对象/.test(r.reply) && !r.reply.includes('已扣款'), r.reply)
   }
 
   // A：信用卡额度伪造 → 服务端额度块替换。
@@ -157,11 +158,127 @@ try {
     check('A：返回与持久化文案一致', last?.role === 'assistant' && last.text === r.reply && r.reply.includes('账户信息（服务端核验）'))
   }
 
-  // A：纯解释 / 澄清不被业务块改写。
+  // A：澄清必须走结构化枚举码，服务端生成模板；原始自由文本不直接展示。
+  {
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"clarification","code":"need_recipient"}') })
+    const r = await a.chat({ message: '我想转账' })
+    check('A：结构化澄清由服务端模板渲染',
+      r.reply === '请提供收款人姓名，或先让我列出常用收款人供您选择。'
+        && (r.reply_blocks || []).some((b) => b.kind === 'clarification' && b.source?.code === 'need_recipient'), r.reply)
+  }
   {
     const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('请问您要转给谁？需要提供收款人和金额。') })
     const r = await a.chat({ message: '我想转账' })
-    check('A：纯澄清保留原文', r.reply === '请问您要转给谁？需要提供收款人和金额。', r.reply)
+    check('A：未结构化追问不直接展示', r.reply !== '请问您要转给谁？需要提供收款人和金额。'
+      && r.reply.includes('无法依据当前服务端数据确认'), r.reply)
+  }
+
+  // —— 架构级：任意未受信草稿（无金额 / 中文大写 / 无单位数字 / 英文 / 表格 / 伪块 / 未知枚举）——
+  {
+    const UNTRUSTED = '我无法依据当前服务端数据确认该信息'
+    const drafts = [
+      ['无金额声明', '已经办好了。'],
+      ['中文大写金额', '您的存款余额是九十九万元。'],
+      ['无单位数字', '余额 999999'],
+      ['英文', 'The funds have reached the recipient.'],
+      ['表格', '| 项目 | 内容 |\n|---|---|\n| 金额 | 888.00 元 |'],
+      ['JSON 伪块', '{"amount":"888.00元","status":"completed"}'],
+      ['合法 answer 但无来源', '{"kind":"answer"}'],
+      ['未知枚举', '{"kind":"clarification","code":"unknown_code"}'],
+      ['自由文本参数', '{"kind":"clarification","code":"need_amount","params":{"text":"请转888元"}}'],
+    ]
+    for (const [label, draft] of drafts) {
+      const beforeTx = db.prepare('SELECT count(*) n FROM transactions').get().n
+      const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin(draft) })
+      const r = await a.chat({ message: '给李雷转600元，并查余额' })
+      const stored = a.getCurrent().messages.at(-1)?.text
+      check(`架构：未受信草稿不进入可见输出（${label}）`,
+        r.reply.startsWith(UNTRUSTED) && stored === r.reply && !r.reply.includes(draft)
+          && r.fact_guard?.trust === 'server_rendered' && r.fact_guard?.dropped_raw === true, r.reply)
+      check(`架构：未受信草稿不产生业务块 / 副作用（${label}）`,
+        (r.reply_blocks || []).length === 0 && db.prepare('SELECT count(*) n FROM transactions').get().n === beforeTx)
+    }
+  }
+
+  // —— 结构化枚举：服务端模板；未知 / 带自由文本的参数仍兜底 ——
+  {
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"clarification","code":"need_amount"}') })
+    const r = await a.chat({ message: '转账' })
+    check('架构：结构化澄清码生成服务端模板', r.reply === '请提供金额（元，最多两位小数）。'
+      && (r.reply_blocks || []).some((b) => b.source?.server_template && b.source?.code === 'need_amount'), r.reply)
+  }
+  {
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"explanation","code":"readonly_only"}') })
+    const r = await a.chat({ message: '直接扣款' })
+    check('架构：结构化解释码生成服务端模板', r.reply === '我只能查询和准备待确认操作单，不能直接执行扣款、冻结或更改业务状态。'
+      && (r.reply_blocks || []).some((b) => b.source?.server_template && b.source?.code === 'readonly_only'), r.reply)
+  }
+
+  // —— 成功查询始终渲染服务端块；原始草稿与错误数字都不进入块 ——
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('list_transfer_recipients', {}, 'c-recipients') : fin('收款人已经找到，请直接转账。')) })
+    const r = await a.chat({ message: '我的收款人有哪些？' })
+    check('架构：成功查询始终渲染服务端收款人块', r.reply.includes('收款人（服务端核验）')
+      && !r.reply.includes('收款人已经找到，请直接转账。')
+      && (r.reply_blocks || []).every((b) => !b.text.includes('请直接转账')), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('get_accounts', {}, 'c-acc-arch') : fin('您的存款余额是九十九万元。')) })
+    const r = await a.chat({ message: '查余额' })
+    check('架构：余额只从服务端账户块取值', r.reply.includes('账户信息（服务端核验）')
+      && !r.reply.includes('九十九万') && (r.reply_blocks || []).every((b) => !b.text.includes('九十九万')), r.reply)
+  }
+
+  // —— 会话关联的已完成转账：未受信否定文案不覆盖权威状态 ——
+  {
+    const sid = 'session-closure-completed'
+    const op = createTransfer(db, uid, { recipientId: rec, amountCents: 100, fromAccountId: acct, sessionId: sid })
+    confirmTransfer(db, uid, op.ref_no)
+    const now = Date.now()
+    db.prepare("INSERT INTO chat_sessions (id,user_id,messages_json,created_at,last_active_at) VALUES (?,?,'[]',?,?)").run(sid, uid, now, now)
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('这笔钱还没扣走。') })
+    const r = await a.chat({ message: '刚才的钱扣了吗', sessionId: sid })
+    check('架构：已完成转账不被未受信否定文案覆盖',
+      !r.reply.includes('还没扣走') && r.reply.includes('该笔转账已完成')
+        && (r.reply_blocks || []).some((b) => b.kind === 'operation_transfer' && b.fields?.status === 'completed'), r.reply)
+  }
+
+  // —— 返回 / 可见历史 / 续聊最终消息一致 ——
+  {
+    const calls = []
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async (args) => {
+      calls.push(JSON.parse(JSON.stringify(args.messages)))
+      n += 1
+      if (n === 1) return tool('get_accounts', {}, 'c-consistency')
+      return fin('{"kind":"explanation","code":"general_ack"}')
+    } })
+    const r1 = await a.chat({ message: '查余额' })
+    const view = a.getCurrent()
+    check('架构：返回与可见历史一致', view.messages.at(-1)?.text === r1.reply && r1.reply.includes('账户信息（服务端核验）'))
+    await a.chat({ message: '再说一次', sessionId: r1.sessionId })
+    const priorAssistant = (calls[2] || []).filter((m) => m.role === 'assistant').at(-1)
+    check('架构：续聊最终 assistant 消息使用同一受信文本', priorAssistant?.content === r1.reply,
+      JSON.stringify(priorAssistant?.content)?.slice(0, 120))
+  }
+
+  // —— 候选对象只来自已验证工具结果；非法 id 不回显 ——
+  {
+    const count = db.prepare('SELECT count(*) n FROM transfer_recipients').get().n
+    if (count < 2) db.prepare("INSERT INTO transfer_recipients (name, masked_account) VALUES ('李雷','6222 **** 9999')").run()
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1
+        ? tool('list_transfer_recipients', {}, 'c-candidates')
+        : fin('{"kind":"clarification","code":"ambiguous_recipient","params":{"ids":[999999]}}')) })
+    const r = await a.chat({ message: '收款人选哪个？' })
+    check('架构：候选澄清使用工具结果且不回显非法 id',
+      r.reply.includes('找到多个匹配的收款人') && !r.reply.includes('999999')
+        && (r.reply_blocks || []).some((b) => b.kind === 'recipients'), r.reply)
   }
 } catch (e) {
   failures += 1

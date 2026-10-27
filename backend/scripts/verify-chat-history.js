@@ -53,10 +53,13 @@ db.prepare('INSERT INTO accounts (user_id, account_name, opening_balance_cents, 
 const demoUserId = u1
 
 // ---------- 1 + 2. 旧会话保留、列表顺序与标题 ----------
+const GREETING = '您好，我可以帮您查询账户、账单、银行卡、订阅与信用卡信息，也可以准备待确认操作单。'
+const GENERAL_ACK = '好的，我已记录您的问题。'
+const READONLY_ONLY = '我只能查询和准备待确认操作单，不能直接执行扣款、冻结或更改业务状态。'
 const mockA = makeScriptedMock([
-  { content: 'A 回答一' },
-  { content: 'A 回答二' },
-  { content: 'B 回答一' },
+  { content: '{"kind":"explanation","code":"greeting"}' },
+  { content: '{"kind":"explanation","code":"general_ack"}' },
+  { content: '{"kind":"explanation","code":"readonly_only"}' },
 ])
 const assistant = createAssistant({ db, demoUserId, chatFn: mockA })
 const rA = await assistant.chat({ message: '旧会话问题' })
@@ -78,7 +81,7 @@ check('2.4 含最近活跃时间（毫秒）', typeof list[0].lastActiveAt === '
 // ---------- 3 + 4. 打开历史会话恢复消息并切换当前指针 ----------
 const viewA = assistant.getConversation(rA.sessionId)
 check('3.1 打开 A 返回其消息（2 用户 + 2 助手）', viewA.sessionId === rA.sessionId && viewA.messages.length === 4, String(viewA.messages.length))
-check('3.2 打开 A 恢复内容顺序', viewA.messages[0].text === '旧会话问题' && viewA.messages[3].text === 'A 回答二')
+check('3.2 打开 A 恢复内容顺序', viewA.messages[0].text === '旧会话问题' && viewA.messages[3].text === GENERAL_ACK)
 check('3.3 打开 A 后当前指针切到 A', assistant.getCurrent().sessionId === rA.sessionId)
 
 const viewB = assistant.getConversation(rB.sessionId)
@@ -123,7 +126,7 @@ check('7.1 列表与打开不调用模型', mockReadonly.calls === 0, String(moc
       }
       return { content: '已生成待确认转账单。', toolCalls: [], usage: null }
     }
-    return { content: 'B回复', toolCalls: [], usage: null }
+    return { content: '{"kind":"explanation","code":"readonly_only"}', toolCalls: [], usage: null }
   }
 
   const assistant = createAssistant({ db, demoUserId, chatFn: mock })
@@ -141,7 +144,7 @@ check('7.1 列表与打开不调用模型', mockReadonly.calls === 0, String(moc
   const viewB = assistant.getConversation(rB.sessionId)
   const bTexts = viewB.messages.map((m) => m.text)
   const bHasTransferCard = viewB.messages.some((m) => (m.toolRecords || []).some((t) => t.name === 'prepare_transfer'))
-  check('8.2 B 会话不含 A 消息', viewB.messages.length === 2 && bTexts[0] === 'B问题' && bTexts[1] === 'B回复' && !bHasTransferCard, JSON.stringify(bTexts))
+  check('8.2 B 会话不含 A 消息', viewB.messages.length === 2 && bTexts[0] === 'B问题' && bTexts[1] === READONLY_ONLY && !bHasTransferCard, JSON.stringify(bTexts))
 
   // A 已持久化：回复 + 结果卡 + 业务单引用
   const viewA = assistant.getConversation(rA.sessionId)
