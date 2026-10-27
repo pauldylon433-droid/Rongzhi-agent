@@ -3067,3 +3067,39 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
   `cloud-recheck`：R12 与云端 A 剩余项均被服务端兜底 / 块替换，B 故障注入仍 `operation_created:false`。
 - 未执行：真实 CloudBase 多连接 / 部署、真实模型、Chromium / 手机实机、部署环境沙箱资源；
   未推送、未部署、未执行云端 SQL、未调用收费模型；未修改现有业务库 / 密钥 / 绑定。
+
+---
+
+## 第六十阶段：A 最终输出层收口（提示码状态核验 + 成功结果可见）
+
+日期：2026-10-28（本地隔离；B/C 与原始草稿关闭逻辑保留，未重做）
+
+### 一、提示码必须绑定真实状态
+
+- 新增渲染上下文：相关操作单编号 / 类型 / 状态 / 风险 / 有效期 / 是否仍可确认，查询成功 / 空结果 / 失败 / 候选集合。
+- `need_confirmation` 仅在存在真实、相关、仍可确认的操作单时输出“已准备”；无单、已完成、已取消、已过期分别给出服务端中性文案。
+- `need_strong_verification` 仅在真实 `needs_verification` 或红色风险单上输出；黄色待确认单改为按真实状态提示，不再声称需要强验证。
+- `transfer_requires_confirmation` 改为不带“已准备”的通用规则；`no_data` / `query_failed` / `object_not_found` 必须有对应查询结果或错误依据。
+- 混合查询保留成功块，空结果 / 失败按具体工具逐条说明，不再用一句泛化提示否认全部结果。
+- `ids/account_ids` 与已核验工具结果 / 服务端账户列表求交集；顶层 `text/message/explanation` 等额外字段按协议拒绝。
+- 状态块对过期但数据库仍为 pending 的单据显示“已过期”，不写回业务库。
+
+### 二、成功工具结果可见
+
+- 新增 `plan_workflow` 块：计划编号、任务类型、当前状态、参数、下一步（计划任务入口）。
+- 新增 `start_subscription_review` 块：任务编号、月份、状态、下一步；保留原任务卡。
+- 沙箱块渲染已独立复算通过的合计 / 笔数 / 分类，保留 `authoritative:false` 与“非银行事实”说明；伪造分析仍被拒绝。
+- 19 个白名单工具的成功 / 空结果 / 失败 / 部分成功均有输出处理；成功块带 `call_id` / `ref_no` / `plan_no` / `task_no` 来源。
+- 合法 `answer`、合法解释码、无效自由文本三条路径都渲染真实成功工具结果；正文、`reply_blocks`、可见历史、续聊最终 assistant 消息一致。
+
+### 三、验证（实际执行）
+
+- 本地后端 `verify-*.js`：**46 / 46**；`verify:fact-blocks` **71 / 71**
+  （新增：无单/已完成/已过期 need_confirmation、黄色单 need_strong_verification、成功查询 + no_data、
+  真空 / 失败 / 混合查询、计划 / 任务 / 沙箱正文可见、19 工具成功/空/失败覆盖、伪造沙箱拒绝、非法候选 id / 顶层自由字段）。
+- CloudBase 本地：SQL 36 PASS；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 **62 PASS**；
+  `cloud:verify:deps` 5 PASS（本机 PGlite / RPC 桩）。
+- 前端 `verify:plans-form` 5 / 5；`npm run build` 通过（`index-CSTpLXAW.css` / `index-B5aMdmaj.js`）。
+- 独立复核包：`remaining-fact` 6 项保持不再原样展示；`cloud-recheck` A/B 通过；`fact-variants` 保持通过。
+- 未执行：真实 CloudBase 多连接 / 部署、真实模型、Chromium / 手机实机、部署环境沙箱资源；
+  未推送、未部署、未执行云端 SQL、未调用收费模型；未修改现有业务库 / 密钥 / 绑定。

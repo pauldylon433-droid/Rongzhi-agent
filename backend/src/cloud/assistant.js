@@ -620,17 +620,18 @@ export function collectCloudFacts(store, refs) {
     if (t) {
       const v = store.transferOp(ref)
       facts.set(`transfer:${ref}`, { kind: 'transfer', ref_no: ref, status: t.status, amount_cents: t.amount_cents,
-        transaction_id: v ? v.transaction_id ?? null : null })
+        transaction_id: v ? v.transaction_id ?? null : null, risk_level: t.risk_level, expires_at: t.expires_at })
       continue
     }
     const c = (snap.card_operations || []).find((o) => o.ref_no === ref)
-    if (c) { facts.set(`card:${ref}`, { kind: 'card', ref_no: ref, status: c.status, action: c.action, card_masked: c.card_masked }); continue }
+    if (c) { facts.set(`card:${ref}`, { kind: 'card', ref_no: ref, status: c.status, action: c.action, card_masked: c.card_masked,
+      risk_level: c.risk_level, expires_at: c.expires_at }); continue }
     const sub = (snap.subscription_operations || []).find((o) => o.ref_no === ref)
     if (sub) { facts.set(`subscription:${ref}`, { kind: 'subscription', ref_no: ref, status: sub.status, action: sub.action,
-      amount_cents: sub.amount_cents, merchant: sub.merchant }); continue }
+      amount_cents: sub.amount_cents, merchant: sub.merchant, risk_level: sub.risk_level, expires_at: sub.expires_at }); continue }
     const r = (snap.repayment_operations || []).find((o) => o.ref_no === ref)
     if (r) { facts.set(`repayment:${ref}`, { kind: 'repayment', ref_no: ref, status: r.status, action: 'repay',
-      amount_cents: r.amount_cents, statement_month: r.statement_month }) }
+      amount_cents: r.amount_cents, statement_month: r.statement_month, risk_level: r.risk_level, expires_at: r.expires_at }) }
   }
   return [...facts.values()]
 }

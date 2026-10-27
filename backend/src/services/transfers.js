@@ -152,6 +152,8 @@ export function latestTransferForSession(db, userId, sessionId) {
     recipient_name: row.recipient_name,
     transaction_id: v.transaction_id || null,
     confirmed_at: row.confirmed_at,
+    expires_at: row.expires_at,
+    risk_level: row.risk_level,
   }
 }
 

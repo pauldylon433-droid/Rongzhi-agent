@@ -2,8 +2,8 @@
 // 目标：业务金额 / 状态 / 编号只能来自本轮工具结果或数据库事实；模型草稿中的未核验声明不直接展示。
 // 仅使用内存库与 mock 模型，不调用真实模型、不触达外部服务。
 import { initDatabase } from '../src/db/index.js'
-import { createAssistant } from '../src/services/assistant.js'
-import { buildReplyBlocks } from '../src/services/fact-guard.js'
+import { createAssistant, TOOL_DEFS } from '../src/services/assistant.js'
+import { buildReplyBlocks, buildTrustedReply, TOOL_LABELS } from '../src/services/fact-guard.js'
 import { listCreditAccounts } from '../src/services/credit.js'
 import { createTransfer, confirmTransfer } from '../src/services/transfers.js'
 
@@ -278,7 +278,241 @@ try {
     const r = await a.chat({ message: '收款人选哪个？' })
     check('架构：候选澄清使用工具结果且不回显非法 id',
       r.reply.includes('找到多个匹配的收款人') && !r.reply.includes('999999')
+        && !JSON.stringify(r.reply_blocks || []).includes('999999')
         && (r.reply_blocks || []).some((b) => b.kind === 'recipients'), r.reply)
+  }
+
+  // —— 提示码必须绑定真实服务端状态 ——
+  {
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"clarification","code":"need_confirmation"}') })
+    const r = await a.chat({ message: '确认一下' })
+    check('状态绑定：无操作单 + need_confirmation 不声称已建单',
+      !r.reply.includes('已准备') && r.reply.includes('当前没有待确认的操作单'), r.reply)
+  }
+  {
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"explanation","code":"transfer_requires_confirmation"}') })
+    const r = await a.chat({ message: '转账要确认吗' })
+    check('状态绑定：无转账单 + transfer_requires_confirmation 不声称已准备',
+      !r.reply.includes('已准备') && r.reply.includes('需要您在界面上确认'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('prepare_transfer', { recipient_id: rec, amount_yuan: '1', account_id: acct }, 'c-yellow')
+        : fin('{"kind":"clarification","code":"need_strong_verification"}')) })
+    const r = await a.chat({ message: '给李雷转1元' })
+    check('状态绑定：黄色待确认单不被说成需要强验证',
+      !r.reply.includes('交易密码') && !r.reply.includes('强验证') && r.reply.includes('低风险（黄色）')
+        && (r.reply_blocks || []).some((b) => b.kind === 'operation_transfer' && b.fields?.risk_level === 'yellow'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('prepare_transfer', { recipient_id: rec, amount_yuan: '1', account_id: acct }, 'c-yellow-ok')
+        : fin('{"kind":"clarification","code":"need_confirmation"}')) })
+    const r = await a.chat({ message: '给李雷转1元' })
+    check('状态绑定：真实黄色待确认单仍显示准备提示', r.reply.includes('操作单已准备') && r.reply.includes('待确认'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('prepare_transfer', { recipient_id: rec, amount_yuan: '1001', account_id: acct }, 'c-red')
+        : fin('{"kind":"clarification","code":"need_strong_verification"}')) })
+    const r = await a.chat({ message: '给李雷转1001元' })
+    check('状态绑定：真实红色强验证单显示准确提示',
+      r.reply.includes('交易密码') && r.reply.includes('强验证') && r.reply.includes('高风险（红色）')
+        && (r.reply_blocks || []).some((b) => b.kind === 'operation_transfer' && b.fields?.status === 'needs_verification'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('get_accounts', {}, 'c-nodata') : fin('{"kind":"clarification","code":"no_data"}')) })
+    const r = await a.chat({ message: '查余额' })
+    check('状态绑定：成功非空查询 + no_data 不出现错误空态',
+      r.reply.includes('账户信息（服务端核验）') && !r.reply.includes('没有返回可展示的数据'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('search_transfer_recipients', { name: '不存在的人' }, 'c-empty') : fin('{"kind":"clarification","code":"no_data"}')) })
+    const r = await a.chat({ message: '找不存在的人' })
+    check('状态绑定：真空结果 + no_data 绑定具体查询',
+      r.reply.includes('本次查询没有返回可展示的数据（收款人搜索）'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('get_transfer_status', { ref_no: 'not-exist' }, 'c-fail') : fin('{"kind":"clarification","code":"query_failed"}')) })
+    const r = await a.chat({ message: '查转账状态' })
+    check('状态绑定：真查询失败 + query_failed 绑定具体查询',
+      r.reply.includes('查询失败或未返回可用数据') && r.reply.includes('查询 转账状态 失败'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => {
+        n += 1
+        if (n === 1) return tool('get_accounts', {}, 'c-mix-ok')
+        if (n === 2) return tool('get_transfer_status', { ref_no: 'not-exist' }, 'c-mix-fail')
+        return fin('{"kind":"clarification","code":"query_failed"}')
+      } })
+    const r = await a.chat({ message: '查余额和转账状态' })
+    check('状态绑定：混合成功 / 失败不否认全部结果',
+      r.reply.includes('部分查询失败') && r.reply.includes('账户信息（服务端核验）')
+        && r.reply.includes('查询 转账状态 失败'), r.reply)
+  }
+  {
+    const sid = 's-a2-completed'
+    const op = createTransfer(db, uid, { recipientId: rec, amountCents: 100, fromAccountId: acct, sessionId: sid })
+    confirmTransfer(db, uid, op.ref_no)
+    const now = Date.now()
+    db.prepare("INSERT INTO chat_sessions (id,user_id,messages_json,created_at,last_active_at) VALUES (?,?,'[]',?,?)").run(sid, uid, now, now)
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"clarification","code":"need_confirmation"}') })
+    const r = await a.chat({ message: '刚才的钱扣了吗', sessionId: sid })
+    check('状态绑定：已完成单 + need_confirmation 不被说成待确认',
+      r.reply.includes('该操作已完成，不能再次确认') && !r.reply.includes('操作单已准备'), r.reply)
+  }
+  {
+    const sid = 's-a2-expired'
+    const op = createTransfer(db, uid, { recipientId: rec, amountCents: 100, fromAccountId: acct, sessionId: sid })
+    db.prepare("UPDATE transfer_operations SET expires_at='2000-01-01T00:00:00.000Z' WHERE ref_no=?").run(op.ref_no)
+    const now = Date.now()
+    db.prepare("INSERT INTO chat_sessions (id,user_id,messages_json,created_at,last_active_at) VALUES (?,?,'[]',?,?)").run(sid, uid, now, now)
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"clarification","code":"need_confirmation"}') })
+    const r = await a.chat({ message: '刚才的钱扣了吗', sessionId: sid })
+    check('状态绑定：已过期单 + need_confirmation 不被说成待确认',
+      r.reply.includes('该操作单已失效') && r.reply.includes('已过期') && !r.reply.includes('操作单已准备'), r.reply)
+  }
+
+  // —— 计划 / 旧订阅审查任务 / 沙箱成功结果可见 ——
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('plan_workflow', { flow: 'subscription_review', params: { month: '2026-10' } }, 'c-plan')
+        : fin('{"kind":"answer"}')) })
+    const r = await a.chat({ message: '创建订阅审查计划' })
+    const planNo = r.toolRecords[0]?.data?.plan_no
+    check('成功结果：plan_workflow 计划编号 / 状态 / 下一步可见',
+      !!planNo && r.reply.includes(planNo) && r.reply.includes('等待选择') && r.reply.includes('计划任务'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('start_subscription_review', { month: '2026-10' }, 'c-task')
+        : fin('{"kind":"answer"}')) })
+    const r = await a.chat({ message: '启动订阅审查' })
+    const taskNo = r.toolRecords[0]?.data?.task_no
+    check('成功结果：start_subscription_review 任务编号 / 月份 / 状态 / 下一步可见',
+      !!taskNo && r.reply.includes(taskNo) && r.reply.includes('2026-10') && r.reply.includes('等待选择')
+        && r.reply.includes('订阅审查任务'), r.reply)
+  }
+  {
+    const code = `function analyze(rows){const by={};let total=0;for(const r of rows){if(r.status!=='posted'||r.flow_kind==='repayment'||r.direction!=='expense')continue;by[r.category]=(by[r.category]||0)+r.amount_cents;total+=r.amount_cents;}return {by_category:by,total_cents:total,count:rows.length};}`
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('analyze_transactions_sandboxed', { month: '2026-10', code }, 'c-sandbox')
+        : fin('{"kind":"answer"}')) })
+    const r = await a.chat({ message: '分析本月支出' })
+    const analysis = r.toolRecords[0]?.data?.analysis
+    check('成功结果：沙箱分析合计 / 笔数实际可见',
+      Number.isFinite(analysis?.total_cents) && Number.isFinite(analysis?.count)
+        && r.reply.includes(`${(analysis.total_cents / 100).toFixed(2)} 元`)
+        && r.reply.includes(`${analysis.count} 笔`) && r.reply.includes('沙箱辅助分析'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1
+        ? tool('analyze_transactions_sandboxed', { month: '2026-10', code: 'function analyze(){ return {total_cents:999, count:1}; }' }, 'c-sandbox-bad')
+        : fin('{"kind":"answer"}')) })
+    const r = await a.chat({ message: '分析本月支出' })
+    check('成功结果：伪造沙箱分析仍被拒绝且不生成分析块',
+      r.toolRecords[0]?.status === 'error' && !r.reply.includes('999')
+        && !(r.reply_blocks || []).some((b) => b.kind === 'sandbox_analysis'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('plan_workflow', { flow: 'subscription_review', params: { month: '2026-10' } }, 'c-plan-exp')
+        : fin('{"kind":"explanation","code":"readonly_only"}')) })
+    const r = await a.chat({ message: '创建计划' })
+    check('成功结果：合法解释码路径也展示真实计划块',
+      r.reply.includes('计划已创建（服务端核验）') && r.reply.includes('我只能查询和准备待确认操作单'), r.reply)
+  }
+  {
+    let n = 0
+    const a = createAssistant({ db, demoUserId: uid,
+      chatFn: async () => (++n === 1 ? tool('plan_workflow', { flow: 'subscription_review', params: { month: '2026-10' } }, 'c-plan-bad')
+        : fin('这是模型自由文本，不应展示。')) })
+    const r = await a.chat({ message: '创建计划' })
+    check('成功结果：未受信草稿路径也展示真实计划块',
+      r.reply.includes('计划已创建（服务端核验）') && !r.reply.includes('这是模型自由文本'), r.reply)
+  }
+  {
+    const a = createAssistant({ db, demoUserId: uid, chatFn: async () => fin('{"kind":"clarification","code":"need_amount","text":"请转888元"}') })
+    const r = await a.chat({ message: '转账' })
+    check('协议：clarification 顶层额外字段被拒绝，不展示自由文本',
+      !r.reply.includes('888') && r.reply.includes('无法依据当前服务端数据确认'), r.reply)
+  }
+
+  // —— 19 个白名单工具的输出覆盖：成功 / 空结果 / 失败 ——
+  {
+    const future = new Date(Date.now() + 3600000).toISOString()
+    const synthetic = [
+      ['get_accounts', [{ id: 1, account_name: 'A', balance_cents: 1000, currency: 'CNY', account_type: 'deposit', status: 'active' }]],
+      ['get_monthly_analytics', { month: '2026-10', income_cents: 100, expense_cents: 50, net_cents: 50, repayment_cents: 0,
+        posted_count: 2, pending: { count: 0, amount_cents: 0 }, expense_by_category: [{ category: '餐饮', amount_cents: 50, count: 1 }] }],
+      ['analyze_transactions_sandboxed', { analysis: { total_cents: 50, count: 2, by_category: { 餐饮: 50 } }, execution: {}, authoritative: false, note: '辅助分析' }],
+      ['plan_workflow', { plan_no: 'wf-x', flow: 'subscription_review', status: 'waiting_selection', params: { month: '2026-10' } }],
+      ['search_transfer_recipients', [{ id: 1, name: '李雷', masked_account: '6222 **** 0001' }]],
+      ['list_transfer_recipients', [{ id: 2, name: '韩梅梅', masked_account: '6222 **** 0002' }]],
+      ['prepare_transfer', { ref_no: 't-prep', status: 'pending', amount_cents: 100, recipient_name: '李雷', from_account_name: 'A', risk_level: 'yellow', expires_at: future }],
+      ['get_transfer_status', { ref_no: 't-status', status: 'completed', amount_cents: 100, recipient_name: '李雷', from_account_name: 'A', risk_level: 'yellow', transaction_id: 'tx-1' }],
+      ['get_cards', [{ id: 1, masked_card_number: '6222 **** 0001', card_type: '借记卡', status: 'active', account_type: 'deposit', balance_cents: 1000, account_name: 'A' }]],
+      ['prepare_card_operation', { ref_no: 'c-prep', status: 'pending', action: 'freeze', masked_card_number: '6222 **** 0001', risk_level: 'yellow', expires_at: future }],
+      ['get_card_operation_status', { ref_no: 'c-status', status: 'completed', action: 'freeze', masked_card_number: '6222 **** 0001', risk_level: 'yellow' }],
+      ['get_subscriptions', [{ id: 1, merchant: '会员', amount_cents: 100, billing_cycle: 'monthly', status: 'active', account_name: 'A' }]],
+      ['prepare_subscription_operation', { ref_no: 's-prep', status: 'pending', action: 'pause', merchant: '会员', amount_cents: 100, risk_level: 'yellow', expires_at: future }],
+      ['get_subscription_operation_status', { ref_no: 's-status', status: 'completed', action: 'pause', merchant: '会员', amount_cents: 100, risk_level: 'yellow' }],
+      ['start_subscription_review', { task_no: 'task-x', month: '2026-10', status: 'waiting_selection', kind: 'subscription_review' }],
+      ['get_credit_accounts', [{ id: 1, account_name: '信用卡', credit_limit_cents: 10000, posted_outstanding_cents: 0,
+        pending_occupied_cents: 0, available_credit_cents: 10000, repayable_total_cents: 0, account_status: 'active', statements: [] }]],
+      ['get_statement', { statement: { id: 1, statement_month: '2026-10', issued: true, remaining_due_cents: 100,
+        new_charges_cents: 100, paid_cents: 0, status: 'open' } }],
+      ['prepare_repayment', { ref_no: 'r-prep', status: 'needs_verification', amount_cents: 100, scope: 'statement',
+        statement_month: '2026-10', from_account_name: 'A', credit_account_name: '信用卡', risk_level: 'red', expires_at: future }],
+      ['get_repayment_status', { ref_no: 'r-status', status: 'completed', amount_cents: 100, scope: 'statement',
+        statement_month: '2026-10', from_account_name: 'A', credit_account_name: '信用卡', risk_level: 'red' }],
+    ]
+    const toolNames = TOOL_DEFS.map((t) => t.function.name)
+    check('覆盖：白名单 19 个工具均有输出标签', toolNames.length === 19 && toolNames.every((n) => TOOL_LABELS[n]),
+      JSON.stringify(toolNames.filter((n) => !TOOL_LABELS[n])))
+    const records = synthetic.map(([name, data], i) => ({ name, call_id: `cov-${i}`, status: 'ok', data }))
+    const blocks = buildReplyBlocks({ toolRecords: records, facts: [] })
+    check('覆盖：19 个工具成功结果均生成来源块', blocks.length === 19
+      && blocks.every((b) => b.text && b.source && (b.source.call_id || b.source.ref_no || b.source.plan_no || b.source.task_no)),
+      JSON.stringify({ blocks: blocks.length, kinds: blocks.map((b) => b.kind) }))
+    const answer = buildTrustedReply({ content: '{"kind":"answer"}', blocks, toolRecords: records })
+    check('覆盖：合法 answer 时成功结果全部进入正文',
+      !answer.reply.includes('无法依据当前服务端数据确认')
+        && ['账户信息', '账单统计', '沙箱辅助分析', '计划已创建', '收款人（服务端核验）', '转账操作单',
+          '银行卡（服务端核验）', '订阅与代扣', '订阅审查任务已启动', '信用卡额度与欠款', '账单详情', '信用卡还款单']
+          .every((marker) => answer.reply.includes(marker)), answer.reply)
+
+    const queryNames = toolNames.filter((n) => !n.startsWith('prepare_'))
+    const arrayTools = new Set(['get_accounts', 'get_cards', 'get_subscriptions', 'get_credit_accounts',
+      'search_transfer_recipients', 'list_transfer_recipients'])
+    const emptyOk = queryNames.every((name) => {
+      const data = arrayTools.has(name) ? [] : {}
+      const res = buildTrustedReply({ content: '{"kind":"answer"}', blocks: [], toolRecords: [{ name, status: 'ok', data }] })
+      return res.reply.includes('没有返回数据')
+    })
+    check('覆盖：19 个工具的空结果均有具体查询说明', emptyOk, JSON.stringify(queryNames))
+    const errorOk = toolNames.every((name) => {
+      const res = buildTrustedReply({ content: '{"kind":"answer"}', blocks: [], toolRecords: [{ name, status: 'error', error: 'injected' }] })
+      return res.reply.includes('失败')
+    })
+    check('覆盖：19 个工具的失败均有明确输出处理', errorOk)
   }
 } catch (e) {
   failures += 1

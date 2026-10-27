@@ -300,6 +300,9 @@ try {
   const taskSnap = await snapshot()
   check('订阅审查：启动任务并返回真实任务编号', r.status === 200 && taskNo
     && taskSnap.agent_tasks.some((t) => t.task_no === taskNo && t.session_id === r.json.data.sessionId))
+  check('订阅审查：正文展示任务编号 / 月份 / 状态 / 下一步', r.status === 200 && taskNo
+    && r.json.data.reply.includes(taskNo) && r.json.data.reply.includes('等待选择')
+    && r.json.data.reply.includes('订阅审查任务'))
 
   // 信用卡查询
   setScript(toolResp('get_credit_accounts', {}), finalResp('信用卡可用额度'))
@@ -309,13 +312,17 @@ try {
     && Array.isArray(r.json.data.toolRecords[0].data[0].statements))
 
   // 沙箱工具：正常执行 + 宿主访问阻断
-  const sandboxCode = 'function analyze(rows){ let total=0; for(const r of rows){ if(r.status==="posted" && r.direction==="expense") total+=r.amount_cents; } return {total_cents:total}; }'
+  const sandboxCode = 'function analyze(rows){ let total=0; for(const r of rows){ if(r.status==="posted" && r.direction==="expense" && r.flow_kind!=="repayment") total+=r.amount_cents; } return {total_cents:total, count:rows.length}; }'
   setScript(toolResp('analyze_transactions_sandboxed', { month, code: sandboxCode }), finalResp('沙箱分析完成'))
   r = await post({ message: '用沙箱分析本月支出' })
   check('沙箱工具：正常执行且标记非权威', r.status === 200
     && r.json.data.toolRecords[0].status === 'ok'
     && r.json.data.toolRecords[0].data.execution.sandbox === 'quickjs-wasm'
     && r.json.data.toolRecords[0].data.authoritative === false, JSON.stringify(r.json?.data?.toolRecords?.[0]))
+  const sandboxAnalysis = r.json?.data?.toolRecords?.[0]?.data?.analysis
+  check('沙箱工具：正文实际展示复算合计 / 笔数', Number.isFinite(sandboxAnalysis?.total_cents)
+    && r.json.data.reply.includes(`${(sandboxAnalysis.total_cents / 100).toFixed(2)} 元`)
+    && r.json.data.reply.includes(`${sandboxAnalysis.count} 笔`), r.json?.data?.reply)
   setScript(toolResp('analyze_transactions_sandboxed', { month, code: "function analyze(){ return require('fs').readFileSync('C:/Windows/win.ini'); }" }), finalResp('无法访问宿主'))
   r = await post({ message: '尝试读取宿主文件' })
   check('沙箱工具：宿主访问被阻断', r.status === 200
@@ -327,6 +334,9 @@ try {
   const planNo = r.json?.data?.toolRecords?.[0]?.data?.plan_no
   check('DAG 工具：创建云端订阅审查计划', r.status === 200 && planNo
     && r.json.data.toolRecords[0].data.status === 'waiting_selection', JSON.stringify(r.json?.data?.toolRecords?.[0]))
+  check('DAG 工具：正文展示计划编号 / 状态 / 下一步', r.status === 200 && planNo
+    && r.json.data.reply.includes(planNo) && r.json.data.reply.includes('等待选择')
+    && r.json.data.reply.includes('计划任务'))
   r = await get(`/api/workflows/${planNo}`)
   check('DAG 计划：云端 GET 可恢复计划', r.status === 200 && r.json.data.plan_no === planNo
     && r.json.data.nodes.some((n) => n.key === 'analyze_month' && n.status === 'completed'))
@@ -499,6 +509,29 @@ try {
   const cf3 = await assistant.chat({ message: '给李雷转1元' })
   check('云端事实块：错误表格金额被服务端操作单块替换',
     cf3.reply.includes('转账操作单（服务端核验）') && cf3.reply.includes('1.00 元') && !cf3.reply.includes('888.00'), cf3.reply)
+
+  // 状态绑定：合法提示码不能编造业务状态
+  setScript(finalResp('{"kind":"clarification","code":"need_confirmation"}'))
+  const st1 = await assistant.chat({ message: '确认一下' })
+  check('云端状态绑定：无操作单 need_confirmation 不声称已建单',
+    !st1.reply.includes('已准备') && st1.reply.includes('当前没有待确认的操作单'), st1.reply)
+  setScript(finalResp('{"kind":"explanation","code":"transfer_requires_confirmation"}'))
+  const st2 = await assistant.chat({ message: '转账要确认吗' })
+  check('云端状态绑定：无转账单 transfer_requires_confirmation 不声称已准备',
+    !st2.reply.includes('已准备') && st2.reply.includes('需要您在界面上确认'), st2.reply)
+  setScript(toolResp('prepare_transfer', { recipient_id: 1, amount_yuan: '1', account_id: account1.id }),
+    finalResp('{"kind":"clarification","code":"need_strong_verification"}'))
+  const st3 = await assistant.chat({ message: '给李雷转1元' })
+  check('云端状态绑定：黄色待确认单不被说成需要强验证',
+    !st3.reply.includes('交易密码') && !st3.reply.includes('强验证') && st3.reply.includes('低风险（黄色）'), st3.reply)
+  setScript(toolResp('get_accounts', {}), finalResp('{"kind":"clarification","code":"no_data"}'))
+  const st4 = await assistant.chat({ message: '查余额' })
+  check('云端状态绑定：成功非空查询 + no_data 不出现错误空态',
+    st4.reply.includes('账户信息（服务端核验）') && !st4.reply.includes('没有返回可展示的数据'), st4.reply)
+  setScript(finalResp('{"kind":"clarification","code":"need_amount","text":"请转888元"}'))
+  const st5 = await assistant.chat({ message: '转账' })
+  check('云端协议：clarification 顶层自由字段被拒绝',
+    !st5.reply.includes('888') && st5.reply.includes('无法依据当前服务端数据确认'), st5.reply)
 
   await new Promise((res) => enabled.server.close(res))
 } catch (e) {

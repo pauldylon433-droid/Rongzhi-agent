@@ -484,19 +484,22 @@ export function factsFromStatusSnapshots({ transfer = null, repayment = null, ca
   const facts = []
   if (transfer && /(转账|汇款|那笔|这笔|刚才的钱|刚刚的钱|转的款|扣了吗|扣走|到账|流水)/.test(s)) {
     facts.push({ kind: 'transfer', ref_no: transfer.ref_no, status: transfer.status, amount_cents: transfer.amount_cents,
-      transaction_id: transfer.transaction_id, recipient_name: transfer.recipient_name, from_account_name: transfer.from_account_name })
+      transaction_id: transfer.transaction_id, recipient_name: transfer.recipient_name,
+      from_account_name: transfer.from_account_name, expires_at: transfer.expires_at, risk_level: transfer.risk_level })
   }
   if (repayment && /(还款|还了吗|还款状态)/.test(s)) {
     facts.push({ kind: 'repayment', ref_no: repayment.ref_no, status: repayment.status, amount_cents: repayment.amount_cents,
       statement_month: repayment.statement_month, from_account_name: repayment.from_account_name,
-      credit_account_name: repayment.credit_account_name })
+      credit_account_name: repayment.credit_account_name, expires_at: repayment.expires_at, risk_level: repayment.risk_level })
   }
   if (card && /(冻结|解冻|银行卡状态|卡状态|冻结了吗|解冻了吗)/.test(s)) {
-    facts.push({ kind: 'card', ref_no: card.ref_no, status: card.status, action: card.action, card_masked: card.card_masked })
+    facts.push({ kind: 'card', ref_no: card.ref_no, status: card.status, action: card.action, card_masked: card.card_masked,
+      expires_at: card.expires_at, risk_level: card.risk_level })
   }
   if (subscription && /(订阅状态|代扣状态|已暂停|已恢复|已取消|暂停了吗|恢复了吗|取消了吗)/.test(s)) {
     facts.push({ kind: 'subscription', ref_no: subscription.ref_no, status: subscription.status,
-      action: subscription.action, merchant: subscription.merchant, amount_cents: subscription.amount_cents })
+      action: subscription.action, merchant: subscription.merchant, amount_cents: subscription.amount_cents,
+      expires_at: subscription.expires_at, risk_level: subscription.risk_level })
   }
   return facts
 }
@@ -520,6 +523,8 @@ function resolveReferencedTransfer(db, demoUserId, sessionId) {
           recipient_name: row.recipient_name,
           transaction_id: v.transaction_id || null,
           confirmed_at: row.confirmed_at,
+          expires_at: row.expires_at,
+          risk_level: row.risk_level,
         }
       }
     }
@@ -611,6 +616,8 @@ function resolveReferencedRepayment(db, demoUserId, sessionId) {
           credit_account_name: row.credit_account_name,
           statement_month: row.statement_month,
           confirmed_at: row.confirmed_at,
+          expires_at: row.expires_at,
+          risk_level: row.risk_level,
           statement: v.statement || null,
           allocations: v.allocations,
         }
@@ -695,7 +702,7 @@ export function resolveReferencedCardOp(db, demoUserId, sessionId) {
   return {
     ref_no: row.ref_no, status: row.status, action: row.action,
     card_masked: row.card_masked, from_status: row.from_status, to_status: row.to_status,
-    card: v.card || null, expires_at: row.expires_at,
+    card: v.card || null, expires_at: row.expires_at, risk_level: row.risk_level,
   }
 }
 
@@ -709,7 +716,7 @@ export function resolveReferencedSubscriptionOp(db, demoUserId, sessionId) {
   return {
     ref_no: row.ref_no, status: row.status, action: row.action,
     merchant: row.merchant, amount_cents: row.amount_cents, billing_cycle: row.billing_cycle,
-    from_status: row.from_status, to_status: row.to_status, expires_at: row.expires_at,
+    from_status: row.from_status, to_status: row.to_status, expires_at: row.expires_at, risk_level: row.risk_level,
   }
 }
 
@@ -1440,25 +1447,25 @@ export function collectLocalFacts(db, userId, refs) {
     if (t) {
       const v = viewTransfer(db, t)
       facts.set(`transfer:${ref}`, { kind: 'transfer', ref_no: ref, status: t.status, amount_cents: t.amount_cents,
-        transaction_id: v.transaction_id ?? null })
+        transaction_id: v.transaction_id ?? null, risk_level: t.risk_level, expires_at: t.expires_at })
       continue
     }
     const c = getCardOpRow(db, ref)
     if (c && c.user_id === userId) {
       facts.set(`card:${ref}`, { kind: 'card', ref_no: ref, status: c.status, action: c.action,
-        card_masked: c.card_masked })
+        card_masked: c.card_masked, risk_level: c.risk_level, expires_at: c.expires_at })
       continue
     }
     const sub = getSubscriptionOpRow(db, ref)
     if (sub && sub.user_id === userId) {
       facts.set(`subscription:${ref}`, { kind: 'subscription', ref_no: ref, status: sub.status, action: sub.action,
-        amount_cents: sub.amount_cents, merchant: sub.merchant })
+        amount_cents: sub.amount_cents, merchant: sub.merchant, risk_level: sub.risk_level, expires_at: sub.expires_at })
       continue
     }
     const r = getRepaymentOpRow(db, ref)
     if (r && r.user_id === userId) {
       facts.set(`repayment:${ref}`, { kind: 'repayment', ref_no: ref, status: r.status, action: 'repay',
-        amount_cents: r.amount_cents, statement_month: r.statement_month })
+        amount_cents: r.amount_cents, statement_month: r.statement_month, risk_level: r.risk_level, expires_at: r.expires_at })
     }
   }
   return [...facts.values()]
