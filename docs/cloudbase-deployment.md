@@ -55,6 +55,7 @@ AI 助手只调用查询 / 准备操作单 / 启动任务类工具，没有确�
 | `PUBLIC_AI_ENABLED` | 默认 `0`；设为 `1` 才允许助手调用模型 |
 | `DEEPSEEK_API_KEY` | 开启 AI 时必填 |
 | `PUBLIC_AI_RATE_LIMIT_PER_MIN` / `PUBLIC_AI_DAILY_CALL_QUOTA` / `PUBLIC_AI_MAX_CONCURRENCY` | 开启 AI 时必填，正整数 |
+| `TRUST_PROXY` | CloudBase 网关部署设为 `cloudbase`：只取网关注入的 `X-Original-Forwarded-For` 最后一段作为限流 / 可疑锁定来源；**不要设 `1`**（该网关的 `X-Forwarded-For` 会透传客户端伪造值） |
 
 模板见 `backend/.env.example`。启动时只校验变量名，**不会打印任何值**。
 

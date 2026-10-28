@@ -15,6 +15,7 @@ import { VerificationError } from '../services/verification.js'
 import { AssistantError } from '../services/assistant.js'
 import { loadVerificationKey } from '../lib/verification-key.js'
 import { createRateLimiter } from '../lib/rate-limit.js'
+import { getClientIp } from '../lib/client-ip.js'
 import { hasAiKey, isPublicDemo, getPublicDemoConfig } from '../config.js'
 
 const TRANSFER_CONFIRM_MSG = {
@@ -474,7 +475,7 @@ export function createCloudRouter({ client, demoUserId, assistant = null }) {
       return res.status(503).json({ success: false, message: '云端 AI 助手未启用；查询与手动操作仍可使用' })
     }
     if (chatLimiter) {
-      const lim = chatLimiter(req.ip || 'unknown')
+      const lim = chatLimiter(getClientIp(req))
       if (!lim.allowed) {
         res.set('Retry-After', String(Math.ceil(lim.retryAfterMs / 1000)))
         return res.status(429).json({ success: false, message: 'AI 请求过于频繁，请稍后重试' })

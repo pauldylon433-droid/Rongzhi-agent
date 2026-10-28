@@ -2,11 +2,12 @@
 // 与请求限流（429）、强验证锁定（423）分开；触发条件来自服务端拒绝 / 工具拒绝，而不是提示词关键词。
 // 安全状态读取失败时只读请求放行、敏感写操作返回 503（fail-closed），不静默跳过校验。
 import { isSuspiciousError } from '../services/security-guard.js'
+import { getClientIp } from '../lib/client-ip.js'
 
 export function securityGuardMiddleware(guardFactory) {
   return async (req, res, next) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next()
-    const scopeKey = req.ip || req.socket?.remoteAddress || 'unknown'
+    const scopeKey = getClientIp(req)
     let guard
     try { guard = guardFactory(scopeKey) } catch {
       return res.status(503).json({ success: false, code: 'security_state_unavailable',

@@ -145,13 +145,16 @@ if (dbMode === 'cloudbase') {
 
 const app = express()
 // 代理来源必须显式配置：默认不信任 X-Forwarded-For（本机直连按 socket 地址）。
-// 反向代理部署（Render / CloudBase 网关）需设置 TRUST_PROXY=1，才能用于限流 / 可疑锁定 scope。
+// TRUST_PROXY=1 / 数字：通用单层代理，由 Express 按显式跳数解析 X-Forwarded-For。
+// TRUST_PROXY=cloudbase：CloudBase 网关模式，X-Forwarded-For 可被客户端伪造，改由
+// lib/client-ip.js 取网关注入的 X-Original-Forwarded-For 最后一段（实测网关会追加真实 IP）。
 const trustProxyRaw = String(process.env.TRUST_PROXY || '').trim()
 if (trustProxyRaw === '1' || trustProxyRaw.toLowerCase() === 'true') {
   app.set('trust proxy', 1)
 } else if (/^\d+$/.test(trustProxyRaw)) {
   app.set('trust proxy', Math.max(0, Number(trustProxyRaw)))
 } else {
+  // cloudbase 与默认模式均不启用 Express 的代理头信任；cloudbase 模式在 getClientIp 内单独解析。
   app.set('trust proxy', false)
 }
 app.use(express.json())

@@ -7,6 +7,7 @@ import { createAssistant, AssistantError, MAX_USER_MESSAGE_LEN } from '../servic
 import { hasAiKey, isPublicDemo, getPublicDemoConfig } from '../config.js'
 import { createAiGuard } from '../lib/ai-guard.js'
 import { createRateLimiter } from '../lib/rate-limit.js'
+import { getClientIp } from '../lib/client-ip.js'
 import { chatCompletions } from '../lib/ai-client.js'
 import { createModelBreaker, isSuspiciousError } from '../services/security-guard.js'
 
@@ -94,7 +95,7 @@ export function createAssistantRouter(db, demoUserId, { chatFn = chatCompletions
       })
     }
     if (chatLimiter) {
-      const lim = chatLimiter(req.ip || 'unknown')
+      const lim = chatLimiter(getClientIp(req))
       if (!lim.allowed) {
         res.set('Retry-After', String(Math.ceil(lim.retryAfterMs / 1000)))
         return res.status(429).json({ success: false, message: 'AI 请求过于频繁，请稍后重试' })

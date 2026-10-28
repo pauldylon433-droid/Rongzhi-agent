@@ -11,6 +11,7 @@ import { createSecurityGuard, createModelBreaker, createLocalSecurityState } fro
 import { createApiRouter } from '../src/routes/index.js'
 import { createAssistantRouter } from '../src/routes/assistant.js'
 import { AiError } from '../src/lib/ai-client.js'
+import { getClientIp, parseOriginalForwardedFor } from '../src/lib/client-ip.js'
 
 const DB_PATH = join(tmpdir(), 'rongzhi-security-test.db')
 for (const p of [DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm']) { try { rmSync(p, { force: true }) } catch {} }
@@ -28,6 +29,18 @@ const userId = Number(db.prepare("INSERT INTO users (name) VALUES ('张三')").r
 const trail = createAuditTrail(db)
 const config = { enabled: true, windowMs: 60000, threshold: 3, lockMs: 60000 }
 const state = createLocalSecurityState(db)
+
+// 客户端来源：CloudBase 网关只信任 X-Original-Forwarded-For 的最后一段（真实客户端 IP），
+// X-Forwarded-For / X-Real-IP 可被客户端伪造，不能作为 scope 依据。
+const fakeReq = (headers, ip = '10.0.0.1') => ({ headers, ip, socket: { remoteAddress: ip } })
+check('客户端来源：取 X-Original-Forwarded-For 最后一段',
+  parseOriginalForwardedFor('203.0.113.77, 223.74.34.85') === '223.74.34.85')
+check('客户端来源：CloudBase 模式忽略伪造的 X-Forwarded-For',
+  getClientIp(fakeReq({ 'x-forwarded-for': '203.0.113.77', 'x-original-forwarded-for': '223.74.34.85' }), 'cloudbase') === '223.74.34.85')
+check('客户端来源：非法头回退到 socket / req.ip',
+  getClientIp(fakeReq({ 'x-original-forwarded-for': 'not-an-ip' }), 'cloudbase') === '10.0.0.1')
+check('客户端来源：默认模式不读代理头',
+  getClientIp(fakeReq({ 'x-original-forwarded-for': '203.0.113.77' }), '') === '10.0.0.1')
 
 const a = createSecurityGuard({ auditTrail: trail, stateStore: state, scopeKey: 'ip-a', config })
 const b = createSecurityGuard({ auditTrail: trail, stateStore: state, scopeKey: 'ip-b', config })
@@ -106,6 +119,48 @@ try {
   check('HTTP 异常：其他 IP 不受影响（仍为 400）', otherIp.status === 400)
 } finally {
   await new Promise((res) => server.close(res))
+}
+
+// CloudBase 网关模式：scope 取 X-Original-Forwarded-For 最后一段；伪造 X-Forwarded-For 不改变 scope。
+{
+  const oldTrust = process.env.TRUST_PROXY
+  const oldEnabled = process.env.SECURITY_ANOMALY_ENABLED
+  process.env.TRUST_PROXY = 'cloudbase'
+  process.env.SECURITY_ANOMALY_ENABLED = '1'
+  process.env.SECURITY_ANOMALY_THRESHOLD = '3'
+  process.env.SECURITY_ANOMALY_WINDOW_SECONDS = '60'
+  process.env.SECURITY_ANOMALY_LOCK_SECONDS = '60'
+  const app = express()
+  app.set('trust proxy', false)
+  app.use(express.json())
+  app.use('/api', createApiRouter(db, userId, trail))
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)) })
+  const base = `http://127.0.0.1:${server.address().port}`
+  const post = (xff, xoff) => fetch(`${base}/api/transfers`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(xff ? { 'X-Forwarded-For': xff } : {}),
+      ...(xoff ? { 'X-Original-Forwarded-For': xoff } : {}),
+    },
+    body: JSON.stringify({ recipient_id: 1, amount_cents: 100, from_account_id: 1, extra: true }),
+  })
+  try {
+    let last
+    for (let i = 0; i < 3; i++) last = await post('203.0.113.99', '10.9.9.21')
+    check('CloudBase 模式：前 3 次非法请求返回 400', last.status === 400)
+    await new Promise((r) => setTimeout(r, 200))
+    const blocked = await post('203.0.113.98', '10.9.9.21')
+    const bj = await blocked.json()
+    check('CloudBase 模式：同来源第 4 次返回 423（伪造 XFF 不改变 scope）',
+      blocked.status === 423 && bj.code === 'suspicious_locked', `status=${blocked.status}`)
+    const other = await post('203.0.113.99', '10.9.9.22')
+    check('CloudBase 模式：其他来源不受影响', other.status === 400)
+  } finally {
+    await new Promise((res) => server.close(res))
+    if (oldTrust === undefined) delete process.env.TRUST_PROXY; else process.env.TRUST_PROXY = oldTrust
+    if (oldEnabled === undefined) delete process.env.SECURITY_ANOMALY_ENABLED; else process.env.SECURITY_ANOMALY_ENABLED = oldEnabled
+  }
 }
 
 // P2-11：本地 SQLite 模式的路由层模型熔断（与云端共用 createModelBreaker）

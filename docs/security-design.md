@@ -210,6 +210,9 @@
   计数 / 锁定 / 到期使用独立持久状态（本地 `security_scope_state`、云端 `rongzhi_bank_security_scope_state` + 固定 RPC），
   不从审计最近 N 条推导，跨 scope 事件洪泛不会提前解锁；状态存储故障时敏感写操作返回 503（只读查询仍可用）。
   代理来源必须显式配置 `TRUST_PROXY`（默认不信任 `X-Forwarded-For`）。
+  CloudBase 网关部署使用 `TRUST_PROXY=cloudbase`：只取网关注入的 `X-Original-Forwarded-For` 最后一段
+  （实测网关会把真实客户端 IP 追加到链尾，而 `X-Forwarded-For` / `X-Real-IP` 会透传客户端伪造值）；
+  该模式下不启用 Express 的 `X-Forwarded-For` 信任，直接暴露服务时仍回退 socket 地址。
 - 模型服务熔断：本地与云端共用 `createModelBreaker`；连续真正模型故障达到 `MODEL_BREAKER_THRESHOLD` 后在
   `MODEL_BREAKER_COOLDOWN_MS` 内快速失败，返回 503 `model_breaker`；配额 / 并发 / 请求限流拒绝发生在熔断之外，不计入提供方故障。
 - 单个 scope 锁定不会锁死整个共享服务；其他 IP / 访客不受影响。
