@@ -98,10 +98,12 @@
 ### 本轮验证汇总（实际执行）
 
 - 本地 SQLite `verify-*.js`：**46 / 46**（原 43 + `verify-workflow-api.js` + `verify-db-path.js` + `verify-fact-blocks.js`）。
-  A 事实通道：`verify-fact-blocks.js` **71 / 71**（结构化协议；提示码绑定真实单据状态 / 风险 / 有效期，
-  成功查询必渲染块，计划 / 任务 / 沙箱结果正文可见，19 工具成功 / 空 / 失败覆盖，未受信草稿矩阵、持久化 / 续聊一致）。
+  A 事实通道：`verify-fact-blocks.js` **80 / 80**（结构化协议；提示码绑定真实单据状态 / 风险 / 有效期，
+  成功查询必渲染块，计划 / 任务 / 沙箱结果正文可见，19 工具成功 / 空 / 失败覆盖，工具名称 / call_id 元数据
+  不进入正文，生成期状态升级风险一致，未查询与查询为空区分，未受信草稿矩阵、持久化 / 续聊一致）。
+  Markdown 渲染回归 **37 / 37**（含恶意工具名 / call_id 实际渲染检查）。
 - 前端 `npm run build`：通过（本环境 `index-CSTpLXAW.css` / `index-B5aMdmaj.js`；构建哈希随工具链环境变化，不作为业务判定依据）。
-- CloudBase 本地：SQL 36 PASS；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 / DAG / 审计 / 安全 62 PASS（mock 模型）；计划前置节点 5 PASS（本机 PGlite 桩）。
+- CloudBase 本地：SQL 36 PASS；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 / DAG / 审计 / 安全 67 PASS（mock 模型）；计划前置节点 5 PASS（本机 PGlite 桩）。
 - 前端计划表单 JSDOM：5 PASS（`npm run verify:plans-form`），另有 `npm run build` 通过。
 - `npm run verify:competition`：6 个定向脚本全部通过。
 - 未执行：真实 CloudBase 多连接与部署、真实模型、浏览器自动化 / 手机布局实机验收、目标部署环境沙箱性能。

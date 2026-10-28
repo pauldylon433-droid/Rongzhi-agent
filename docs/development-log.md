@@ -3103,3 +3103,42 @@ AI 工作区顶部用 `<AgentTasksSection minimal />`，其 `load()` 拉取 `fet
 - 独立复核包：`remaining-fact` 6 项保持不再原样展示；`cloud-recheck` A/B 通过；`fact-variants` 保持通过。
 - 未执行：真实 CloudBase 多连接 / 部署、真实模型、Chromium / 手机实机、部署环境沙箱资源；
   未推送、未部署、未执行云端 SQL、未调用收费模型；未修改现有业务库 / 密钥 / 绑定。
+
+---
+
+## 第六十一阶段：A 输出层元数据 / 状态一致性收口
+
+日期：2026-10-28（本地隔离；A 原有修正、B/C 与旧回归保留）
+
+### 一、工具元数据不得进入受信正文
+
+- 工具名称 / 调用编号来自模型响应，按不可信输入处理：`queryNotes` 未知工具名统一显示“未知工具”，
+  不回显 `function.name`；`sourceLine` / 沙箱块不再把 `call_id` 写入 Markdown。
+- `call_id` 仅保留在结构化 `source.call_id`，用于内部关联 / 审计 / 测试；正文只使用固定服务端标签。
+- 合法工具的恶意 `call.id` 不再产生额外段落、加粗或表格；内部 `tool_call_id` 配对与审计关联不变。
+- 来源行中的 `ref_no / plan_no / task_no / account_ids / month` 均为服务端生成或校验后的参数。
+
+### 二、状态 / 风险使用同一最新来源
+
+- `operationBlock` 的状态、风险、有效期、金额统一优先取最新 fact；旧工具快照只在没有 fact 时使用。
+- 生成期间操作单升级为 `needs_verification / red` 后，正文风险行、`reply_blocks.fields.risk_level`、
+  状态提示与数据库一致，不再出现“需要强验证 + 低风险（黄色）”混用。
+- 未改风险阈值、确认权限、强验证或扣款逻辑。
+
+### 三、提示细节
+
+- `explanation` 路径保留实际查询失败 / 空结果说明，并同时保留成功结果块，不再被 `general_ack` 等解释码掩盖。
+- `need_object` 区分“未查询”与“查询为空”：未查询时提示“请先查询并选择…”，只有实际查询为空才说“本次查询未找到…”。
+  银行卡 / 订阅 / 账单 / 信用卡使用同一原则。
+
+### 四、验证（实际执行）
+
+- 本地后端 `verify-*.js`：**46 / 46**；`verify:fact-blocks` **80 / 80**
+  （新增：恶意工具名 / call_id、真实 Markdown 前正文、生成期风险升级、解释码保留查询失败、未查询 vs 空结果）。
+- CloudBase 本地：SQL 36 PASS；竞态 28 PASS / 3 SKIP；API 63 PASS；助手 **67 PASS**；
+  `cloud:verify:deps` 5 PASS（本机 PGlite / RPC 桩；含云端恶意元数据、风险交错、解释失败、未查询断言）。
+- 前端 Markdown 回归 **37 / 37**（真实 `renderMarkdown` + JSDOM；恶意工具名 / call_id 不生成加粗段落）；
+  `verify:plans-form` 5 / 5；`npm run build` 通过。
+- 独立复核包：`remaining-fact` / `cloud-recheck` / `fact-variants` 保持通过。
+- 未执行：真实 CloudBase 多连接 / 部署、真实模型、Chromium / 手机实机、部署环境沙箱资源；
+  未推送、未部署、未执行云端 SQL、未调用收费模型；未修改现有业务库 / 密钥 / 绑定。

@@ -169,7 +169,9 @@ const demoUserId = u1
 
   check('2.1 未知工具被拒绝（error）', r.toolRecords.length === 1 && r.toolRecords[0].status === 'error' && /未知工具/.test(r.toolRecords[0].error), r.toolRecords[0]?.error)
   check('2.2 工具失败无伪造数据', r.toolRecords[0].data === undefined)
-  check('2.3 回复由服务端解释模板给出', r.reply === '我只能查询和准备待确认操作单，不能直接执行扣款、冻结或更改业务状态。')
+  check('2.3 解释模板保留且查询失败说明不被吞掉',
+    r.reply.includes('我只能查询和准备待确认操作单，不能直接执行扣款、冻结或更改业务状态。')
+      && r.reply.includes('失败'), r.reply)
   const afterTx = db.prepare('SELECT COUNT(*) AS c FROM transactions').get().c
   const afterBal = db.prepare('SELECT balance_cents AS b FROM accounts WHERE user_id = ?').get(demoUserId).b
   check('2.4 转账请求未触发业务写入（交易数与余额不变）', afterTx === beforeTx && afterBal === beforeBal, `tx ${beforeTx}->${afterTx}, bal ${beforeBal}->${afterBal}`)

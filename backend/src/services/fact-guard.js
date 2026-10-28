@@ -197,9 +197,15 @@ const LIST_STATUS_TEXT = {
   open: '未结清', paid: '已结清', unissued: '未出账', issued: '已出账', failed: '失败',
 }
 
-function sourceLine(tool, callId, extra = '') {
-  const parts = [`来源：${tool}`]
-  if (callId) parts.push(`call_id=${callId}`)
+const INTERNAL_SOURCE_LABELS = {
+  transfer: '转账状态', card_operation: '银行卡操作状态',
+  subscription_operation: '订阅操作状态', repayment: '还款状态',
+}
+// 工具名称 / 调用编号来自模型响应，属于不可信元数据：正文只使用固定服务端标签，
+// call_id 仅保留在结构化 source 字段用于内部关联，不进入 Markdown。
+function sourceLine(tool, _callId, extra = '') {
+  const label = TOOL_LABELS[tool] || INTERNAL_SOURCE_LABELS[tool] || '业务功能'
+  const parts = [`来源：${label}`]
   if (extra) parts.push(extra)
   return parts.join(' · ')
 }
@@ -301,6 +307,7 @@ function operationBlock(rec, callId, kind, factByRef) {
   if (!d.ref_no) return null
   const f = d.ref_no ? factByRef.get(String(d.ref_no)) : null
   const status = f?.status || d.status
+  const riskLevel = f?.risk_level || d.risk_level || null
   const expiresAt = f?.expires_at || d.expires_at || null
   const expired = ['pending', 'needs_verification'].includes(status) && expiresAt
     && Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) <= Date.now()
@@ -314,20 +321,20 @@ function operationBlock(rec, callId, kind, factByRef) {
   let rows
   if (kind === 'transfer') {
     rows = [['操作编号', d.ref_no], ['状态', STATUS_TEXT[displayStatus] || displayStatus], ['金额', fmtCents(amountCents)],
-      ['收款人', d.recipient_name], ['付款账户', d.from_account_name], ['风险等级', riskLabel(d.risk_level)],
+      ['收款人', d.recipient_name], ['付款账户', d.from_account_name], ['风险等级', riskLabel(riskLevel)],
       ['备注', d.remark], ['到期时间', expiresAt]]
     if (fact.transaction_id) rows.push(['流水编号', fact.transaction_id])
   } else if (kind === 'card') {
     rows = [['操作编号', d.ref_no], ['状态', STATUS_TEXT[displayStatus] || displayStatus], ['操作', ACTION_TEXT[d.action] || d.action],
-      ['银行卡', d.masked_card_number], ['风险等级', riskLabel(d.risk_level)], ['到期时间', expiresAt]]
+      ['银行卡', d.masked_card_number], ['风险等级', riskLabel(riskLevel)], ['到期时间', expiresAt]]
   } else if (kind === 'subscription') {
     rows = [['操作编号', d.ref_no], ['状态', STATUS_TEXT[displayStatus] || displayStatus], ['操作', ACTION_TEXT[d.action] || d.action],
       ['订阅商户', d.merchant], ['每期金额', fmtCents(amountCents)], ['原扣款来源', d.from_account_name || d.from_masked_card],
-      ['新扣款来源', d.to_account_name || d.to_masked_card], ['风险等级', riskLabel(d.risk_level)]]
+      ['新扣款来源', d.to_account_name || d.to_masked_card], ['风险等级', riskLabel(riskLevel)]]
   } else {
     rows = [['操作编号', d.ref_no], ['状态', STATUS_TEXT[displayStatus] || displayStatus], ['还款范围', d.scope === 'all_posted' ? '结清全部已入账欠款' : '指定账单'],
       ['账期', d.statement_month], ['金额', fmtCents(amountCents)], ['付款账户', d.from_account_name],
-      ['信用卡', d.credit_account_name], ['风险等级', riskLabel(d.risk_level)]]
+      ['信用卡', d.credit_account_name], ['风险等级', riskLabel(riskLevel)]]
   }
   const title = { transfer: '转账操作单', card: '银行卡操作单', subscription: '订阅操作单', repayment: '信用卡还款单' }[kind]
   return {
@@ -335,7 +342,7 @@ function operationBlock(rec, callId, kind, factByRef) {
     source: { tool: rec.name, call_id: callId, ref_no: d.ref_no || null },
     fields: { ref_no: d.ref_no, status: displayStatus, amount_cents: amountCents, action: d.action, transaction_id: fact.transaction_id,
       statement_month: d.statement_month, recipient_name: d.recipient_name, merchant: d.merchant,
-      risk_level: d.risk_level, expires_at: expiresAt, from_account_name: d.from_account_name || null,
+      risk_level: riskLevel, expires_at: expiresAt, from_account_name: d.from_account_name || null,
       to_account_name: d.to_account_name || null, credit_account_name: d.credit_account_name || null,
       masked_card_number: d.masked_card_number || null, scope: d.scope || null },
     text: `${head}\n\n**${title}（服务端核验）**\n\n${mdTable(['项目', '内容'], rows)}\n\n${sourceLine(rec.name, callId, d.ref_no ? `ref_no=${d.ref_no}` : '')}`,
@@ -418,7 +425,7 @@ function analysisBlock(rec, callId) {
   return {
     kind: 'sandbox_analysis', authoritative: false, source: { tool: rec.name, call_id: callId },
     fields: { analysis: a, execution: rec.data?.execution ?? null, note: rec.data?.note ?? null },
-    text: `**沙箱辅助分析（非银行事实，不作为余额 / 交易 / 执行结果 / 风险判定依据）**\n\n${detail}\n\n来源：${rec.name}${callId ? ` · call_id=${callId}` : ''}`,
+    text: `**沙箱辅助分析（非银行事实，不作为余额 / 交易 / 执行结果 / 风险判定依据）**\n\n${detail}\n\n来源：${TOOL_LABELS[rec.name] || '沙箱分析'}`,
   }
 }
 
@@ -730,13 +737,13 @@ function buildRenderContext({ toolRecords = [], blocks = [], context = {} } = {}
     const name = rec.name
     if (rec.status === 'error') {
       const mapped = toolCodeFromMessage(rec.error)
-      queryStatus.push({ name, label: TOOL_LABELS[name] || name, status: 'error',
+      queryStatus.push({ name, label: TOOL_LABELS[name] || '未知工具', status: 'error',
         prepare: PREPARE_TOOL_NAMES.has(name), requiredCode: mapped?.code || null })
     } else if (rec.status === 'ok' && QUERY_TOOL_NAMES.has(name)) {
-      queryStatus.push({ name, label: TOOL_LABELS[name] || name,
+      queryStatus.push({ name, label: TOOL_LABELS[name] || '未知工具',
         status: isEmptyToolData(name, rec.data) ? 'empty' : 'ok', prepare: false })
     } else if (rec.status === 'ok' && PREPARE_TOOL_NAMES.has(name)) {
-      queryStatus.push({ name, label: TOOL_LABELS[name] || name, status: 'prepared', prepare: true })
+      queryStatus.push({ name, label: TOOL_LABELS[name] || '未知工具', status: 'prepared', prepare: true })
     }
   }
   const operations = blocks
@@ -865,11 +872,16 @@ function validateTemplate(env, ctx) {
     const key = OBJECT_CANDIDATE_KEY[type]
     const list = key ? (ctx.candidates[key] || []) : []
     if (list.length) return { valid: true, code, text: clarificationTemplate(code, env.params, [], ctx) }
-    if (type === 'card') return { valid: false, code, text: '未找到可操作的银行卡；请先查询本人银行卡。' }
-    if (type === 'subscription') return { valid: false, code, text: '未找到可操作的订阅；请先查询本人订阅。' }
-    if (type === 'statement') return { valid: false, code, text: '未找到可还款的已出账账单；如要提前还款，请使用结清全部已入账欠款。' }
-    if (type === 'credit_account') return { valid: false, code, text: '未找到信用卡账户；请先查询本人信用卡。' }
-    return { valid: false, code, text: '请选择要操作的对象。' }
+    const queryName = { card: 'get_cards', subscription: 'get_subscriptions',
+      statement: 'get_credit_accounts', credit_account: 'get_credit_accounts' }[type]
+    const label = { card: '银行卡', subscription: '订阅', statement: '已出账账单', credit_account: '信用卡' }[type]
+    const states = queryName ? ctx.queryStatus.filter((q) => q.name === queryName).map((q) => q.status) : []
+    const queriedOk = states.includes('ok') || states.includes('empty')
+    const queryFailed = states.includes('error')
+    if (!queriedOk && !queryFailed) return { valid: false, code, text: `请先查询并选择${label || '业务对象'}。` }
+    if (queryFailed) return { valid: false, code, text: `查询${label || '业务对象'}失败，未能确认可操作对象；请稍后重试。` }
+    if (type === 'statement') return { valid: false, code, text: '本次查询未找到可还款的已出账账单；如要提前还款，请使用结清全部已入账欠款。' }
+    return { valid: false, code, text: `本次查询未找到可操作的${label || '业务对象'}。` }
   }
   if (code === 'need_payment_account') {
     const list = ctx.candidates.depositAccounts
@@ -927,8 +939,7 @@ export function buildTrustedReply({
       const params = sanitizeEnvelopeParams(env, ctx)
       allBlocks.unshift(templateBlock(env.kind, v.code || env.code, v.text, params))
     }
-    const applyNotes = env.kind === 'explanation' ? (v.notes || [])
-      : (v.notes !== undefined ? v.notes : notes)
+    const applyNotes = v.notes !== undefined ? v.notes : notes
     const text = [joinBlocks(allBlocks), ...(applyNotes || [])].filter(Boolean).join('\n\n')
     if (text) {
       return { reply: text, blocks: allBlocks, reason: `protocol_${env.kind}`,
