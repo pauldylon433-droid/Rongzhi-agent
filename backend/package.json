@@ -14,8 +14,9 @@
     "cloud:verify:sql": "node scripts/cloud/verify-sql.js",
     "cloud:verify:api": "node scripts/cloud/verify-api.js",
     "cloud:verify:assistant": "node scripts/cloud/verify-assistant.js",
-    "cloud:verify": "npm run cloud:verify:sql && npm run cloud:verify:races && npm run cloud:verify:api && npm run cloud:verify:assistant && npm run cloud:verify:deps",
+    "cloud:verify": "npm run cloud:verify:sql && npm run cloud:verify:races && npm run cloud:verify:api && npm run cloud:verify:assistant && npm run cloud:verify:startup && npm run cloud:verify:deps",
     "cloud:verify:deps": "node scripts/cloud/verify-plan-deps.js",
+    "cloud:verify:startup": "node scripts/cloud/verify-startup.js",
     "ai:check": "node scripts/ai-check.js",
     "cloud:verify:races": "node scripts/cloud/verify-races.js",
     "verify:receipts": "node scripts/verify-authoritative-receipts.js",
@@ -39,6 +40,6 @@
     "nodemon": "^3.1.14"
   },
   "engines": {
-    "node": ">=20.12 <25"
+    "node": ">=22 <25"
   }
 }

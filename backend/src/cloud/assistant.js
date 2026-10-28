@@ -117,11 +117,18 @@ function subscriptionStatusReply(store, snapshot) {
   return `该订阅${act}操作${({ pending:'待确认（未执行）', needs_verification:'需要强验证（未执行）', cancelled:'已取消', expired:'已过期', failed:'已失效' })[current.status] || current.status}。`
 }
 
-function transferStatusReply(store, snapshot) {
+function transferStatusReply(store, snapshot, draft = '', preparedNewTransfer = false) {
   if (!snapshot || typeof snapshot.ref_no !== 'string' || !snapshot.ref_no) return null
   const row = (store.snapshot.transfer_operations || []).find((o) => o.ref_no === snapshot.ref_no)
   const current = store.transferOp(snapshot.ref_no)
-  if (!row || !current || current.status === snapshot.status) return null
+  if (!row || !current) return null
+  // 覆盖当前轮明确引用该已完成单据、却仍说“待确认”的陈旧文案；本轮新建单不覆盖。
+  const staleCompletedClaim = current.status === 'completed' && !preparedNewTransfer
+    && String(draft).split(/[。！？\n]/).some((sentence) => {
+      const identifiesOrder = sentence.includes(snapshot.ref_no) || sentence.includes(snapshot.ref_no.slice(0, 8))
+      return identifiesOrder && /(?:仍为|仍是|还是|处于|状态[：:为是\s]*)(?:\*\*)?待确认/.test(sentence)
+    })
+  if (current.status === snapshot.status && !staleCompletedClaim) return null
   if (current.status === 'completed') {
     return `该笔转账已完成，金额 ${centsToYuan(row.amount_cents)} 元，流水编号 ${current.transaction_id ?? '未知'}。`
   }
@@ -735,7 +742,10 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
       // 回复生成后复核本轮引用单的最新状态；变化时用服务端权威文案替换模型草稿。
       await load().then((fresh) => { state.store = fresh })
       const authoritativeReplies = [
-        statusReplyRelevant('transfer', trimmed, toolRecords) ? transferStatusReply(state.store, snapshotTransfer) : null,
+        statusReplyRelevant('transfer', trimmed, toolRecords)
+          ? transferStatusReply(state.store, snapshotTransfer, finalReply,
+            toolRecords.some((r) => r.status === 'ok' && r.name === 'prepare_transfer'))
+          : null,
         statusReplyRelevant('repayment', trimmed, toolRecords) ? repaymentStatusReply(state.store, snapshotRepayment) : null,
         statusReplyRelevant('card', trimmed, toolRecords) ? cardStatusReply(state.store, snapshotCard) : null,
         statusReplyRelevant('subscription', trimmed, toolRecords) ? subscriptionStatusReply(state.store, snapshotSubscription) : null,
