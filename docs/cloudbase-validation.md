@@ -15,6 +15,10 @@
 | mock 模型 + PGlite RPC 桩 + 真实 Express 路由 | `npm run cloud:verify:assistant` 48 PASS / 0 FAIL | 19 工具契约、查询、多轮建单、越权拒绝、敏感信息隔离、状态交错、AI 开关 | 真实模型行为与平台网络 |
 | 真实 CloudBase | 本轮未执行（按约束不建表 / 不部署） | — | 需部署后单独记录 |
 
+> 2026-10-28 演示问题修复复验（仍为 PGlite / RPC 桩，不连真实云端）：`cloud:verify:assistant` **74 PASS / 0 FAIL**，
+> 工具契约更新为 20 个；新增只读 `get_transactions` 的待入账明细、账户筛选与越权拒绝检查。
+> 该结果不改变上表“不能证明真实 CloudBase 网关 / 性能”的边界。
+>
 > 前置任务中的 HTTPS RPC 验收结果为 PASS 78 / FAIL 0 / SKIP 2（仅跳过 anon/authenticated 真实令牌）；
 > 该结果属于 RPC 能力验收，不等同于本轮业务持久化适配的云端验收。
 

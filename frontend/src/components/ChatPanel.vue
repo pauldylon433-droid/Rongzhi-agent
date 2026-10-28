@@ -5,6 +5,8 @@ import { ref, reactive, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useChatSession } from '../composables/useChatSession.js'
 import { useDataRefresh } from '../composables/useDataRefresh.js'
 import { formatMoney, formatCentsToYuan, formatShanghaiDateTime, formatShanghaiDate } from '../utils/format.js'
+import { hasIncompleteNotice } from '../utils/chatNotice.js'
+import { previousTransferNotice } from '../utils/transferDisplay.js'
 import TransferConfirmCard from './TransferConfirmCard.vue'
 import CardOperationConfirmCard from './CardOperationConfirmCard.vue'
 import SubscriptionOperationConfirmCard from './SubscriptionOperationConfirmCard.vue'
@@ -236,7 +238,7 @@ onBeforeUnmount(() => {
             <p v-if="m.error" class="chat-error">{{ m.error }}</p>
             <template v-else>
               <MarkdownContent v-if="m.text" :text="m.text" />
-              <p v-if="m.incomplete" class="chat-incomplete">（本轮回答未完成，请稍后重试）</p>
+              <p v-if="m.incomplete && !hasIncompleteNotice(m.text)" class="chat-incomplete">（本轮回答未完成，请稍后重试）</p>
               <p v-if="messageHasTerminalOp(m)" class="chat-stale-note">以上回复为操作创建时说明，当前状态见下方回执。</p>
 
               <div v-for="rec in okRecords(m)" :key="rec.__i" class="result-cards">
@@ -312,7 +314,8 @@ onBeforeUnmount(() => {
                 </template>
 
                 <template v-else-if="rec.name === 'prepare_transfer'">
-                  <p v-if="rec.data && rec.data.notice && !isTerminalStatus(opStatusOf(rec))" class="transfer-notice">{{ rec.data.notice }}</p>
+                  <p v-if="rec.data && rec.data.previous" class="transfer-notice">{{ previousTransferNotice(rec.data) }}</p>
+                  <p v-else-if="rec.data && rec.data.notice && !isTerminalStatus(opStatusOf(rec))" class="transfer-notice">{{ rec.data.notice }}</p>
                   <TransferConfirmCard :op="rec.data" @confirmed="onTransferConfirmed" @status="(s) => onOpStatus(rec.data.ref_no, s)" />
                 </template>
 

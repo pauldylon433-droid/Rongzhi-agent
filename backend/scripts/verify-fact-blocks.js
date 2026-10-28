@@ -455,13 +455,18 @@ try {
       !r.reply.includes('888') && r.reply.includes('无法依据当前服务端数据确认'), r.reply)
   }
 
-  // —— 19 个白名单工具的输出覆盖：成功 / 空结果 / 失败 ——
+  // —— 20 个白名单工具的输出覆盖：成功 / 空结果 / 失败 ——
   {
     const future = new Date(Date.now() + 3600000).toISOString()
     const synthetic = [
       ['get_accounts', [{ id: 1, account_name: 'A', balance_cents: 1000, currency: 'CNY', account_type: 'deposit', status: 'active' }]],
       ['get_monthly_analytics', { month: '2026-10', income_cents: 100, expense_cents: 50, net_cents: 50, repayment_cents: 0,
         posted_count: 2, pending: { count: 0, amount_cents: 0 }, expense_by_category: [{ category: '餐饮', amount_cents: 50, count: 1 }] }],
+      ['get_transactions', { month: '2026-10', status: 'pending', total: 1, returned: 1, rows: [
+        { id: 1, account_id: 1, account_name: 'A', direction: 'expense', amount_cents: 30000, category: '转账',
+          merchant: '韩梅梅', description: '待入账转账', transaction_at: '2026-10-20T02:00:00.000Z',
+          posted_at: null, status: 'pending' },
+      ] }],
       ['analyze_transactions_sandboxed', { analysis: { total_cents: 50, count: 2, by_category: { 餐饮: 50 } }, execution: {}, authoritative: false, note: '辅助分析' }],
       ['plan_workflow', { plan_no: 'wf-x', flow: 'subscription_review', status: 'waiting_selection', params: { month: '2026-10' } }],
       ['search_transfer_recipients', [{ id: 1, name: '李雷', masked_account: '6222 **** 0001' }]],
@@ -485,17 +490,17 @@ try {
         statement_month: '2026-10', from_account_name: 'A', credit_account_name: '信用卡', risk_level: 'red' }],
     ]
     const toolNames = TOOL_DEFS.map((t) => t.function.name)
-    check('覆盖：白名单 19 个工具均有输出标签', toolNames.length === 19 && toolNames.every((n) => TOOL_LABELS[n]),
+    check('覆盖：白名单 20 个工具均有输出标签', toolNames.length === 20 && toolNames.every((n) => TOOL_LABELS[n]),
       JSON.stringify(toolNames.filter((n) => !TOOL_LABELS[n])))
     const records = synthetic.map(([name, data], i) => ({ name, call_id: `cov-${i}`, status: 'ok', data }))
     const blocks = buildReplyBlocks({ toolRecords: records, facts: [] })
-    check('覆盖：19 个工具成功结果均生成来源块', blocks.length === 19
+    check('覆盖：20 个工具成功结果均生成来源块', blocks.length === 20
       && blocks.every((b) => b.text && b.source && (b.source.call_id || b.source.ref_no || b.source.plan_no || b.source.task_no)),
       JSON.stringify({ blocks: blocks.length, kinds: blocks.map((b) => b.kind) }))
     const answer = buildTrustedReply({ content: '{"kind":"answer"}', blocks, toolRecords: records })
     check('覆盖：合法 answer 时成功结果全部进入正文',
       !answer.reply.includes('无法依据当前服务端数据确认')
-        && ['账户信息', '账单统计', '沙箱辅助分析', '计划已创建', '收款人（服务端核验）', '转账操作单',
+        && ['账户信息', '账单统计', '交易明细', '沙箱辅助分析', '计划已创建', '收款人（服务端核验）', '转账操作单',
           '银行卡（服务端核验）', '订阅与代扣', '订阅审查任务已启动', '信用卡额度与欠款', '账单详情', '信用卡还款单']
           .every((marker) => answer.reply.includes(marker)), answer.reply)
 
@@ -507,12 +512,12 @@ try {
       const res = buildTrustedReply({ content: '{"kind":"answer"}', blocks: [], toolRecords: [{ name, status: 'ok', data }] })
       return res.reply.includes('没有返回数据')
     })
-    check('覆盖：19 个工具的空结果均有具体查询说明', emptyOk, JSON.stringify(queryNames))
+    check('覆盖：20 个工具的空结果均有具体查询说明', emptyOk, JSON.stringify(queryNames))
     const errorOk = toolNames.every((name) => {
       const res = buildTrustedReply({ content: '{"kind":"answer"}', blocks: [], toolRecords: [{ name, status: 'error', error: 'injected' }] })
       return res.reply.includes('失败')
     })
-    check('覆盖：19 个工具的失败均有明确输出处理', errorOk)
+    check('覆盖：20 个工具的失败均有明确输出处理', errorOk)
   }
 
   // —— 工具元数据不可信：名称 / 调用编号不得进入受信 Markdown ——

@@ -84,6 +84,13 @@ function fmtCents(cents) {
   const n = Number(cents)
   return Number.isFinite(n) ? `${(n / 100).toFixed(2)} 元` : '金额未知'
 }
+function shanghaiMinute(iso) {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso || '—'
+  const s = new Date(d.getTime() + 8 * 60 * 60 * 1000)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${s.getUTCFullYear()}-${p(s.getUTCMonth() + 1)}-${p(s.getUTCDate())} ${p(s.getUTCHours())}:${p(s.getUTCMinutes())}`
+}
 function cell(v) {
   if (v === null || v === undefined || v === '') return '—'
   return String(v).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ')
@@ -243,6 +250,33 @@ function analyticsBlock(rec, callId) {
     text: `**${d.month || '本月'} 账单统计（服务端核验）**\n\n${mdTable(['项目', '数值'], rows)}\n\n${sourceLine('get_monthly_analytics', callId, `month=${d.month || '—'}${rec.args?.account_id ? ` · account_id=${rec.args.account_id}` : ''}`)}`,
   }
 }
+function transactionsBlock(rec, callId) {
+  const d = rec.data || {}
+  const rows = Array.isArray(d.rows) ? d.rows : []
+  if (!rows.length) return null
+  const body = rows.map((r) => [
+    shanghaiMinute(r.transaction_at),
+    r.account_name || '—',
+    r.direction === 'income' ? '收入' : r.flow_kind === 'repayment' ? '还款' : '支出',
+    fmtCents(r.amount_cents),
+    r.category || '—',
+    r.merchant || '—',
+    r.status === 'pending' ? '待入账' : '已入账',
+  ])
+  return {
+    kind: 'transactions', authoritative: true, source: { tool: 'get_transactions', call_id: callId },
+    fields: { month: d.month, account_id: d.account_id ?? null, status: d.status || null,
+      total: d.total, returned: d.returned, items: rows.map((r) => ({
+        transaction_id: r.id, account_id: r.account_id, account_name: r.account_name,
+        direction: r.direction, amount_cents: r.amount_cents, category: r.category,
+        merchant: r.merchant, transaction_at: r.transaction_at, status: r.status,
+      })) },
+    text: `**${d.month || '本月'} 交易明细（服务端核验）**\n\n` +
+      `${mdTable(['时间', '账户', '方向', '金额', '分类', '商户', '状态'], body)}\n\n` +
+      `共 ${d.total ?? rows.length} 笔，显示 ${d.returned ?? rows.length} 笔。\n\n` +
+      `${sourceLine('get_transactions', callId, `month=${d.month || '—'}${d.status ? ` · status=${d.status}` : ''}${d.account_id ? ` · account_id=${d.account_id}` : ''}`)}`,
+  }
+}
 function subscriptionsBlock(rec, callId) {
   const data = Array.isArray(rec.data) ? rec.data : []
   if (!data.length) return null
@@ -353,7 +387,8 @@ function factBlock(f) {
   const recName = { transfer: 'transfer', card: 'card_operation', subscription: 'subscription_operation', repayment: 'repayment' }[f.kind]
   return operationBlock({ name: recName, data: { ref_no: f.ref_no, status: f.status, amount_cents: f.amount_cents,
     action: f.action, transaction_id: f.transaction_id, statement_month: f.statement_month,
-    masked_card_number: f.card_masked, merchant: f.merchant, expires_at: f.expires_at, risk_level: f.risk_level } },
+    masked_card_number: f.card_masked, merchant: f.merchant, expires_at: f.expires_at, risk_level: f.risk_level,
+    recipient_name: f.recipient_name, from_account_name: f.from_account_name } },
   null, f.kind, new Map([[String(f.ref_no), f]]))
 }
 function recipientsBlock(rec, callId) {
@@ -444,6 +479,7 @@ export function buildReplyBlocks({ toolRecords = [], facts = [] } = {}) {
     const name = rec.name
     if (name === 'get_accounts') upsert(`accounts:${callId || blocks.length}`, accountsBlock(rec, callId))
     else if (name === 'get_monthly_analytics') upsert(`analytics:${rec.data?.month}:${rec.args?.account_id ?? 'all'}:${callId || blocks.length}`, analyticsBlock(rec, callId))
+    else if (name === 'get_transactions') upsert(`transactions:${callId || blocks.length}`, transactionsBlock(rec, callId))
     else if (name === 'get_subscriptions') upsert(`subscriptions:${callId || blocks.length}`, subscriptionsBlock(rec, callId))
     else if (name === 'get_cards') upsert(`cards:${callId || blocks.length}`, cardsBlock(rec, callId))
     else if (name === 'get_credit_accounts') upsert(`credit:${callId || blocks.length}`, creditBlock(rec, callId))
@@ -469,7 +505,7 @@ export function buildReplyBlocks({ toolRecords = [], facts = [] } = {}) {
   }
   // 操作单 / 状态回执优先展示，其次账户 / 账单 / 列表；保证回复首行是当前业务的权威回执。
   const priority = { operation_transfer: 100, operation_repayment: 100, operation_card: 100, operation_subscription: 100,
-    plan: 95, task: 95, accounts: 80, analytics: 70, credit_accounts: 60, statement: 60, subscriptions: 50, cards: 50,
+    plan: 95, task: 95, accounts: 80, transactions: 75, analytics: 70, credit_accounts: 60, statement: 60, subscriptions: 50, cards: 50,
     sandbox_analysis: 40, recipients: 10 }
   return blocks.sort((a, b) => (priority[b.kind] ?? 30) - (priority[a.kind] ?? 30))
 }
@@ -672,7 +708,8 @@ function joinBlocks(blocks) {
 }
 
 export const TOOL_LABELS = {
-  get_accounts: '账户查询', get_monthly_analytics: '账单统计', analyze_transactions_sandboxed: '沙箱分析',
+  get_accounts: '账户查询', get_monthly_analytics: '账单统计', get_transactions: '交易明细查询',
+  analyze_transactions_sandboxed: '沙箱分析',
   plan_workflow: '计划创建', search_transfer_recipients: '收款人搜索', list_transfer_recipients: '收款人列表',
   prepare_transfer: '转账单准备', get_transfer_status: '转账状态', get_cards: '银行卡查询',
   prepare_card_operation: '银行卡操作单准备', get_card_operation_status: '银行卡操作状态',
@@ -699,6 +736,7 @@ function isEmptyToolData(name, data) {
   if (Array.isArray(data)) return data.length === 0
   if (typeof data !== 'object') return false
   if (Object.keys(data).length === 0) return true
+  if (name === 'get_transactions') return !Array.isArray(data.rows) || data.rows.length === 0
   if (name === 'get_statement') return false
   return false
 }

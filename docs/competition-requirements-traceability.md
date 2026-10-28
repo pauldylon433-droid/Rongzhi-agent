@@ -23,7 +23,7 @@
 | B1 服务端统一风险 / 权限，客户端 / 模型不能降级 | 创建 / 确认 / 验证接口服务端判定；模型工具无确认 / 扣款权限 | `verify-transfers.js`、`verify-strong-verification.js`、`verify-security-boundaries.js` | PASS |
 | B2 上海当日完成转账累计，确认时并发保护内重算 | 本地 SQLite 事务；云端 `internal_transfer_user_lock` 用户级 advisory lock + 重算 | `verify-transfers.js`、`verify-races.js`（同账户 / 不同账户受控顺序；真实多连接 SKIP） | PASS（受控顺序；真实并发未执行） |
 | B3 操作单冻结账户 / 对象 / 金额 / 版本 / 有效期 | 四类操作单字段快照 + 版本 CAS + 过期校验 + 锁后重新取时间 | 现有 verify-* + `verify-races.js` | PASS |
-| B4 工具白名单 / 参数 / 归属 / 确认 / 强验证独立生效 | `TOOL_DEFS` 19 个；`executeTool` 校验；未知 / 额外参数拒绝 | `verify-security-boundaries.js`、`verify-assistant.js` | PASS |
+| B4 工具白名单 / 参数 / 归属 / 确认 / 强验证独立生效 | `TOOL_DEFS` 20 个；`executeTool` 校验；未知 / 额外参数拒绝 | `verify-security-boundaries.js`、`verify-assistant.js` | PASS |
 | B5 用户输入 / 备注 / 名称 / 工具输出不能改变权限 | 系统提示数据边界 + 工具权限固定 + 凭证拦截 | `verify-security-boundaries.js`（恶意名称 / 角色标签 / 伪造回执） | PASS |
 | B6 直接 / 间接 / 多轮注入与伪造回执 | 系统提示 + 工具白名单 + 无确认工具 + 权威状态回读；`plan_workflow` 只建计划 | `verify-security-boundaries.js`；`verify-assistant.js` | PASS（mock 模型；真实模型未调用） |
 | C1 请求 / 会话 / 计划 / 工具 / 操作单 / 回执关联编号 | `services/audit-trail.js`；`audit_events` 表；assistant request / tool / reply；API 中间件；计划审计 | `verify-audit.js`、cloud assistant 审计测试 | PASS |
@@ -99,7 +99,7 @@
 
 - 本地 SQLite `verify-*.js`：**46 / 46**（原 43 + `verify-workflow-api.js` + `verify-db-path.js` + `verify-fact-blocks.js`）。
   A 事实通道：`verify-fact-blocks.js` **80 / 80**（结构化协议；提示码绑定真实单据状态 / 风险 / 有效期，
-  成功查询必渲染块，计划 / 任务 / 沙箱结果正文可见，19 工具成功 / 空 / 失败覆盖，工具名称 / call_id 元数据
+  成功查询必渲染块，计划 / 任务 / 沙箱结果正文可见，20 工具成功 / 空 / 失败覆盖，工具名称 / call_id 元数据
   不进入正文，生成期状态升级风险一致，未查询与查询为空区分，未受信草稿矩阵、持久化 / 续聊一致）。
   Markdown 渲染回归 **37 / 37**（含恶意工具名 / call_id 实际渲染检查）。
 - 前端 `npm run build`：通过（本环境 `index-CSTpLXAW.css` / `index-B5aMdmaj.js`；构建哈希随工具链环境变化，不作为业务判定依据）。

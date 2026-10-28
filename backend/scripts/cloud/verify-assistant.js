@@ -107,19 +107,19 @@ try {
     return { status: res.status, json: await res.json() }
   }
 
-  // 17 个工具契约
+  // 20 个工具契约
   setScript(finalResp('你好'))
   r = await post({ message: '你好' })
   const expectedTools = [
-    'get_accounts', 'get_monthly_analytics', 'search_transfer_recipients', 'list_transfer_recipients',
-    'prepare_transfer', 'get_transfer_status', 'get_cards', 'prepare_card_operation',
+    'get_accounts', 'get_monthly_analytics', 'get_transactions', 'search_transfer_recipients',
+    'list_transfer_recipients', 'prepare_transfer', 'get_transfer_status', 'get_cards', 'prepare_card_operation',
     'get_card_operation_status', 'get_subscriptions', 'prepare_subscription_operation',
     'get_subscription_operation_status', 'start_subscription_review', 'get_credit_accounts',
     'get_statement', 'prepare_repayment', 'get_repayment_status',
     'analyze_transactions_sandboxed', 'plan_workflow',
   ]
-  check('工具契约：恰好 19 个且名称完全一致',
-    Array.isArray(lastTools) && lastTools.length === 19
+  check('工具契约：恰好 20 个且名称完全一致',
+    Array.isArray(lastTools) && lastTools.length === 20
     && expectedTools.every((n) => lastTools.some((t) => t.function && t.function.name === n))
     && lastTools.every((t) => expectedTools.includes(t.function.name)))
 
@@ -143,6 +143,58 @@ try {
   const seen = JSON.stringify(calls[0] || [])
   check('续聊：模型输入包含上一轮用户与助手消息', r.status === 200
     && seen.includes('查询我的账户') && seen.includes('账户信息（服务端核验）'))
+
+  // 待入账明细：走真实交易表（种子含 1 笔 300.00 元待入账），不再依赖沙箱聚合
+  const shNow = new Date(Date.now() + 8 * 3600 * 1000)
+  const thisMonth = `${shNow.getUTCFullYear()}-${String(shNow.getUTCMonth() + 1).padStart(2, '0')}`
+  setScript(toolResp('get_transactions', { month: thisMonth, status: 'pending' }), finalResp('{"kind":"answer"}'))
+  r = await post({ message: '待入账的这一笔是什么' })
+  const detailRec = r.json?.data?.toolRecords?.[0]
+  check('待入账明细：工具成功且返回 1 笔真实记录', r.status === 200
+    && detailRec?.name === 'get_transactions' && detailRec?.status === 'ok'
+    && detailRec?.data?.rows?.length === 1 && detailRec.data.rows[0].amount_cents === 30000
+    && detailRec.data.rows[0].merchant === '餐厅',
+  JSON.stringify(detailRec?.data || detailRec?.error))
+  check('待入账明细：回复含商户 / 金额 / 待入账，不出现沙箱失败或上限',
+    r.json.data.reply.includes('餐厅') && r.json.data.reply.includes('300.00 元')
+      && r.json.data.reply.includes('待入账')
+      && !/沙箱分析失败|未返回可用数据|调用上限|回答未完成/.test(r.json.data.reply),
+    r.json.data.reply)
+  check('待入账明细：服务端交易块', r.json.data.reply_blocks?.some(
+    (b) => b.kind === 'transactions' && b.authoritative === true))
+
+  setScript(toolResp('get_transactions', { month: '2025-01', status: 'pending' }), finalResp('{"kind":"answer"}'))
+  r = await post({ message: '2025 年 1 月待入账的是哪一笔' })
+  check('待入账明细：无数据如实说明，不编造',
+    r.json?.data?.toolRecords?.[0]?.status === 'ok'
+      && r.json.data.toolRecords[0].data.rows.length === 0
+      && /没有返回(?:可展示的)?数据/.test(r.json.data.reply)
+      && !r.json.data.reply.includes('餐厅'), r.json?.data?.reply)
+
+  setScript(toolResp('get_transactions', { month: thisMonth, account_id: account1.id }),
+    finalResp('{"kind":"answer"}'))
+  r = await post({ message: '日常账户本月明细' })
+  check('待入账明细：账户筛选生效且不越权',
+    r.json?.data?.toolRecords?.[0]?.status === 'ok'
+      && r.json.data.toolRecords[0].data.account_id === account1.id
+      && r.json.data.toolRecords[0].data.rows.every((x) => Number(x.account_id) === Number(account1.id)),
+    JSON.stringify(r.json?.data?.toolRecords?.[0]?.data))
+
+  setScript(toolResp('get_transactions', { month: thisMonth, account_id: 999999 }),
+    finalResp('{"kind":"answer"}'))
+  r = await post({ message: '查一下那个账户的明细' })
+  check('待入账明细：非本人账户被拒绝',
+    r.json?.data?.toolRecords?.[0]?.status === 'error'
+      && /不属于当前用户|未找到该账户/.test(r.json.data.toolRecords[0].error || ''),
+    JSON.stringify(r.json?.data?.toolRecords?.[0]))
+
+  setScript(toolResp('get_transactions', { month: thisMonth, limit: 51 }),
+    finalResp('{"kind":"answer"}'))
+  r = await post({ message: '多列一些明细' })
+  check('待入账明细：超过 50 条的 limit 被拒绝',
+    r.json?.data?.toolRecords?.[0]?.status === 'error'
+      && /limit/.test(r.json.data.toolRecords[0].error || ''),
+    JSON.stringify(r.json?.data?.toolRecords?.[0]))
 
   // 模拟进程重启：新助手实例从 CloudBase 会话快照加载历史
   const assistant2 = createCloudAssistant({ client, userId: USER_ID, chatFn: mockChat })

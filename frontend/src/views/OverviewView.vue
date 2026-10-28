@@ -12,6 +12,7 @@ import { useNavigation } from '../composables/useNavigation.js'
 import { useAssistantState } from '../composables/useAssistantState.js'
 import { useCardSelection } from '../composables/useCardSelection.js'
 import { formatMoney, formatCentsToYuan, formatShanghaiDate } from '../utils/format.js'
+import { summarizeOverviewBalance } from '../utils/accountBalance.js'
 import AppIcon from '../components/AppIcon.vue'
 import CategoryBadge from '../components/CategoryBadge.vue'
 import MerchantLogo from '../components/MerchantLogo.vue'
@@ -43,13 +44,14 @@ const isCurrentMonth = computed(() => selectedMonth.value === `${currentYear}-${
 // 账户（余额始终当前）
 const { data: accounts, loading: accountsLoadingState, error: accountsError, load: loadAccountsData } = useAsyncData(fetchAccounts)
 
-// 概要「账户余额」：选中借记卡时展示其关联活期账户余额，否则回退到首个账户
-const balanceAccount = computed(() => {
-  if (selectedAccountId.value && accounts.value) {
-    const a = accounts.value.find((x) => x.id === selectedAccountId.value)
-    if (a) return a
-  }
-  return accounts.value && accounts.value[0] ? accounts.value[0] : null
+// 概要「账户余额」：未选具体借记账户时展示全部借记账户余额合计；信用卡额度 / 欠款不计入。
+const balanceSummary = computed(() => summarizeOverviewBalance(accounts.value, selectedAccountId.value))
+const selectionHint = computed(() => {
+  if (!selectedCard.value) return ''
+  const credit = selectedCard.value.account_type === 'credit'
+  return credit
+    ? '下方收支与最近交易按该账户过滤；借记账户余额合计不受信用卡筛选影响'
+    : '下方余额、收支与最近交易均按该账户过滤'
 })
 
 // 月度统计
@@ -213,14 +215,14 @@ watch(selectedAccountId, () => {
       <div class="summary-card">
         <div class="sc-head">
           <span class="sc-icon sc-icon-balance"><AppIcon name="balance" :size="18" /></span>
-          <span class="sc-label">账户余额</span>
+          <span class="sc-label">{{ balanceSummary.label }}</span>
         </div>
         <span v-if="accountsLoadingState" class="sc-value">—</span>
-        <span v-else-if="balanceAccount" class="sc-value">
-          {{ formatMoney(balanceAccount.balance_cents, balanceAccount.currency) }}
+        <span v-else-if="balanceSummary.totalCents !== null" class="sc-value">
+          {{ formatMoney(balanceSummary.totalCents, balanceSummary.currency) }}
         </span>
         <span v-else class="sc-value">—</span>
-        <span class="sc-sub">当前余额 · {{ balanceAccount ? balanceAccount.currency : '—' }}<template v-if="selectedCard"> · {{ selectedCard.account_name }}</template></span>
+        <span class="sc-sub">{{ accountsLoadingState ? '正在加载账户…' : (accountsError ? '账户加载失败' : balanceSummary.subText) }}</span>
       </div>
       <div class="summary-card">
         <div class="sc-head">
@@ -244,9 +246,9 @@ watch(selectedAccountId, () => {
       </div>
     </div>
 
-    <!-- 选中借记卡时提示：概览余额 / 收支 / 最近交易均按该账户过滤 -->
+    <!-- 选中账户时提示筛选范围；信用卡不会把额度 / 欠款并入借记余额合计 -->
     <div v-if="selectedCard" class="selection-hint">
-      已按账户筛选：<strong>{{ selectedCard.account_name }}</strong>（{{ selectedCard.masked_card_number }}）· 下方余额、收支与最近交易均按该账户过滤
+      已按账户筛选：<strong>{{ selectedCard.account_name }}</strong>（{{ selectedCard.masked_card_number }}）· {{ selectionHint }}
     </div>
 
     <!-- 近期交易（紧凑表格 + 分类图标 + 真实分页） -->

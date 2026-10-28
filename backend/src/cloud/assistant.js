@@ -1,4 +1,4 @@
-// CloudBase 持久库模式的 AI 助手：复用既有系统提示、19 个工具契约与白名单，
+// CloudBase 持久库模式的 AI 助手：复用既有系统提示、20 个工具契约与白名单，
 // 通过异步 CloudBase RPC 完成查询 / 准备操作单 / 任务启动；不确认、不扣款、不校验凭据、不执行 SQL。
 import { randomUUID, createHash } from 'node:crypto'
 import { chatCompletions, AiError } from '../lib/ai-client.js'
@@ -198,6 +198,42 @@ async function executeTool(state, client, userId, name, args, ctx) {
       accountId = args.account_id
     }
     return store().analytics({ ...parsed, asOf: new Date().toISOString(), accountId })
+  }
+  if (name === 'get_transactions') {
+    const extra = Object.keys(args).filter((k) => !['month', 'account_id', 'status', 'limit'].includes(k))
+    if (extra.length) throw new ToolError(`get_transactions 不接受额外参数：${extra.join('、')}`)
+    const parsed = parseMonth(args.month)
+    if (!parsed) throw new ToolError('month 参数格式应为 YYYY-MM（月份 01-12）')
+    let accountId
+    if (args.account_id !== undefined) {
+      if (typeof args.account_id !== 'number' || !Number.isSafeInteger(args.account_id) || args.account_id <= 0) throw new ToolError('account_id 必须为正整数')
+      if (!store().snapshot.accounts.some((a) => Number(a.id) === args.account_id)) throw new ToolError('未找到该账户或不属于当前用户')
+      accountId = args.account_id
+    }
+    if (args.status !== undefined && args.status !== 'posted' && args.status !== 'pending') {
+      throw new ToolError('status 只能是 posted 或 pending')
+    }
+    let limit = 20
+    if (args.limit !== undefined) {
+      if (typeof args.limit !== 'number' || !Number.isSafeInteger(args.limit) || args.limit <= 0 || args.limit > 50) {
+        throw new ToolError('limit 必须为 1-50 的整数')
+      }
+      limit = args.limit
+    }
+    const names = new Map((store().snapshot.accounts || []).map((a) => [Number(a.id), a.account_name]))
+    const result = store().transactions({ month: parsed, status: args.status, accountId, limit, offset: 0 })
+    const rows = (result.rows || []).map((r) => ({
+      id: r.id, account_id: r.account_id, account_name: names.get(Number(r.account_id)) || null,
+      direction: r.direction, amount_cents: r.amount_cents, category: r.category,
+      merchant: r.merchant, description: r.description,
+      transaction_at: r.transaction_at, posted_at: r.posted_at, status: r.status,
+      flow_kind: r.flow_kind,
+    }))
+    return {
+      month: `${String(parsed.year).padStart(4, '0')}-${String(parsed.month).padStart(2, '0')}`,
+      account_id: accountId ?? null, status: args.status || null,
+      total: result.total, returned: rows.length, rows,
+    }
   }
   if (name === 'analyze_transactions_sandboxed') {
     const extra = Object.keys(args).filter((k) => !['month', 'account_id', 'code'].includes(k))
@@ -627,7 +663,8 @@ export function collectCloudFacts(store, refs) {
     if (t) {
       const v = store.transferOp(ref)
       facts.set(`transfer:${ref}`, { kind: 'transfer', ref_no: ref, status: t.status, amount_cents: t.amount_cents,
-        transaction_id: v ? v.transaction_id ?? null : null, risk_level: t.risk_level, expires_at: t.expires_at })
+        transaction_id: v ? v.transaction_id ?? null : null, risk_level: t.risk_level, expires_at: t.expires_at,
+        recipient_name: t.recipient_name, from_account_name: t.from_account_name })
       continue
     }
     const c = (snap.card_operations || []).find((o) => o.ref_no === ref)
@@ -714,10 +751,11 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
       const snapshotRepayment = resolveReferencedRepayment(snap, session.id, session)
       const snapshotCard = resolveReferencedCard(snap, session.id, session)
       const snapshotSubscription = resolveReferencedSubscription(snap, session.id, session)
-      const transferContext = snapshotTransfer ? buildTransferStatusText(snapshotTransfer) : ''
-      const repaymentContext = snapshotRepayment ? buildRepaymentStatusText(snapshotRepayment) : ''
-      const cardContext = snapshotCard ? buildCardStatusText(snapshotCard) : ''
-      const subscriptionContext = snapshotSubscription ? buildSubscriptionStatusText(snapshotSubscription) : ''
+      // 只注入与本轮问题相关的操作单快照，避免无关问题被旧回执干扰。
+      const transferContext = snapshotTransfer && statusReplyRelevant('transfer', trimmed) ? buildTransferStatusText(snapshotTransfer) : ''
+      const repaymentContext = snapshotRepayment && statusReplyRelevant('repayment', trimmed) ? buildRepaymentStatusText(snapshotRepayment) : ''
+      const cardContext = snapshotCard && statusReplyRelevant('card', trimmed) ? buildCardStatusText(snapshotCard) : ''
+      const subscriptionContext = snapshotSubscription && statusReplyRelevant('subscription', trimmed) ? buildSubscriptionStatusText(snapshotSubscription) : ''
       const messages = [buildSystemMessage(transferContext, repaymentContext, cardContext, subscriptionContext), ...history, { role: 'user', content: trimmed }]
       const state = { store: snap }
       const messageState = {
@@ -740,12 +778,14 @@ export function createCloudAssistant({ client, userId, chatFn = chatCompletions,
       const { finalReply, toolRecords, incomplete, usage } = loopResult
 
       // 回复生成后复核本轮引用单的最新状态；变化时用服务端权威文案替换模型草稿。
+      // 本轮已生成新转账单时不再用旧单快照文案覆盖，新单由服务端操作块展示。
       await load().then((fresh) => { state.store = fresh })
+      const preparedTransfer = toolRecords.find((r) => r && r.status === 'ok' && r.name === 'prepare_transfer')
       const authoritativeReplies = [
-        statusReplyRelevant('transfer', trimmed, toolRecords)
-          ? transferStatusReply(state.store, snapshotTransfer, finalReply,
-            toolRecords.some((r) => r.status === 'ok' && r.name === 'prepare_transfer'))
-          : null,
+        preparedTransfer ? null
+          : (statusReplyRelevant('transfer', trimmed, toolRecords)
+            ? transferStatusReply(state.store, snapshotTransfer, finalReply, false)
+            : null),
         statusReplyRelevant('repayment', trimmed, toolRecords) ? repaymentStatusReply(state.store, snapshotRepayment) : null,
         statusReplyRelevant('card', trimmed, toolRecords) ? cardStatusReply(state.store, snapshotCard) : null,
         statusReplyRelevant('subscription', trimmed, toolRecords) ? subscriptionStatusReply(state.store, snapshotSubscription) : null,

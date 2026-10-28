@@ -104,8 +104,8 @@
 
 ## 七、AI 助手安全边界
 
-- AI 助手工具白名单共 **19 个**（与源码 `TOOL_DEFS` 一致）：
-  - 账户 / 分析：`get_accounts`、`get_monthly_analytics`
+- AI 助手工具白名单共 **20 个**（与源码 `TOOL_DEFS` 一致）：
+  - 账户 / 分析：`get_accounts`、`get_monthly_analytics`、`get_transactions`
   - 转账：`search_transfer_recipients`、`list_transfer_recipients`、`prepare_transfer`、`get_transfer_status`
   - 银行卡：`get_cards`、`prepare_card_operation`、`get_card_operation_status`
   - 订阅 / 跨场景：`get_subscriptions`、`prepare_subscription_operation`、`get_subscription_operation_status`、

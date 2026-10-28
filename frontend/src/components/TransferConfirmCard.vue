@@ -40,7 +40,7 @@ const opStatusText = {
   pending: '待确认转账',
   needs_verification: '需要强验证',
   completed: '已完成',
-  cancelled: '已取消',
+  cancelled: '已取消（未扣款）',
   expired: '已过期',
   failed: '失败',
 }
@@ -181,6 +181,9 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
       </div>
 
       <p class="env-badge">模拟银行环境 · 数据仅供演示</p>
+      <p v-if="op.status === 'cancelled'" class="cancelled-note">
+        本操作单已取消，未发生扣款。操作编号：{{ op.ref_no }}
+      </p>
 
       <dl class="detail-list">
         <div class="detail-row"><dt>付款账户</dt><dd>{{ op.from_account_name }}</dd></div>
@@ -263,6 +266,16 @@ watch(op, () => emit('status', op.value && op.value.status), { deep: true })
   margin: 0 0 8px;
   font-size: 12px;
   color: var(--muted);
+}
+.cancelled-note {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+  font-size: 13px;
+  color: #4b5563;
+  word-break: break-all;
 }
 .receipt {
   border: 1px solid #bbf7d0;

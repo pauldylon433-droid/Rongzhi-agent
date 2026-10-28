@@ -224,7 +224,8 @@ await withServer(async (base) => {
   // ============ 3. 工具权限 ============
   console.log('—— 3. 工具权限（白名单 / 强行请求越权工具）——')
   const expectedTools = [
-    'get_accounts', 'get_monthly_analytics', 'search_transfer_recipients', 'list_transfer_recipients',
+    'get_accounts', 'get_monthly_analytics', 'get_transactions', 'search_transfer_recipients',
+    'list_transfer_recipients',
     'prepare_transfer', 'get_transfer_status', 'get_cards', 'prepare_card_operation', 'get_card_operation_status',
     'get_subscriptions', 'prepare_subscription_operation', 'get_subscription_operation_status',
     'start_subscription_review', 'get_credit_accounts', 'get_statement', 'prepare_repayment', 'get_repayment_status',

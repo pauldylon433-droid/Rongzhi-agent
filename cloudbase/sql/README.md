@@ -52,7 +52,7 @@ npm ci
 npm run cloud:verify:sql       # PGlite 执行真实 SQL：安装幂等 / 权限 / 事务回滚 / 清理 / 升级列
 npm run cloud:verify:races     # 锁定竞态 / 日累计顺序复核 / 会话合并 / 时间步残留 / 样例账期
 npm run cloud:verify:api       # PGlite RPC 桩 + 真实 Node 云路由：业务 / 回滚 / 幂等 / 过期视图 / 任务
-npm run cloud:verify:assistant # mock 模型 + 真实 Express 路由：19 工具 / 建单 / 越权 / 敏感信息 / 状态交错
+npm run cloud:verify:assistant # mock 模型 + 真实 Express 路由：20 工具 / 建单 / 越权 / 敏感信息 / 状态交错
 ```
 
 以上结果只代表本地 SQL 与 Node 适配逻辑，**不是真实 CloudBase 网关 / 令牌 / 多连接并发证据**；

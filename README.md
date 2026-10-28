@@ -42,7 +42,7 @@
 - 安装 / 升级 / 回退 / 环境变量 / 验证命令见 **[docs/cloudbase-deployment.md](docs/cloudbase-deployment.md)**。
 - 本地 SQL / RPC 桩验证结果与证据边界见 **[docs/cloudbase-validation.md](docs/cloudbase-validation.md)**。
 - SQL 对象与版本化脚本见 **[cloudbase/sql/README.md](cloudbase/sql/README.md)**。
-- 公网 AI 默认关闭；显式开启且模型密钥 / 配额 / 并发配置齐全时，云端模式复用同一套系统提示与 19 个工具白名单，
+- 公网 AI 默认关闭；显式开启且模型密钥 / 配额 / 并发配置齐全时，云端模式复用同一套系统提示与 20 个工具白名单，
   通过固定 RPC 完成查询、准备操作单与订阅审查任务。助手仍无确认、扣款、验证凭据或任意 SQL 权限。
 
 ## 目录结构

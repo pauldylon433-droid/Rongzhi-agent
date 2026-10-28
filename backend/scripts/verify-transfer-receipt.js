@@ -124,16 +124,16 @@ let refNo
 {
   const mock = makeScriptedMock([{ content: '你的余额是 40,963.38 元。' }])
   const assistant = createAssistant({ db, demoUserId, chatFn: mock })
-  const r = await assistant.chat({ message: '查一下我的余额', sessionId })
+  const r = await assistant.chat({ message: '那笔转账确认后，我的余额是多少', sessionId })
   const block = receiptBlock(systemContent(mock, 0))
   check('3.1 注入权威回执', block !== '')
   const d3 = receiptData(block)
   check('3.2 状态为已完成（已扣款）', !!d3 && d3.status === 'completed' && /已完成/.test(d3.status_text || ''))
   check('3.3 含流水编号与确认时间', !!d3 && d3.transaction_id != null && /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(d3.confirmed_at || ''), d3 && JSON.stringify({ id: d3.transaction_id, at: d3.confirmed_at }))
   check('3.4 回执块不含「尚未确认/待确认」旧状态', !/尚未确认/.test(block) && !/待确认（尚未扣款）/.test(block))
-  check('3.5 模型回复不引入旧待确认结论；无余额查询来源时不冒充事实',
-    !/待确认/.test(r.reply) && !r.reply.includes('转账操作单')
-      && /无法依据当前服务端数据确认|请先查询/.test(r.reply), r.reply)
+  check('3.5 模型回复不引入旧待确认结论，也不把模型猜测的余额当作事实',
+    !/待确认/.test(r.reply) && !r.reply.includes('40,963.38')
+      && (/该笔转账已完成/.test(r.reply) || /无法依据当前服务端数据确认|请先查询/.test(r.reply)), r.reply)
 }
 
 // ---------- 4. 成功后追问「为什么没扣款」：注入已完成，不要求再次确认 ----------
@@ -188,7 +188,7 @@ let refNo
 
   const mockCheck = makeScriptedMock([{ content: 'ok' }])
   const a3 = createAssistant({ db, demoUserId, chatFn: mockCheck })
-  await a3.chat({ message: '确认成功了吗', sessionId: sidA })
+  await a3.chat({ message: '那笔转账确认成功了吗', sessionId: sidA })
   check('7.3 A 会话注入已完成回执', /已完成（已扣款）/.test(receiptBlock(systemContent(mockCheck, 0))))
 }
 
